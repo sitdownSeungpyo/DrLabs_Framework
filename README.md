@@ -75,4 +75,3 @@ The following features were part of the initial high-performance requirements an
 - **Hardware**: Robotis Dynamixel Series
 
 ---
-*Created with ❤️ by Antigravity & User*

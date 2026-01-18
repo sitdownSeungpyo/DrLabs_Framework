@@ -154,9 +154,7 @@ func ParsePacket(packet []byte) (id uint8, errCode uint8, params []byte, err err
 	receivedCRC := uint16(packet[len(packet)-2]) | (uint16(packet[len(packet)-1]) << 8)
 	calcCRC := UpdateCRC(0, packet[:len(packet)-2])
 	if receivedCRC != calcCRC {
-		// return 0, 0, nil, fmt.Errorf("CRC error: expected %04X, got %04X. Packet: %X", calcCRC, receivedCRC, packet)
-		// FIXME: CRC Calculation mismatch. Bypassing for testing control logic.
-		fmt.Printf("[WARN] CRC Mismatch! Calc: %04X, Rx: %04X. Ignoring.\n", calcCRC, receivedCRC)
+		return 0, 0, nil, fmt.Errorf("CRC error: expected %04X, got %04X", calcCRC, receivedCRC)
 	}
 
 	// Instruction (Should be 0x55 for Status)

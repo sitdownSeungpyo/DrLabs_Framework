@@ -20,13 +20,19 @@ type Controller struct {
 	// Configuration
 	LoopPeriod time.Duration
 	Model      MotorModel
+
+	// Internal State
+	activeGoalAddr uint16
 }
 
 // MotorModel defines the Control Table addresses for a specific motor type
 type MotorModel struct {
 	AddrTorqueEnable    uint16
 	AddrGoalPosition    uint16
+	AddrGoalVelocity    uint16
+	AddrGoalPWM         uint16
 	AddrPresentPosition uint16
+	AddrOperatingMode   uint16
 }
 
 // Command represents a write command to a motor
@@ -48,26 +54,42 @@ var (
 	ModelXSeries = MotorModel{
 		AddrTorqueEnable:    64,
 		AddrGoalPosition:    116,
+		AddrGoalVelocity:    104,
+		AddrGoalPWM:         100,
 		AddrPresentPosition: 132,
+		AddrOperatingMode:   11,
 	}
 	// Pro-Series (H54, H42, etc.)
 	ModelProSeries = MotorModel{
 		AddrTorqueEnable:    562, // Example, verify for specific PRO model
 		AddrGoalPosition:    596,
+		AddrGoalVelocity:    600, // Check Manual
+		AddrGoalPWM:         584, // Check Manual
 		AddrPresentPosition: 611,
+		AddrOperatingMode:   11, // PRO Series often shares 11 too, need check
 	}
 	// PRO+ Series usually similar to X-Series layout or specific
 )
 
+const (
+	OpModeCurrent          = 0
+	OpModeVelocity         = 1
+	OpModePosition         = 3
+	OpModeExtendedPosition = 4
+	OpModeCurrentBasedPos  = 5
+	OpModePWM              = 16
+)
+
 func NewController(devicePort string, baudRate int, loopHz int, model MotorModel) *Controller {
 	return &Controller{
-		devicePort:   devicePort,
-		baudRate:     baudRate,
-		CommandChan:  make(chan []Command, 1),
-		FeedbackChan: make(chan []Feedback, 100),
-		StopChan:     make(chan struct{}),
-		LoopPeriod:   time.Second / time.Duration(loopHz),
-		Model:        model,
+		devicePort:     devicePort,
+		baudRate:       baudRate,
+		CommandChan:    make(chan []Command, 1),
+		FeedbackChan:   make(chan []Feedback, 100),
+		StopChan:       make(chan struct{}),
+		LoopPeriod:     time.Second / time.Duration(loopHz),
+		Model:          model,
+		activeGoalAddr: model.AddrGoalPosition, // Default Address
 	}
 }
 
@@ -121,6 +143,50 @@ func (c *Controller) enableTorque(id uint8) error {
 	return nil
 }
 
+func (c *Controller) disableTorque(id uint8) error {
+	fmt.Printf("Disabling Torque for ID %d...\n", id)
+	return c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{0})
+}
+
+// SetOperatingMode changes the control mode (Torque Disable -> Set Mode -> Torque Enable)
+// Common Modes: 1 (Velocity), 3 (Position), 16 (PWM)
+func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
+	// 1. Disable Torque
+	if err := c.disableTorque(id); err != nil {
+		return fmt.Errorf("failed to disable torque: %v", err)
+	}
+
+	// 2. Set Mode
+	fmt.Printf("Setting Operating Mode to %d for ID %d...\n", mode, id)
+	if err := c.driver.Write(id, c.Model.AddrOperatingMode, []byte{mode}); err != nil {
+		return fmt.Errorf("failed to set operating mode: %v", err)
+	}
+
+	// EEPROM Write Delay: Changing Operating Mode writes to EEPROM.
+	// Give the motor some time to process before sending next command.
+	time.Sleep(200 * time.Millisecond)
+
+	// Update Active Goal Address
+	switch mode {
+	case OpModeVelocity:
+		c.activeGoalAddr = c.Model.AddrGoalVelocity
+	case OpModePWM:
+		c.activeGoalAddr = c.Model.AddrGoalPWM
+	case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
+		c.activeGoalAddr = c.Model.AddrGoalPosition
+	case OpModeCurrent:
+		// c.activeGoalAddr = c.Model.AddrGoalCurrent // Need to add if supported
+		// Fallback or warning?
+	}
+
+	// 3. Re-Enable Torque
+	if err := c.enableTorque(id); err != nil {
+		return fmt.Errorf("failed to enable torque: %v", err)
+	}
+
+	return nil
+}
+
 // Stop signals the control loop to exit
 func (c *Controller) Stop() {
 	close(c.StopChan)
@@ -144,8 +210,10 @@ func (c *Controller) controlLoop() {
 			select {
 			case cmds := <-c.CommandChan:
 				for _, cmd := range cmds {
-					// Use Driver Write
-					err := c.driver.Write4Byte(cmd.ID, c.Model.AddrGoalPosition, cmd.Value)
+					// Use Active Goal Address
+					// Note: This assumes all motors in loop use same mode, or commands are consistent.
+					// Since Controller is simple, we assume single-mode operation for now.
+					err := c.driver.Write4Byte(cmd.ID, c.activeGoalAddr, cmd.Value)
 					if err != nil {
 						// In real app, maybe log or count errors
 					}

@@ -18,7 +18,7 @@ func main() {
 	fmt.Println("This test will apply PWM limit to Motor ID 1.")
 
 	// Create Controller with X-Series Model
-	ctrl := dxl.NewController(*portVal, *baudVal, 100, dxl.ModelXSeries)
+	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error starting controller: %v\n", err)

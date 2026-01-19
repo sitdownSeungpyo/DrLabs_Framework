@@ -7,28 +7,40 @@ Designed for developers who want the concurrency and simplicity of Go without th
 
 ## ✨ Key Features
 
-- **Pure Go Implementation**: 
+- **Pure Go Implementation**:
   - Zero dependencies on `dxl_x64_c.dll` or `gcc`.
-  - Uses native Windows `syscall` for direct serial port access.
-- **Protocol 2.0 Full Support**: 
+  - Native Windows & Linux serial port support.
+- **Protocol 2.0 Full Support**:
   - Complete implementation of Packet Construction, Parsing, Byte Stuffing, and CRC16 validation.
-- **Robust Control Architecture**: 
+  - **Sync Read/Write**: Efficient multi-motor control in a single packet (up to 3-5x faster).
+  - **Bulk Read/Write**: Future support for different addresses per motor.
+- **Robust Control Architecture**:
   - **Verified Startup**: Checks Ping and Torque Enable before motion.
   - **Closed Loop Control**: Feedback-based motion (Move -> Verify Arrival -> Move).
   - **Concurrency**: Goroutine-based non-blocking controller loop.
-- **Configurable Motor Models**: 
+  - **Multi-Motor Support**: Control multiple motors simultaneously with automatic sync optimization.
+- **Configurable Motor Models**:
   - Supports X-Series (`XM430`, `XC430`) and Pro-Series out of the box.
+- **Multiple Control Modes**:
+  - Position Control, Velocity Control, PWM (Torque) Control
 
 ## 📁 Project Structure
 
 ```bash
 dxl_go/
 ├── dxl/
-│   ├── driver.go         # 🎮 High-Level API (Ping, Read, Write)
+│   ├── driver.go         # 🎮 High-Level API (Ping, Read, Write, Sync Read/Write)
 │   ├── protocol.go       # 🧠 Protocol 2.0 Logic (CRC, Packet)
-│   ├── controller.go     # ⚡ Concurrent Control Loop
-│   └── serial_windows.go # 🔌 Native Serial Port (Syscalls)
-└── main.go               # 🚀 Example: Robust Rotation Test
+│   ├── controller.go     # ⚡ Concurrent Multi-Motor Control Loop
+│   ├── serial_windows.go # 🔌 Native Windows Serial Port
+│   └── serial_linux.go   # 🔌 Native Linux Serial Port
+├── test/
+│   ├── position_run.go   # Position control example
+│   ├── velocity_run.go   # Velocity control example
+│   ├── torque_run.go     # PWM/Torque control example
+│   ├── multi_motor_run.go# Multi-motor sync control example
+│   └── sync_benchmark.go # Performance comparison
+└── main.go               # 🚀 Main entry point
 ```
 
 ## 🚀 Getting Started
@@ -46,27 +58,88 @@ cd dxl_go/src
 go build
 ```
 
-### Usage
+### Usage Examples
 
-**Run Rotation Test:**
-Rotates Motor ID 1 from 0 to 4096 (closed-loop).
-
+**Position Control (Single Motor):**
 ```bash
-# Default: COM3, 1Mbps
-.\go_dxl.exe
+cd test
+go run position_run.go
+```
 
-# Custom Port/Baud
-.\go_dxl.exe -port COM4 -baud 57600
+**Velocity Control:**
+```bash
+cd test
+go run velocity_run.go
+```
+
+**Multi-Motor Control (Sync Read/Write):**
+```bash
+cd test
+go run multi_motor_run.go
+```
+
+**Performance Benchmark:**
+Compare individual writes vs sync write performance.
+```bash
+cd test
+go run sync_benchmark.go
+# Expected: Sync Write is 3-5x faster for 3+ motors
+```
+
+### API Quick Reference
+
+**Single Motor Control:**
+```go
+// Individual read/write
+driver.Write4Byte(id, addr, value)
+driver.Read4Byte(id, addr)
+```
+
+**Multi-Motor Control (Recommended):**
+```go
+// Sync Write - Send to multiple motors in one packet
+values := map[uint8]uint32{
+    1: 2048,  // Motor 1 -> position 2048
+    2: 3072,  // Motor 2 -> position 3072
+    3: 1024,  // Motor 3 -> position 1024
+}
+driver.SyncWrite4Byte(goalPositionAddr, values)
+
+// Sync Read - Read from multiple motors efficiently
+ids := []uint8{1, 2, 3}
+positions, _ := driver.SyncRead4Byte(presentPositionAddr, ids)
+// Returns: map[uint8]uint32{1: 2048, 2: 3072, 3: 1024}
+```
+
+**Controller with Auto-Optimization:**
+```go
+ctrl := dxl.NewController("COM3", 57600, dxl.ModelXSeries)
+ctrl.SetMotorIDs([]uint8{1, 2, 3}) // Automatically enables sync read/write
+ctrl.Start()
+
+// Send commands - automatically uses sync write for efficiency
+ctrl.CommandChan <- []dxl.Command{
+    {ID: 1, Value: 2048},
+    {ID: 2, Value: 3072},
+    {ID: 3, Value: 1024},
+}
+
+// Receive feedback - automatically uses sync read
+feedbacks := <-ctrl.FeedbackChan // Returns all motor positions
 ```
 
 ## 🗺️ Roadmap & TBD
 
-The following features were part of the initial high-performance requirements and are planned for future updates:
+Recent updates:
+- [x] **Sync Read/Write**: Implemented for efficient multi-motor control (3-5x faster)
+- [x] **Cross-Platform Support**: Linux support added
+- [x] **Multiple Control Modes**: Position, Velocity, and PWM control
 
-- [ ] **Real-time 1kHz Cycle**: Ensure <1ms loop times with precise OS timer tuning.
-- [ ] **Sync Write / Bulk Read**: Optimize bandwidth for multi-motor robots.
-- [ ] **Cross-Platform Support**: Add `serial_linux.go` and `serial_darwin.go`.
-- [ ] **Trajectory Generation**: Trapezoidal velocity profile generation in Go.
+Future enhancements:
+- [ ] **Bulk Read/Write**: Per-motor custom address/length support
+- [ ] **Real-time 1kHz Cycle**: Optimize for <1ms loop times with OS timer tuning
+- [ ] **Trajectory Generation**: Trapezoidal velocity profile generation in Go
+- [ ] **macOS Support**: Add `serial_darwin.go`
 
 ## 🛠️ Tech Stack
 

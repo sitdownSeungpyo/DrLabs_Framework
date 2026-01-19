@@ -18,7 +18,7 @@ func main() {
 	fmt.Println("This test will rotate Motor ID 1 from position 0 to 4096 and back.")
 
 	// Create Controller with X-Series Model
-	ctrl := dxl.NewController(*portVal, *baudVal, 100, dxl.ModelXSeries)
+	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error starting controller: %v\n", err)

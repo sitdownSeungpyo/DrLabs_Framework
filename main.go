@@ -16,7 +16,7 @@ func main() {
 	fmt.Printf("Connecting to %s at %d baud...\n", *portVal, *baudVal)
 
 	// Create Controller with X-Series Model
-	ctrl := dxl.NewController(*portVal, *baudVal, 100, dxl.ModelXSeries)
+	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error connecting to controller: %v\n", err)

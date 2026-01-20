@@ -12,13 +12,14 @@ import (
 func main() {
 	portVal := flag.String("port", "COM3", "Serial port name")
 	baudVal := flag.Int("baud", 1000000, "Baudrate")
+	idVal := flag.Int("id", 1, "Motor ID")
 	flag.Parse()
 
-	fmt.Printf("Starting Position Control Test on %s at %d baud...\n", *portVal, *baudVal)
-	fmt.Println("This test will rotate Motor ID 1 from position 0 to 4096 and back.")
+	fmt.Printf("Starting Position Test on %s at %d baud, ID %d...\n", *portVal, *baudVal, *idVal)
 
-	// Create Controller with X-Series Model
+	// Create Controller
 	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
+	ctrl.SetMotorIDs([]uint8{uint8(*idVal)})
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error starting controller: %v\n", err)
@@ -26,17 +27,18 @@ func main() {
 	}
 	defer ctrl.Stop()
 
-	// Ensure Operating Mode is Position (3)
-	if err := ctrl.SetOperatingMode(1, dxl.OpModePosition); err != nil {
-		fmt.Printf("Error setting operating mode: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Capture interrupt
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
 
-	// Combined Motion & Feedback Loop
+	// Set Mode
+	if err := ctrl.SetOperatingMode(uint8(*idVal), dxl.OpModePosition); err != nil {
+		fmt.Printf("Failed to set Position Mode: %v\n", err)
+		return
+	}
+	fmt.Println("Mode set to Position Control.")
+
+	// targets
 	targetPositions := []uint32{0, 1024, 2048, 3072, 4095}
 	idx := 0
 	forward := true
@@ -44,9 +46,9 @@ func main() {
 	// Initial Move
 	currentTarget := targetPositions[0]
 	fmt.Printf("Moving to: %d\n", currentTarget)
-	ctrl.CommandChan <- []dxl.Command{{ID: 1, Value: currentTarget}}
+	ctrl.CommandChan <- []dxl.Command{{ID: uint8(*idVal), Value: currentTarget}}
 
-	// Wait loop
+	// Loop
 Loop:
 	for {
 		select {
@@ -54,8 +56,10 @@ Loop:
 			fmt.Println("\nStopping...")
 			break Loop
 		case fbs := <-ctrl.FeedbackChan:
-			if len(fbs) > 0 {
-				fb := fbs[0]
+			for _, fb := range fbs {
+				if fb.ID != uint8(*idVal) {
+					continue
+				}
 				if fb.Error != nil {
 					fmt.Printf("Error: %v\n", fb.Error)
 					continue
@@ -67,11 +71,9 @@ Loop:
 					diff = -diff
 				}
 
-				// Threshold: 20 ticks
 				if diff < 20 {
-					fmt.Printf("Reached %d (Req: %d). Move Next.\n", fb.Value, currentTarget)
+					fmt.Printf("Reached %d. Move Next.\n", fb.Value)
 
-					// Update Target
 					if forward {
 						idx++
 						if idx >= len(targetPositions) {
@@ -87,10 +89,9 @@ Loop:
 					}
 
 					currentTarget = targetPositions[idx]
-					// Small delay to see it stop
 					time.Sleep(500 * time.Millisecond)
 					fmt.Printf("Moving to: %d\n", currentTarget)
-					ctrl.CommandChan <- []dxl.Command{{ID: 1, Value: currentTarget}}
+					ctrl.CommandChan <- []dxl.Command{{ID: uint8(*idVal), Value: currentTarget}}
 				}
 			}
 		}

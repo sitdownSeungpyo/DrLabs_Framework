@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(while read hash)",
+      "Bash(do git show -s --format=%B $hash)",
+      "Bash(done)"
+    ]
+  }
+}

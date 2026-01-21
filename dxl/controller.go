@@ -1,8 +1,10 @@
 package dxl
 
 import (
+	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -15,14 +17,19 @@ type Controller struct {
 	// Channels for communication with the control loop
 	CommandChan  chan []Command
 	FeedbackChan chan []Feedback
-	StopChan     chan struct{}
+
+	// Context for graceful shutdown
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	// Configuration
-	Model   MotorModel
+	Model    MotorModel
 	MotorIDs []uint8 // List of motor IDs to control
 
 	// Internal State
-	activeGoalAddr uint16
+	mu               sync.RWMutex // Protects shared state
+	activeGoalAddr   uint16
 	useSyncReadWrite bool // Enable sync read/write for better performance
 }
 
@@ -82,12 +89,14 @@ const (
 )
 
 func NewController(devicePort string, baudRate int, model MotorModel) *Controller {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Controller{
 		devicePort:       devicePort,
 		baudRate:         baudRate,
 		CommandChan:      make(chan []Command, 1),
 		FeedbackChan:     make(chan []Feedback, 100),
-		StopChan:         make(chan struct{}),
+		ctx:              ctx,
+		cancel:           cancel,
 		Model:            model,
 		MotorIDs:         []uint8{1}, // Default single motor
 		activeGoalAddr:   model.AddrGoalPosition, // Default Address
@@ -97,9 +106,35 @@ func NewController(devicePort string, baudRate int, model MotorModel) *Controlle
 
 // SetMotorIDs configures which motors to control
 // Automatically enables sync read/write if multiple motors
+// Thread-safe: can be called while control loop is running
 func (c *Controller) SetMotorIDs(ids []uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.MotorIDs = ids
 	c.useSyncReadWrite = len(ids) > 1
+}
+
+// getMotorIDs returns a copy of motor IDs (thread-safe)
+func (c *Controller) getMotorIDs() []uint8 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ids := make([]uint8, len(c.MotorIDs))
+	copy(ids, c.MotorIDs)
+	return ids
+}
+
+// isSyncMode returns whether sync read/write is enabled (thread-safe)
+func (c *Controller) isSyncMode() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.useSyncReadWrite
+}
+
+// getActiveGoalAddr returns the active goal address (thread-safe)
+func (c *Controller) getActiveGoalAddr() uint16 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.activeGoalAddr
 }
 
 // Start spawns the control loop goroutine
@@ -128,6 +163,7 @@ func (c *Controller) Start() error {
 	}
 
 	// Start the control loop in a separate goroutine
+	c.wg.Add(1)
 	go c.controlLoop()
 
 	return nil
@@ -187,7 +223,8 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	// Increased delay to ensure motor is fully ready after mode change
 	time.Sleep(1000 * time.Millisecond)
 
-	// Update Active Goal Address
+	// Update Active Goal Address (thread-safe)
+	c.mu.Lock()
 	switch mode {
 	case OpModeVelocity:
 		c.activeGoalAddr = c.Model.AddrGoalVelocity
@@ -197,8 +234,10 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		c.activeGoalAddr = c.Model.AddrGoalPosition
 	case OpModeCurrent:
 		// c.activeGoalAddr = c.Model.AddrGoalCurrent // Need to add if supported
-		// Fallback or warning?
+		fmt.Printf("Warning: Current mode not fully supported, using position address\n")
+		c.activeGoalAddr = c.Model.AddrGoalPosition
 	}
+	c.mu.Unlock()
 
 	// 3. Re-Enable Torque
 	if err := c.enableTorque(id); err != nil {
@@ -208,12 +247,15 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	return nil
 }
 
-// Stop signals the control loop to exit
+// Stop signals the control loop to exit and waits for it to finish
 func (c *Controller) Stop() {
-	close(c.StopChan)
+	c.cancel()
+	c.wg.Wait()
 }
 
 func (c *Controller) controlLoop() {
+	defer c.wg.Done()
+
 	// 1. Lock OS Thread to reduce scheduler jitter
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -221,26 +263,25 @@ func (c *Controller) controlLoop() {
 
 	for {
 		select {
-		case <-c.StopChan:
+		case <-c.ctx.Done():
 			return
 		// 1. Process Commands (Prioritized)
 		case cmds := <-c.CommandChan:
-			if c.useSyncReadWrite {
+			goalAddr := c.getActiveGoalAddr()
+			if c.isSyncMode() {
 				// Use Sync Write for multiple motors (more efficient)
 				values := make(map[uint8]uint32)
 				for _, cmd := range cmds {
 					values[cmd.ID] = cmd.Value
 				}
-				err := c.driver.SyncWrite4Byte(c.activeGoalAddr, values)
-				if err != nil {
-					// In real app, maybe log or count errors
+				if err := c.driver.SyncWrite4Byte(goalAddr, values); err != nil {
+					fmt.Printf("SyncWrite error: %v\n", err)
 				}
 			} else {
 				// Individual writes for single motor or legacy mode
 				for _, cmd := range cmds {
-					err := c.driver.Write4Byte(cmd.ID, c.activeGoalAddr, cmd.Value)
-					if err != nil {
-						// In real app, maybe log or count errors
+					if err := c.driver.Write4Byte(cmd.ID, goalAddr, cmd.Value); err != nil {
+						fmt.Printf("Write error for motor %d: %v\n", cmd.ID, err)
 					}
 				}
 			}
@@ -250,18 +291,19 @@ func (c *Controller) controlLoop() {
 
 		// 2. Read Feedback
 		var feedbacks []Feedback
+		motorIDs := c.getMotorIDs()
 
-		if c.useSyncReadWrite {
+		if c.isSyncMode() {
 			// Use Sync Read for multiple motors (more efficient)
-			values, err := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, c.MotorIDs)
+			values, err := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
 			if err != nil {
 				// Error reading all motors, create error feedback for each
-				for _, id := range c.MotorIDs {
+				for _, id := range motorIDs {
 					feedbacks = append(feedbacks, Feedback{ID: id, Value: 0, Error: err})
 				}
 			} else {
 				// Success, create feedback for each motor
-				for _, id := range c.MotorIDs {
+				for _, id := range motorIDs {
 					if val, ok := values[id]; ok {
 						feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: nil})
 					} else {
@@ -271,16 +313,17 @@ func (c *Controller) controlLoop() {
 			}
 		} else {
 			// Individual reads for single motor
-			for _, id := range c.MotorIDs {
+			for _, id := range motorIDs {
 				val, err := c.driver.Read4Byte(id, c.Model.AddrPresentPosition)
 				feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: err})
 			}
 		}
 
-		// Send feedback
+		// Send feedback (non-blocking)
 		select {
 		case c.FeedbackChan <- feedbacks:
 		default:
+			// Channel full, drop oldest feedback
 		}
 	}
 }

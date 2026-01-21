@@ -102,6 +102,42 @@ func StuffParams(params []byte) []byte {
 	return stuffed
 }
 
+// DestuffParams removes byte stuffing from received data
+// Protocol 2.0: FF FF FD FD -> FF FF FD
+func DestuffParams(data []byte) []byte {
+	if len(data) < 4 {
+		return data
+	}
+
+	result := make([]byte, 0, len(data))
+	ffCount := 0
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+
+		if ffCount >= 2 && b == 0xFD {
+			// Check if next byte is also 0xFD (stuffed)
+			if i+1 < len(data) && data[i+1] == 0xFD {
+				// This is a stuffed pattern, output one FD and skip the next
+				result = append(result, b)
+				i++ // Skip the extra FD
+				ffCount = 0
+				continue
+			}
+		}
+
+		result = append(result, b)
+
+		if b == 0xFF {
+			ffCount++
+		} else {
+			ffCount = 0
+		}
+	}
+
+	return result
+}
+
 // BuildPacket constructs a Protocol 2.0 Packet
 func BuildPacket(id uint8, inst uint8, params []byte) []byte {
 	// 1. Header
@@ -131,9 +167,8 @@ func BuildPacket(id uint8, inst uint8, params []byte) []byte {
 // ParsePacket validates a response from stream
 // Returns: ID, ErrorCode, Params, valid/error
 func ParsePacket(packet []byte) (id uint8, errCode uint8, params []byte, err error) {
-	if len(packet) < 10 { // Min packet size: H(4)+ID(1)+Len(2)+Inst(1)+Err(1)+CRC(2) = 11?
-		// Status Packet: H(4) + ID(1) + Len(2) + Inst(1)[0x55] + Err(1) + Param(N) + CRC(2)
-		// Min params 0 -> Size 11.
+	// Min packet size: H(4)+ID(1)+Len(2)+Inst(1)+Err(1)+CRC(2) = 11 bytes
+	if len(packet) < 11 {
 		return 0, 0, nil, errors.New("packet too short")
 	}
 
@@ -159,21 +194,18 @@ func ParsePacket(packet []byte) (id uint8, errCode uint8, params []byte, err err
 
 	// Instruction (Should be 0x55 for Status)
 	inst := packet[7]
-	if inst != InstStatus {
-		// Not a status packet?
-		// Could be loopback?
-	}
+	_ = inst // Instruction byte available for future use if needed
 
 	errCode = packet[8]
 
-	// Params
-	// Parameters start at 9, end at len-2
-	// Need to Remove Stuffing?
-	// Yes, if FF FF FD FD -> FF FF FD
-	rawParams := packet[9 : len(packet)-2]
-	// Destuffing
-	// TODO: implement destuffing if needed. For simple Read/Write it's rare.
-	params = rawParams
+	// Params: start at index 9, end before CRC (len-2)
+	// For minimum packet (11 bytes), 9 to 9 = empty params
+	if len(packet) > 11 {
+		rawParams := packet[9 : len(packet)-2]
+		params = DestuffParams(rawParams)
+	} else {
+		params = nil
+	}
 
 	return id, errCode, params, nil
 }

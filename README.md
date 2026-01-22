@@ -137,7 +137,6 @@ Recent updates:
 
 Future enhancements:
 - [ ] **Bulk Read/Write**: Per-motor custom address/length support
-- [ ] **Real-time 1kHz Cycle**: Optimize for <1ms loop times with OS timer tuning
 - [ ] **Trajectory Generation**: Trapezoidal velocity profile generation in Go
 - [ ] **macOS Support**: Add `serial_darwin.go`
 

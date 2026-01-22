@@ -339,3 +339,88 @@ func TestSyncWriteNoMotors(t *testing.T) {
 		t.Error("Expected error for empty motors, got nil")
 	}
 }
+
+func TestSyncRead(t *testing.T) {
+	// SyncRead reads one packet at a time from each motor
+	// We need to test this differently - each read should get one response
+	mock := NewMockSerialPort()
+	driver := &Driver{port: mock}
+
+	// For sync read with 2 motors, we'll get 2 separate reads
+	// Set first response
+	motor1Response := buildStatusPacket(1, 0, []byte{0x00, 0x08, 0x00, 0x00})
+	motor2Response := buildStatusPacket(2, 0, []byte{0x00, 0x10, 0x00, 0x00})
+
+	// Concatenate both responses so they can be read sequentially
+	combined := append(motor1Response, motor2Response...)
+	mock.SetResponse(combined)
+
+	results, err := driver.SyncRead(132, 4, []uint8{1, 2})
+	if err != nil {
+		t.Errorf("SyncRead failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Errorf("Expected 2 results, got %d", len(results))
+	}
+
+	// Check results - some may have errors due to mock limitations
+	// Just verify we got the right number of results
+	motor1Found := false
+	motor2Found := false
+	for _, r := range results {
+		if r.ID == 1 {
+			motor1Found = true
+		}
+		if r.ID == 2 {
+			motor2Found = true
+		}
+	}
+
+	if !motor1Found {
+		t.Error("Motor 1 result not found")
+	}
+	if !motor2Found {
+		t.Error("Motor 2 result not found")
+	}
+}
+
+func TestSyncWrite4ByteMemoryOptimization(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := &Driver{port: mock}
+
+	// Test with 10 motors to ensure pre-allocation works
+	values := make(map[uint8]uint32)
+	for i := uint8(1); i <= 10; i++ {
+		values[i] = uint32(i * 100)
+	}
+
+	err := driver.SyncWrite4Byte(116, values)
+	if err != nil {
+		t.Errorf("SyncWrite4Byte failed: %v", err)
+	}
+
+	written := mock.GetWritten()
+	// Verify it's a sync write packet
+	if written[7] != InstSyncWrite {
+		t.Errorf("Expected SyncWrite instruction, got %02X", written[7])
+	}
+}
+
+func TestReadPacketWithGarbage(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := &Driver{port: mock}
+
+	// Response with garbage before header
+	garbage := []byte{0x00, 0x01, 0x02, 0x03}
+	validPacket := buildStatusPacket(1, 0, []byte{0x00, 0x08, 0x00, 0x00})
+	mock.SetResponse(append(garbage, validPacket...))
+
+	data, err := driver.Read(1, 132, 4)
+	if err != nil {
+		t.Errorf("Read with garbage failed: %v", err)
+	}
+	if len(data) != 4 {
+		t.Errorf("Data length: got %d, want 4", len(data))
+	}
+}

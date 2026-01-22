@@ -147,13 +147,12 @@ func (sp *SerialPort) setParams(baud int) error {
 		return fmt.Errorf("GetCommState failed: %v", e1)
 	}
 
-	// Update params
+	// Update params: 8N1 (8 data bits, No parity, 1 stop bit)
 	dcbState.BaudRate = uint32(baud)
 	dcbState.ByteSize = 8
 	dcbState.Parity = NOPARITY
 	dcbState.StopBits = ONESTOPBIT
-	// Flags: Binary (1), DTR/RTS typically needed? DXL usually just 8N1.
-	dcbState.Flags = 1 // fBinary
+	dcbState.Flags = 1 // fBinary mode
 
 	// SetCommState
 	r1, _, e1 = procSetCommState.Call(
@@ -164,11 +163,20 @@ func (sp *SerialPort) setParams(baud int) error {
 		return fmt.Errorf("SetCommState failed: %v", e1)
 	}
 
-	// SetupComm (Buffers)
-	procSetupComm.Call(uintptr(sp.handle), 4096, 4096)
+	// SetupComm: Configure input/output buffer sizes (4KB each)
+	r1, _, e1 = procSetupComm.Call(uintptr(sp.handle), 4096, 4096)
+	if r1 == 0 {
+		return fmt.Errorf("SetupComm failed: %v", e1)
+	}
 
-	// Purge
-	procPurgeComm.Call(uintptr(sp.handle), uintptr(PURGE_TXABORT|PURGE_RXABORT|PURGE_TXCLEAR|PURGE_RXCLEAR))
+	// PurgeComm: Clear all buffers
+	r1, _, e1 = procPurgeComm.Call(
+		uintptr(sp.handle),
+		uintptr(PURGE_TXABORT|PURGE_RXABORT|PURGE_TXCLEAR|PURGE_RXCLEAR),
+	)
+	if r1 == 0 {
+		return fmt.Errorf("PurgeComm failed: %v", e1)
+	}
 
 	return nil
 }
@@ -176,28 +184,16 @@ func (sp *SerialPort) setParams(baud int) error {
 func (sp *SerialPort) setTimeouts() error {
 	var timeouts commTimeouts
 
-	// Non-blocking read (return immediately with what's available)
-	// OR short timeout. DXL packets are fast.
-	// Constant=1ms, Multiplier=0 -> wait max 1ms per Read call if buffer empty?
-	// To replicate 'PacketHandler' logic which often has a timeout logic:
-
-	// Behavior: ReadFile returns immediately if data exists. If not, wait up to Constant.
-	// We want fast reads.
-
-	timeouts.ReadIntervalTimeout = 0 // MAXDWORD for return immediately? No, 0 is ignored?
-	// MAXDWORD interval, 0 others = return immediately even if 0 bytes
-	timeouts.ReadIntervalTimeout = 0xFFFFFFFF
-	timeouts.ReadTotalTimeoutMultiplier = 0
-	timeouts.ReadTotalTimeoutConstant = 0
-
-	// If we want a blocking read with timeout (e.g. wait 5ms for packet):
-	// Let's set a small timeout: 5ms
+	// Configure timeouts for Dynamixel communication:
+	// - ReadIntervalTimeout: Maximum time between bytes (0 = no timeout between bytes)
+	// - ReadTotalTimeoutConstant: Total read timeout in ms
+	// - Set to 10ms for responsive packet reading while allowing application-level timeout control
 	timeouts.ReadIntervalTimeout = 0
 	timeouts.ReadTotalTimeoutMultiplier = 0
-	timeouts.ReadTotalTimeoutConstant = 5
+	timeouts.ReadTotalTimeoutConstant = 10 // 10ms per read call
 
 	timeouts.WriteTotalTimeoutMultiplier = 0
-	timeouts.WriteTotalTimeoutConstant = 5
+	timeouts.WriteTotalTimeoutConstant = 10 // 10ms write timeout
 
 	r1, _, e1 := procSetCommTimeouts.Call(
 		uintptr(sp.handle),

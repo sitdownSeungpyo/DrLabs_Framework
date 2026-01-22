@@ -306,3 +306,72 @@ func TestBuildAndParseRoundTrip(t *testing.T) {
 		t.Errorf("TX packet too short: %d", len(tx))
 	}
 }
+
+func TestStuffParamsWithMultiplePatterns(t *testing.T) {
+	// Test data with multiple header patterns
+	input := []byte{0x01, 0xFF, 0xFF, 0xFD, 0x02, 0xFF, 0xFF, 0xFD, 0x03}
+	result := StuffParams(input)
+
+	// Should have 2 extra FD bytes inserted
+	expected := []byte{0x01, 0xFF, 0xFF, 0xFD, 0xFD, 0x02, 0xFF, 0xFF, 0xFD, 0xFD, 0x03}
+	if !bytes.Equal(result, expected) {
+		t.Errorf("StuffParams multi-pattern: got %X, want %X", result, expected)
+	}
+}
+
+func TestDestuffParamsEdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected []byte
+	}{
+		{
+			name:     "short data",
+			input:    []byte{0xFF, 0xFF},
+			expected: []byte{0xFF, 0xFF},
+		},
+		{
+			name:     "partial stuffed pattern",
+			input:    []byte{0xFF, 0xFF, 0xFD},
+			expected: []byte{0xFF, 0xFF, 0xFD},
+		},
+		{
+			name:     "consecutive stuffed patterns",
+			input:    []byte{0xFF, 0xFF, 0xFD, 0xFD, 0xFF, 0xFF, 0xFD, 0xFD, 0xFF, 0xFF, 0xFD, 0xFD},
+			expected: []byte{0xFF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFD},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := DestuffParams(tt.input)
+			if !bytes.Equal(result, tt.expected) {
+				t.Errorf("DestuffParams(%s) = %X, want %X", tt.name, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBuildPacketWithStuffing(t *testing.T) {
+	// Params that contain header pattern
+	params := []byte{0xFF, 0xFF, 0xFD, 0x42}
+	packet := BuildPacket(1, InstWrite, params)
+
+	// Packet should contain stuffed params
+	// Parse it back to verify
+	// This is an instruction packet, so we can't parse it with ParsePacket (expects status)
+	// Just verify the packet is longer due to stuffing
+	if len(packet) <= 10+len(params) {
+		t.Error("Expected packet to be longer due to byte stuffing")
+	}
+}
+
+func TestCRCConsistency(t *testing.T) {
+	data := []byte{0xFF, 0xFF, 0xFD, 0x00, 0x01, 0x03, 0x00, 0x01}
+	crc1 := UpdateCRC(0, data)
+	crc2 := UpdateCRC(0, data)
+
+	if crc1 != crc2 {
+		t.Errorf("CRC not consistent: %04X vs %04X", crc1, crc2)
+	}
+}

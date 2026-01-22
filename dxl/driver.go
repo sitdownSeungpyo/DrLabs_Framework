@@ -7,11 +7,29 @@ import (
 	"time"
 )
 
-// SerialPortInterface defines the interface for serial port operations
-// This allows for mocking in tests
+// Protocol constants
+const (
+	// ReadBufferSize is the size of the temporary buffer for reading serial data
+	ReadBufferSize = 1024
+	// MinHeaderSize is the minimum bytes needed to parse packet header and length
+	MinHeaderSize = 7 // Header(4) + ID(1) + Length(2)
+	// DefaultTimeout is the default timeout for packet read operations
+	DefaultTimeout = 100 * time.Millisecond
+)
+
+// SerialPortInterface defines the contract for serial port operations.
+// Implementations must handle platform-specific serial I/O (Windows/Linux).
+// This interface enables dependency injection and mocking for unit tests.
 type SerialPortInterface interface {
+	// Read reads up to len(b) bytes into b from the serial port.
+	// Returns the number of bytes read (0 <= n <= len(b)) and any error encountered.
 	Read(b []byte) (int, error)
+
+	// Write writes len(b) bytes from b to the serial port.
+	// Returns the number of bytes written and any error encountered.
 	Write(b []byte) (int, error)
+
+	// Close closes the serial port and releases associated resources.
 	Close() error
 }
 
@@ -34,11 +52,13 @@ func findPacketStart(data []byte) int {
 	return -1
 }
 
-// readPacketWithTimeout reads a complete packet from the serial port with timeout
+// readPacketWithTimeout reads a complete Dynamixel packet from the serial port.
+// It accumulates bytes until a complete packet is received or timeout occurs.
+// Returns the complete packet bytes or an error if timeout/read failure occurs.
 func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
 	buf := bytes.NewBuffer(nil)
-	tmp := make([]byte, 1024)
+	tmp := make([]byte, ReadBufferSize)
 
 	for time.Now().Before(deadline) {
 		n, err := d.port.Read(tmp)
@@ -48,15 +68,15 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 		if n > 0 {
 			buf.Write(tmp[:n])
 
-			// Check if we have enough for header + length
-			if buf.Len() >= 7 {
+			// Check if we have enough bytes for header + length fields
+			if buf.Len() >= MinHeaderSize {
 				b := buf.Bytes()
 				startIdx := findPacketStart(b)
 
-				if startIdx != -1 && buf.Len() >= startIdx+7 {
+				if startIdx != -1 && buf.Len() >= startIdx+MinHeaderSize {
 					pkt := buf.Bytes()
 					bodyLen := uint16(pkt[startIdx+5]) | (uint16(pkt[startIdx+6]) << 8)
-					totalLen := startIdx + 7 + int(bodyLen)
+					totalLen := startIdx + MinHeaderSize + int(bodyLen)
 
 					if buf.Len() >= totalLen {
 						return pkt[startIdx:totalLen], nil
@@ -69,16 +89,15 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 	return nil, fmt.Errorf("read timeout, buffered: %x", buf.Bytes())
 }
 
-// Transfer sends a packet and waits for a response
+// Transfer sends a packet and waits for a response.
+// This is the fundamental request-response pattern for Dynamixel communication.
 func (d *Driver) Transfer(txPacket []byte) ([]byte, error) {
-	// Write packet
 	_, err := d.port.Write(txPacket)
 	if err != nil {
 		return nil, fmt.Errorf("write failed: %v", err)
 	}
 
-	// Read response with 100ms timeout
-	return d.readPacketWithTimeout(100 * time.Millisecond)
+	return d.readPacketWithTimeout(DefaultTimeout)
 }
 
 func (d *Driver) Write(id uint8, addr uint16, data []byte) error {
@@ -173,31 +192,37 @@ type SyncWriteData struct {
 	Data []byte
 }
 
-// SyncWrite writes same address to multiple motors in one packet
-// More efficient than individual writes
+// SyncWrite writes the same address to multiple motors in a single packet.
+// This is significantly more efficient than individual writes when controlling
+// multiple motors simultaneously (e.g., synchronized motion).
 func (d *Driver) SyncWrite(addr uint16, dataLength uint16, motors []SyncWriteData) error {
 	if len(motors) == 0 {
 		return fmt.Errorf("no motors provided")
 	}
 
-	// Build parameters: [Addr_L, Addr_H, Len_L, Len_H, [ID1, Data1...], [ID2, Data2...], ...]
-	params := make([]byte, 4)
-	binary.LittleEndian.PutUint16(params[0:], addr)
-	binary.LittleEndian.PutUint16(params[2:], dataLength)
-
-	// Append each motor's ID and data
+	// Validate data length for all motors first
 	for _, m := range motors {
 		if len(m.Data) != int(dataLength) {
 			return fmt.Errorf("motor ID %d: data length mismatch (expected %d, got %d)", m.ID, dataLength, len(m.Data))
 		}
+	}
+
+	// Pre-allocate buffer with exact size to avoid reallocations
+	// Format: [Addr_L, Addr_H, Len_L, Len_H, [ID1, Data1...], [ID2, Data2...], ...]
+	totalSize := 4 + len(motors)*(1+int(dataLength))
+	params := make([]byte, 4, totalSize)
+	binary.LittleEndian.PutUint16(params[0:], addr)
+	binary.LittleEndian.PutUint16(params[2:], dataLength)
+
+	// Append motor data efficiently
+	for _, m := range motors {
 		params = append(params, m.ID)
 		params = append(params, m.Data...)
 	}
 
-	// Use broadcast ID (0xFE) for sync write - no response expected
+	// Use broadcast ID (0xFE) - no status response expected
 	tx := BuildPacket(0xFE, InstSyncWrite, params)
 
-	// For sync write, we don't expect response, just send
 	_, err := d.port.Write(tx)
 	if err != nil {
 		return fmt.Errorf("sync write failed: %v", err)
@@ -253,7 +278,7 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 	for i, id := range ids {
 		results[i].ID = id
 
-		rx, err := d.readPacketWithTimeout(100 * time.Millisecond)
+		rx, err := d.readPacketWithTimeout(DefaultTimeout)
 		if err != nil {
 			results[i].Err = fmt.Errorf("timeout waiting for motor %d: %v", id, err)
 			continue

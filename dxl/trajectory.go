@@ -1,6 +1,7 @@
 package dxl
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
@@ -9,18 +10,18 @@ import (
 // TrapezoidalProfile represents a trapezoidal velocity profile for motion planning.
 // It generates smooth motion with constant acceleration, constant velocity, and constant deceleration phases.
 type TrapezoidalProfile struct {
-	StartPos     float64       // Starting position
-	TargetPos    float64       // Target position
-	MaxVelocity  float64       // Maximum velocity (units/sec)
-	Acceleration float64       // Acceleration (units/sec^2)
+	StartPos     float64 // Starting position
+	TargetPos    float64 // Target position
+	MaxVelocity  float64 // Maximum velocity (units/sec)
+	Acceleration float64 // Acceleration (units/sec^2)
 
 	// Calculated profile parameters
-	totalTime    float64       // Total time for the motion
-	accelTime    float64       // Time for acceleration phase
-	decelTime    float64       // Time for deceleration phase
-	cruiseTime   float64       // Time for constant velocity phase
-	cruiseVel    float64       // Actual cruise velocity (may be < MaxVelocity)
-	distance     float64       // Total distance to travel
+	totalTime  float64 // Total time for the motion
+	accelTime  float64 // Time for acceleration phase
+	decelTime  float64 // Time for deceleration phase
+	cruiseTime float64 // Time for constant velocity phase
+	cruiseVel  float64 // Actual cruise velocity (may be < MaxVelocity)
+	distance   float64 // Total distance to travel
 }
 
 // TrajectoryPoint represents a single point in the trajectory
@@ -126,27 +127,27 @@ func (p *TrapezoidalProfile) Sample(t float64) TrajectoryPoint {
 		accel = p.Acceleration
 		vel = accel * t
 		pos = 0.5 * accel * t * t
-	} else if t <= p.accelTime + p.cruiseTime {
+	} else if t <= p.accelTime+p.cruiseTime {
 		// Constant velocity (cruise) phase
 		accel = 0
 		vel = p.cruiseVel
 		tCruise := t - p.accelTime
 		posCruiseStart := 0.5 * p.Acceleration * p.accelTime * p.accelTime
-		pos = posCruiseStart + vel * tCruise
+		pos = posCruiseStart + vel*tCruise
 	} else {
 		// Deceleration phase
 		accel = -p.Acceleration
 		tDecel := t - p.accelTime - p.cruiseTime
 		velDecelStart := p.cruiseVel
-		vel = velDecelStart - p.Acceleration * tDecel
+		vel = velDecelStart - p.Acceleration*tDecel
 		posCruiseStart := 0.5 * p.Acceleration * p.accelTime * p.accelTime
-		posCruiseEnd := posCruiseStart + p.cruiseVel * p.cruiseTime
-		pos = posCruiseEnd + velDecelStart * tDecel - 0.5 * p.Acceleration * tDecel * tDecel
+		posCruiseEnd := posCruiseStart + p.cruiseVel*p.cruiseTime
+		pos = posCruiseEnd + velDecelStart*tDecel - 0.5*p.Acceleration*tDecel*tDecel
 	}
 
 	return TrajectoryPoint{
 		Time:     t,
-		Position: p.StartPos + direction * pos,
+		Position: p.StartPos + direction*pos,
 		Velocity: direction * vel,
 		Accel:    direction * accel,
 	}
@@ -165,7 +166,7 @@ func (p *TrapezoidalProfile) Generate(sampleRate float64) []TrajectoryPoint {
 	}
 
 	dt := 1.0 / sampleRate
-	numPoints := int(math.Ceil(p.totalTime * sampleRate)) + 1
+	numPoints := int(math.Ceil(p.totalTime*sampleRate)) + 1
 
 	points := make([]TrajectoryPoint, 0, numPoints)
 
@@ -190,6 +191,18 @@ func (p *TrapezoidalProfile) TotalTime() float64 {
 	return p.totalTime
 }
 
+// clampToUint32 safely converts a float64 position to uint32 motor position,
+// clamping to valid range [0, 4294967295] to prevent overflow.
+func clampToUint32(pos float64) uint32 {
+	if pos < 0 {
+		return 0
+	}
+	if pos > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(pos)
+}
+
 // TrajectoryExecutor executes a trajectory on a motor using the controller
 type TrajectoryExecutor struct {
 	controller *Controller
@@ -206,27 +219,42 @@ func NewTrajectoryExecutor(controller *Controller, motorID uint8) *TrajectoryExe
 
 // Execute runs the trajectory on the motor.
 // This is a blocking call that sends position commands at the specified rate.
+// Uses the controller's context for cancellation support.
 func (e *TrajectoryExecutor) Execute(profile *TrapezoidalProfile, updateRate float64) error {
+	return e.ExecuteWithContext(e.controller.ctx, profile, updateRate)
+}
+
+// ExecuteWithContext runs the trajectory with explicit context for cancellation.
+func (e *TrajectoryExecutor) ExecuteWithContext(ctx context.Context, profile *TrapezoidalProfile, updateRate float64) error {
 	points := profile.Generate(updateRate)
 
 	if len(points) == 0 {
 		return fmt.Errorf("empty trajectory")
 	}
 
-	ticker := time.NewTicker(time.Duration(float64(time.Second) / updateRate))
+	// Use integer arithmetic for precise tick interval
+	intervalNs := int64(time.Second) / int64(updateRate)
+	ticker := time.NewTicker(time.Duration(intervalNs))
 	defer ticker.Stop()
 
 	for i, point := range points {
-		position := uint32(point.Position)
+		position := clampToUint32(point.Position)
 
-		// Send command to motor
-		e.controller.CommandChan <- []Command{
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case e.controller.CommandChan <- []Command{
 			{ID: e.motorID, Value: position},
+		}:
 		}
 
 		// Wait for next update (except for last point)
 		if i < len(points)-1 {
-			<-ticker.C
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
 		}
 	}
 
@@ -234,7 +262,8 @@ func (e *TrajectoryExecutor) Execute(profile *TrapezoidalProfile, updateRate flo
 }
 
 // ExecuteAsync runs the trajectory asynchronously.
-// Returns a channel that will be closed when the trajectory is complete.
+// Returns a channel that receives an error (or nil) when the trajectory completes.
+// Cancel via the controller's context.
 func (e *TrajectoryExecutor) ExecuteAsync(profile *TrapezoidalProfile, updateRate float64) (<-chan error, error) {
 	points := profile.Generate(updateRate)
 
@@ -246,28 +275,7 @@ func (e *TrajectoryExecutor) ExecuteAsync(profile *TrapezoidalProfile, updateRat
 
 	go func() {
 		defer close(errChan)
-
-		ticker := time.NewTicker(time.Duration(float64(time.Second) / updateRate))
-		defer ticker.Stop()
-
-		for i, point := range points {
-			position := uint32(point.Position)
-
-			// Send command to motor
-			select {
-			case e.controller.CommandChan <- []Command{
-				{ID: e.motorID, Value: position},
-			}:
-			default:
-				errChan <- fmt.Errorf("command channel full")
-				return
-			}
-
-			// Wait for next update (except for last point)
-			if i < len(points)-1 {
-				<-ticker.C
-			}
-		}
+		errChan <- e.ExecuteWithContext(e.controller.ctx, profile, updateRate)
 	}()
 
 	return errChan, nil

@@ -147,19 +147,21 @@ func (c *Controller) Start() error {
 
 	c.driver = NewDriver(sp)
 
-	// 2. Ping Motor 1 Check
-	fmt.Println("Pinging Motor ID 1...")
-	model, err := c.driver.Ping(1)
-	if err != nil {
-		sp.Close()
-		return fmt.Errorf("ping failed for ID 1: %v. Check Power/ID/Baudrate", err)
-	}
-	fmt.Printf("Motor ID 1 Found! Model Number: %d\n", model)
+	// 2. Ping and enable torque for all configured motors
+	motorIDs := c.getMotorIDs()
+	for _, id := range motorIDs {
+		fmt.Printf("Pinging Motor ID %d...\n", id)
+		model, err := c.driver.Ping(id)
+		if err != nil {
+			sp.Close()
+			return fmt.Errorf("ping failed for ID %d: %v. Check Power/ID/Baudrate", id, err)
+		}
+		fmt.Printf("Motor ID %d Found! Model Number: %d\n", id, model)
 
-	// 3. Enable Torque
-	if err := c.enableTorque(1); err != nil {
-		sp.Close()
-		return fmt.Errorf("failed to enable torque: %v", err)
+		if err := c.enableTorque(id); err != nil {
+			sp.Close()
+			return fmt.Errorf("failed to enable torque for ID %d: %v", id, err)
+		}
 	}
 
 	// Start the control loop in a separate goroutine
@@ -220,8 +222,15 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 
 	// EEPROM Write Delay: Operating Mode change requires reboot/flash time.
 	// This happens ONLY ONCE at startup, so it does not affect control loop performance.
-	// Increased delay to ensure motor is fully ready after mode change
 	time.Sleep(1000 * time.Millisecond)
+
+	// Verify mode was actually set
+	data, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
+	if err != nil {
+		fmt.Printf("Warning: could not verify operating mode (read error: %v)\n", err)
+	} else if len(data) > 0 && data[0] != mode {
+		return fmt.Errorf("operating mode verification failed: wrote %d, read back %d", mode, data[0])
+	}
 
 	// Update Active Goal Address (thread-safe)
 	c.mu.Lock()
@@ -233,7 +242,6 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
 		c.activeGoalAddr = c.Model.AddrGoalPosition
 	case OpModeCurrent:
-		// c.activeGoalAddr = c.Model.AddrGoalCurrent // Need to add if supported
 		fmt.Printf("Warning: Current mode not fully supported, using position address\n")
 		c.activeGoalAddr = c.Model.AddrGoalPosition
 	}

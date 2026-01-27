@@ -111,7 +111,7 @@ func buildStatusPacket(id uint8, errCode uint8, params []byte) []byte {
 
 func TestDriverPing(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Prepare response: model number 1060 (0x0424) = XM430
 	modelNum := uint16(1060)
@@ -148,7 +148,7 @@ func TestDriverPing(t *testing.T) {
 
 func TestDriverPingError(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Response with error code
 	response := buildStatusPacket(1, 0x80, nil) // Hardware alert
@@ -162,7 +162,7 @@ func TestDriverPingError(t *testing.T) {
 
 func TestDriverRead(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Prepare response: 4 bytes of position data
 	posData := []byte{0x00, 0x08, 0x00, 0x00} // position = 2048
@@ -180,7 +180,7 @@ func TestDriverRead(t *testing.T) {
 
 func TestDriverWrite(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Prepare success response (no params)
 	response := buildStatusPacket(1, 0, nil)
@@ -200,7 +200,7 @@ func TestDriverWrite(t *testing.T) {
 
 func TestDriverWrite4Byte(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	response := buildStatusPacket(1, 0, nil)
 	mock.SetResponse(response)
@@ -213,7 +213,7 @@ func TestDriverWrite4Byte(t *testing.T) {
 
 func TestDriverRead4Byte(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Position 2048 = 0x00000800
 	posData := []byte{0x00, 0x08, 0x00, 0x00}
@@ -231,7 +231,7 @@ func TestDriverRead4Byte(t *testing.T) {
 
 func TestDriverWriteError(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	mock.SetWriteError(errors.New("write failed"))
 
@@ -243,7 +243,7 @@ func TestDriverWriteError(t *testing.T) {
 
 func TestDriverReadTimeout(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// No response set - will timeout
 
@@ -293,7 +293,7 @@ func TestFindPacketStart(t *testing.T) {
 
 func TestSyncWriteData(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	motors := []SyncWriteData{
 		{ID: 1, Data: []byte{0x00, 0x08, 0x00, 0x00}},
@@ -318,7 +318,7 @@ func TestSyncWriteData(t *testing.T) {
 
 func TestSyncWriteDataLengthMismatch(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	motors := []SyncWriteData{
 		{ID: 1, Data: []byte{0x00, 0x08}}, // Only 2 bytes instead of 4
@@ -332,7 +332,7 @@ func TestSyncWriteDataLengthMismatch(t *testing.T) {
 
 func TestSyncWriteNoMotors(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	err := driver.SyncWrite(116, 4, nil)
 	if err == nil {
@@ -344,7 +344,7 @@ func TestSyncRead(t *testing.T) {
 	// SyncRead reads one packet at a time from each motor
 	// We need to test this differently - each read should get one response
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// For sync read with 2 motors, we'll get 2 separate reads
 	// Set first response
@@ -387,7 +387,7 @@ func TestSyncRead(t *testing.T) {
 
 func TestSyncWrite4ByteMemoryOptimization(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Test with 10 motors to ensure pre-allocation works
 	values := make(map[uint8]uint32)
@@ -409,7 +409,7 @@ func TestSyncWrite4ByteMemoryOptimization(t *testing.T) {
 
 func TestReadPacketWithGarbage(t *testing.T) {
 	mock := NewMockSerialPort()
-	driver := &Driver{port: mock}
+	driver := NewDriver(mock)
 
 	// Response with garbage before header
 	garbage := []byte{0x00, 0x01, 0x02, 0x03}

@@ -34,11 +34,12 @@ type SerialPortInterface interface {
 }
 
 type Driver struct {
-	port SerialPortInterface
+	port    SerialPortInterface
+	Timeout time.Duration // Configurable timeout for read operations
 }
 
 func NewDriver(port SerialPortInterface) *Driver {
-	return &Driver{port: port}
+	return &Driver{port: port, Timeout: DefaultTimeout}
 }
 
 // findPacketStart finds the start index of a valid packet header (FF FF FD)
@@ -97,7 +98,7 @@ func (d *Driver) Transfer(txPacket []byte) ([]byte, error) {
 		return nil, fmt.Errorf("write failed: %v", err)
 	}
 
-	return d.readPacketWithTimeout(DefaultTimeout)
+	return d.readPacketWithTimeout(d.Timeout)
 }
 
 func (d *Driver) Write(id uint8, addr uint16, data []byte) error {
@@ -278,7 +279,7 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 	for i, id := range ids {
 		results[i].ID = id
 
-		rx, err := d.readPacketWithTimeout(DefaultTimeout)
+		rx, err := d.readPacketWithTimeout(d.Timeout)
 		if err != nil {
 			results[i].Err = fmt.Errorf("timeout waiting for motor %d: %v", id, err)
 			continue
@@ -297,7 +298,9 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 	return results, nil
 }
 
-// SyncRead4Byte reads 4-byte values from multiple motors
+// SyncRead4Byte reads 4-byte values from multiple motors.
+// Returns partial results: motors that responded successfully are included in the map.
+// Returns an error only if no motor responded at all.
 func (d *Driver) SyncRead4Byte(addr uint16, ids []uint8) (map[uint8]uint32, error) {
 	results, err := d.SyncRead(addr, 4, ids)
 	if err != nil {
@@ -305,14 +308,21 @@ func (d *Driver) SyncRead4Byte(addr uint16, ids []uint8) (map[uint8]uint32, erro
 	}
 
 	values := make(map[uint8]uint32)
+	var lastErr error
 	for _, r := range results {
 		if r.Err != nil {
-			return nil, fmt.Errorf("motor %d error: %v", r.ID, r.Err)
+			lastErr = fmt.Errorf("motor %d error: %v", r.ID, r.Err)
+			continue
 		}
 		if len(r.Data) != 4 {
-			return nil, fmt.Errorf("motor %d: invalid data length %d", r.ID, len(r.Data))
+			lastErr = fmt.Errorf("motor %d: invalid data length %d", r.ID, len(r.Data))
+			continue
 		}
 		values[r.ID] = binary.LittleEndian.Uint32(r.Data)
+	}
+
+	if len(values) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 
 	return values, nil

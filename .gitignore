@@ -14,3 +14,6 @@
 # Editor
 .vscode/
 .idea/
+
+# Claude
+.claude

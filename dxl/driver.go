@@ -13,6 +13,8 @@ const (
 	ReadBufferSize = 1024
 	// MinHeaderSize is the minimum bytes needed to parse packet header and length
 	MinHeaderSize = 7 // Header(4) + ID(1) + Length(2)
+	// MaxPacketSize is the maximum valid packet size (prevents DoS on corrupted length)
+	MaxPacketSize = 1024
 	// DefaultTimeout is the default timeout for packet read operations
 	DefaultTimeout = 100 * time.Millisecond
 )
@@ -78,6 +80,11 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 					pkt := buf.Bytes()
 					bodyLen := uint16(pkt[startIdx+5]) | (uint16(pkt[startIdx+6]) << 8)
 					totalLen := startIdx + MinHeaderSize + int(bodyLen)
+
+					// Validate packet length bounds
+					if totalLen > MaxPacketSize {
+						return nil, fmt.Errorf("packet length exceeds maximum: %d", totalLen)
+					}
 
 					if buf.Len() >= totalLen {
 						return pkt[startIdx:totalLen], nil
@@ -224,9 +231,12 @@ func (d *Driver) SyncWrite(addr uint16, dataLength uint16, motors []SyncWriteDat
 	// Use broadcast ID (0xFE) - no status response expected
 	tx := BuildPacket(0xFE, InstSyncWrite, params)
 
-	_, err := d.port.Write(tx)
+	n, err := d.port.Write(tx)
 	if err != nil {
 		return fmt.Errorf("sync write failed: %v", err)
+	}
+	if n != len(tx) {
+		return fmt.Errorf("sync write incomplete: sent %d/%d bytes", n, len(tx))
 	}
 
 	// Small delay to ensure packet transmission completes

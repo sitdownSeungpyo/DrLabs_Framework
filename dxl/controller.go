@@ -104,14 +104,24 @@ func NewController(devicePort string, baudRate int, model MotorModel) *Controlle
 	}
 }
 
+// MaxValidMotorID is the maximum valid Dynamixel motor ID (253-255 are reserved)
+const MaxValidMotorID = 252
+
 // SetMotorIDs configures which motors to control
 // Automatically enables sync read/write if multiple motors
 // Thread-safe: can be called while control loop is running
-func (c *Controller) SetMotorIDs(ids []uint8) {
+// Returns error if any motor ID is invalid (must be 0-252)
+func (c *Controller) SetMotorIDs(ids []uint8) error {
+	for _, id := range ids {
+		if id > MaxValidMotorID {
+			return fmt.Errorf("invalid motor ID %d: must be 0-%d", id, MaxValidMotorID)
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.MotorIDs = ids
 	c.useSyncReadWrite = len(ids) > 1
+	return nil
 }
 
 // getMotorIDs returns a copy of motor IDs (thread-safe)
@@ -303,20 +313,13 @@ func (c *Controller) controlLoop() {
 
 		if c.isSyncMode() {
 			// Use Sync Read for multiple motors (more efficient)
-			values, err := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
-			if err != nil {
-				// Error reading all motors, create error feedback for each
-				for _, id := range motorIDs {
-					feedbacks = append(feedbacks, Feedback{ID: id, Value: 0, Error: err})
-				}
-			} else {
-				// Success, create feedback for each motor
-				for _, id := range motorIDs {
-					if val, ok := values[id]; ok {
-						feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: nil})
-					} else {
-						feedbacks = append(feedbacks, Feedback{ID: id, Value: 0, Error: fmt.Errorf("no data for motor %d", id)})
-					}
+			// SyncRead4Byte returns partial results - use values for responding motors
+			values, _ := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
+			for _, id := range motorIDs {
+				if val, ok := values[id]; ok {
+					feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: nil})
+				} else {
+					feedbacks = append(feedbacks, Feedback{ID: id, Value: 0, Error: fmt.Errorf("no response from motor %d", id)})
 				}
 			}
 		} else {

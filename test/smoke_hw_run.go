@@ -38,7 +38,10 @@ func main() {
 	// --- Test 1: Controller Start (pings all configured motors) ---
 	fmt.Println("[Test 1] Controller Start - ping configured motor IDs")
 	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
-	ctrl.SetMotorIDs([]uint8{motorID})
+	if err := ctrl.SetMotorIDs([]uint8{motorID}); err != nil {
+		fail("SetMotorIDs", err)
+		os.Exit(1)
+	}
 
 	if err := ctrl.Start(); err != nil {
 		fail("Controller Start", err)

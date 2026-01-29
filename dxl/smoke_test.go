@@ -203,3 +203,62 @@ func TestSmokeTickerIntegerPrecision(t *testing.T) {
 		}
 	}
 }
+
+// 8. Zero update rate validation
+func TestSmokeTrajectoryZeroUpdateRate(t *testing.T) {
+	profile, err := NewTrapezoidalProfile(0, 1000, 500, 1000)
+	if err != nil {
+		t.Fatalf("Failed to create profile: %v", err)
+	}
+
+	ctx := context.Background()
+	ctrl := &Controller{
+		CommandChan: make(chan []Command, 10),
+		ctx:         ctx,
+	}
+	executor := NewTrajectoryExecutor(ctrl, 1)
+
+	// Zero update rate should return error
+	err = executor.ExecuteWithContext(ctx, profile, 0)
+	if err == nil {
+		t.Error("Expected error for zero update rate, got nil")
+	}
+
+	// Negative update rate should return error
+	err = executor.ExecuteWithContext(ctx, profile, -100)
+	if err == nil {
+		t.Error("Expected error for negative update rate, got nil")
+	}
+}
+
+// 9. Motor ID validation
+func TestSmokeMotorIDValidation(t *testing.T) {
+	ctrl := &Controller{}
+
+	// Valid IDs should pass
+	err := ctrl.SetMotorIDs([]uint8{1, 2, 100, 252})
+	if err != nil {
+		t.Errorf("Valid motor IDs should not return error: %v", err)
+	}
+
+	// Invalid ID (253+) should fail
+	err = ctrl.SetMotorIDs([]uint8{1, 253})
+	if err == nil {
+		t.Error("Expected error for motor ID 253, got nil")
+	}
+
+	err = ctrl.SetMotorIDs([]uint8{255})
+	if err == nil {
+		t.Error("Expected error for motor ID 255, got nil")
+	}
+}
+
+// 10. MaxPacketSize constant exists
+func TestSmokeMaxPacketSizeConstant(t *testing.T) {
+	if MaxPacketSize <= 0 {
+		t.Errorf("MaxPacketSize should be positive, got %d", MaxPacketSize)
+	}
+	if MaxPacketSize < 256 {
+		t.Errorf("MaxPacketSize too small: %d", MaxPacketSize)
+	}
+}

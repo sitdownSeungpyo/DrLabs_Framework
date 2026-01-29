@@ -19,7 +19,10 @@ func main() {
 	fmt.Printf("Starting Torque (Current) Test on %s at %d baud, ID %d...\n", *portVal, *baudVal, *idVal)
 
 	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
-	ctrl.SetMotorIDs([]uint8{uint8(*idVal)})
+	if err := ctrl.SetMotorIDs([]uint8{uint8(*idVal)}); err != nil {
+		fmt.Printf("Invalid motor ID: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error starting controller: %v\n", err)

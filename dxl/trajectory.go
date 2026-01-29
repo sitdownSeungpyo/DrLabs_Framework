@@ -226,6 +226,10 @@ func (e *TrajectoryExecutor) Execute(profile *TrapezoidalProfile, updateRate flo
 
 // ExecuteWithContext runs the trajectory with explicit context for cancellation.
 func (e *TrajectoryExecutor) ExecuteWithContext(ctx context.Context, profile *TrapezoidalProfile, updateRate float64) error {
+	if updateRate <= 0 {
+		return fmt.Errorf("update rate must be positive, got %v", updateRate)
+	}
+
 	points := profile.Generate(updateRate)
 
 	if len(points) == 0 {

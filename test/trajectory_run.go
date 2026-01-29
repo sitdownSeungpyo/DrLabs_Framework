@@ -69,7 +69,10 @@ func main() {
 
 	// Create Controller
 	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
-	ctrl.SetMotorIDs([]uint8{uint8(*idVal)})
+	if err := ctrl.SetMotorIDs([]uint8{uint8(*idVal)}); err != nil {
+		fmt.Printf("Invalid motor ID: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := ctrl.Start(); err != nil {
 		fmt.Printf("Error starting controller: %v\n", err)

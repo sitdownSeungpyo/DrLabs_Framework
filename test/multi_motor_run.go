@@ -24,7 +24,10 @@ func main() {
 
 	// Configure multiple motors - adjust IDs to match your setup
 	motorIDs := []uint8{1, 2, 3} // Control 3 motors simultaneously
-	ctrl.SetMotorIDs(motorIDs)
+	if err := ctrl.SetMotorIDs(motorIDs); err != nil {
+		fmt.Printf("Invalid motor IDs: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("Multi-Motor Control Test\n")
 	fmt.Printf("Motor IDs: %v\n", motorIDs)

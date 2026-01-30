@@ -1,149 +1,142 @@
-# 🚀 Pure Go Dynamixel Control
+# Pure Go Dynamixel Control
 
-> **"No Cgo, No DLLs, Just Pure Go."**
+A high-performance, native Go implementation of **Dynamixel Protocol 2.0** for Windows/Linux.
 
-A high-performance, native Go implementation of the **Dynamixel Protocol 2.0** for Windows.
-Designed for developers who want the concurrency and simplicity of Go without the headache of C/C++ dependencies.
+**No Cgo, No DLLs, Just Pure Go.**
 
-## ✨ Key Features
+## Features
 
-- **Pure Go Implementation**:
-  - Zero dependencies on `dxl_x64_c.dll` or `gcc`.
-  - Native Windows & Linux serial port support.
-- **Protocol 2.0 Full Support**:
-  - Complete implementation of Packet Construction, Parsing, Byte Stuffing, and CRC16 validation.
-  - **Sync Read/Write**: Efficient multi-motor control in a single packet (up to 3-5x faster).
-  - **Bulk Read/Write**: Future support for different addresses per motor.
-- **Robust Control Architecture**:
-  - **Verified Startup**: Checks Ping and Torque Enable before motion.
-  - **Closed Loop Control**: Feedback-based motion (Move -> Verify Arrival -> Move).
-  - **Concurrency**: Goroutine-based non-blocking controller loop.
-  - **Multi-Motor Support**: Control multiple motors simultaneously with automatic sync optimization.
-- **Configurable Motor Models**:
-  - Supports X-Series (`XM430`, `XC430`) and Pro-Series out of the box.
-- **Multiple Control Modes**:
-  - Position Control, Velocity Control, PWM (Torque) Control
+- **Pure Go** - No C dependencies, native serial port implementation
+- **Protocol 2.0** - Packet construction, parsing, byte stuffing, CRC16
+- **Sync Read/Write** - Efficient multi-motor control (3-5x faster)
+- **Trajectory Generation** - Trapezoidal velocity profile for smooth motion
+- **Thread-safe** - Concurrent controller with context-based cancellation
+- **Multi-platform** - Windows and Linux support
 
-## 📁 Project Structure
+## Project Structure
 
-```bash
-dxl_go/
-├── dxl/
-│   ├── driver.go         # 🎮 High-Level API (Ping, Read, Write, Sync Read/Write)
-│   ├── protocol.go       # 🧠 Protocol 2.0 Logic (CRC, Packet)
-│   ├── controller.go     # ⚡ Concurrent Multi-Motor Control Loop
-│   ├── serial_windows.go # 🔌 Native Windows Serial Port
-│   └── serial_linux.go   # 🔌 Native Linux Serial Port
-├── test/
-│   ├── position_run.go   # Position control example
-│   ├── velocity_run.go   # Velocity control example
-│   ├── torque_run.go     # PWM/Torque control example
-│   ├── multi_motor_run.go# Multi-motor sync control example
-│   └── sync_benchmark.go # Performance comparison
-└── main.go               # 🚀 Main entry point
+```
+dxl/
+  controller.go      # Multi-motor control loop
+  driver.go          # High-level API (Ping, Read, Write, SyncRead/Write)
+  protocol.go        # Protocol 2.0 (CRC, Packet, Stuffing)
+  trajectory.go      # Trapezoidal velocity profile generation
+  serial_windows.go  # Windows serial port
+  serial_linux.go    # Linux serial port
+  *_test.go          # Unit tests
+
+test/
+  position_run.go    # Position control example
+  velocity_run.go    # Velocity control example
+  torque_run.go      # PWM/Torque control example
+  multi_motor_run.go # Multi-motor sync control
+  trajectory_run.go  # Trajectory execution example
+  smoke_hw_run.go    # Hardware smoke test
+  sync_benchmark.go  # Performance benchmark
+
+docs/
+  TESTING.md         # Test execution guide
 ```
 
-## 🚀 Getting Started
-
-### Prerequisites
-- Go 1.18+
-- Windows OS (for `syscall` support)
-- Dynamixel X-Series or compatible motor (Protocol 2.0)
+## Quick Start
 
 ### Installation
 
 ```bash
 git clone https://github.com/sitdownSeungpyo/dxl_go.git
 cd dxl_go/src
-go build
+go build ./...
 ```
 
-### Usage Examples
+### Basic Usage
 
-**Position Control (Single Motor):**
-```bash
-cd test
-go run position_run.go
-```
-
-**Velocity Control:**
-```bash
-cd test
-go run velocity_run.go
-```
-
-**Multi-Motor Control (Sync Read/Write):**
-```bash
-cd test
-go run multi_motor_run.go
-```
-
-**Performance Benchmark:**
-Compare individual writes vs sync write performance.
-```bash
-cd test
-go run sync_benchmark.go
-# Expected: Sync Write is 3-5x faster for 3+ motors
-```
-
-### API Quick Reference
-
-**Single Motor Control:**
 ```go
-// Individual read/write
-driver.Write4Byte(id, addr, value)
-driver.Read4Byte(id, addr)
-```
-
-**Multi-Motor Control (Recommended):**
-```go
-// Sync Write - Send to multiple motors in one packet
-values := map[uint8]uint32{
-    1: 2048,  // Motor 1 -> position 2048
-    2: 3072,  // Motor 2 -> position 3072
-    3: 1024,  // Motor 3 -> position 1024
-}
-driver.SyncWrite4Byte(goalPositionAddr, values)
-
-// Sync Read - Read from multiple motors efficiently
-ids := []uint8{1, 2, 3}
-positions, _ := driver.SyncRead4Byte(presentPositionAddr, ids)
-// Returns: map[uint8]uint32{1: 2048, 2: 3072, 3: 1024}
-```
-
-**Controller with Auto-Optimization:**
-```go
-ctrl := dxl.NewController("COM3", 57600, dxl.ModelXSeries)
-ctrl.SetMotorIDs([]uint8{1, 2, 3}) // Automatically enables sync read/write
+ctrl := dxl.NewController("COM3", 1000000, dxl.ModelXSeries)
+ctrl.SetMotorIDs([]uint8{1})
 ctrl.Start()
+defer ctrl.Stop()
 
-// Send commands - automatically uses sync write for efficiency
+// Set mode
+ctrl.SetOperatingMode(1, dxl.OpModePosition)
+
+// Send command
+ctrl.CommandChan <- []dxl.Command{{ID: 1, Value: 2048}}
+
+// Receive feedback
+fb := <-ctrl.FeedbackChan
+fmt.Printf("Position: %d\n", fb[0].Value)
+```
+
+### Multi-Motor Control
+
+```go
+ctrl.SetMotorIDs([]uint8{1, 2, 3}) // Auto-enables sync mode
+
 ctrl.CommandChan <- []dxl.Command{
     {ID: 1, Value: 2048},
     {ID: 2, Value: 3072},
     {ID: 3, Value: 1024},
 }
-
-// Receive feedback - automatically uses sync read
-feedbacks := <-ctrl.FeedbackChan // Returns all motor positions
 ```
 
-## 🗺️ Roadmap & TBD
+### Trajectory Execution
 
-Recent updates:
-- [x] **Sync Read/Write**: Implemented for efficient multi-motor control (3-5x faster)
-- [x] **Cross-Platform Support**: Linux support added
-- [x] **Multiple Control Modes**: Position, Velocity, and PWM control
+```go
+profile, _ := dxl.NewTrapezoidalProfile(0, 4096, 1000, 5000)
+executor := dxl.NewTrajectoryExecutor(ctrl, 1)
+executor.Execute(profile, 100) // 100Hz update rate
+```
 
-Future enhancements:
-- [ ] **Bulk Read/Write**: Per-motor custom address/length support
-- [ ] **Trajectory Generation**: Trapezoidal velocity profile generation in Go
-- [ ] **macOS Support**: Add `serial_darwin.go`
+## Running Tests
 
-## 🛠️ Tech Stack
+```bash
+# Unit tests
+go test ./dxl/... -v
 
-- **Language**: Go (Golang)
-- **OS**: Windows (Native API)
-- **Hardware**: Robotis Dynamixel Series
+# Unit tests with coverage
+go test ./dxl/... -cover
 
----
+# Hardware tests
+go run test/position_run.go -port COM4 -id 1
+go run test/trajectory_run.go -port COM4 -id 1
+go run test/smoke_hw_run.go -port COM4 -id 1
+```
+
+See [docs/TESTING.md](docs/TESTING.md) for detailed test commands.
+
+## API Reference
+
+| Function | Description |
+|----------|-------------|
+| `NewController(port, baud, model)` | Create controller |
+| `SetMotorIDs(ids)` | Configure motor IDs (0-252) |
+| `SetOperatingMode(id, mode)` | Set control mode |
+| `Start()` / `Stop()` | Start/stop control loop |
+| `NewTrapezoidalProfile(start, end, vel, accel)` | Create trajectory |
+| `TrajectoryExecutor.Execute(profile, rate)` | Run trajectory |
+
+## Control Modes
+
+| Mode | Constant | Description |
+|------|----------|-------------|
+| Position | `OpModePosition` | Position control |
+| Velocity | `OpModeVelocity` | Velocity control |
+| PWM | `OpModePWM` | Torque/PWM control |
+| Extended Position | `OpModeExtendedPosition` | Multi-turn position |
+| Current-based Position | `OpModeCurrentBasedPos` | Position with current limit |
+
+## Supported Motors
+
+- X-Series: XM430, XC430, XL430, etc.
+- MX-Series: MX-106, MX-64, MX-28 (Protocol 2.0 firmware)
+- Pro-Series: H54, H42
+
+## Requirements
+
+- Go 1.18+
+- Windows or Linux
+- Dynamixel Protocol 2.0 compatible motor
+
+## License
+
+MIT

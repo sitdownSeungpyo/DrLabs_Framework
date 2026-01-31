@@ -79,6 +79,12 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 				if startIdx != -1 && buf.Len() >= startIdx+MinHeaderSize {
 					pkt := buf.Bytes()
 					bodyLen := uint16(pkt[startIdx+5]) | (uint16(pkt[startIdx+6]) << 8)
+
+					// Validate body length before calculating totalLen to prevent overflow
+					if int(bodyLen) > MaxPacketSize-MinHeaderSize {
+						return nil, fmt.Errorf("body length exceeds maximum: %d", bodyLen)
+					}
+
 					totalLen := startIdx + MinHeaderSize + int(bodyLen)
 
 					// Validate packet length bounds

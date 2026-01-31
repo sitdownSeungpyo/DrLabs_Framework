@@ -154,8 +154,11 @@ func (p *TrapezoidalProfile) Sample(t float64) TrajectoryPoint {
 }
 
 // Generate creates a complete trajectory with points sampled at the given rate.
-// sampleRate is in Hz (samples per second).
+// sampleRate is in Hz (samples per second). Must be positive.
 func (p *TrapezoidalProfile) Generate(sampleRate float64) []TrajectoryPoint {
+	if sampleRate <= 0 {
+		return nil
+	}
 	if p.totalTime == 0 {
 		return []TrajectoryPoint{{
 			Time:     0,

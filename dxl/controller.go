@@ -182,6 +182,9 @@ func (c *Controller) Start() error {
 }
 
 func (c *Controller) enableTorque(id uint8) error {
+	if c.driver == nil {
+		return fmt.Errorf("controller not started")
+	}
 	// Write 1 to proper address
 	fmt.Printf("Enabling Torque for ID %d at address %d...\n", id, c.Model.AddrTorqueEnable)
 	err := c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{1})
@@ -212,6 +215,9 @@ func (c *Controller) enableTorque(id uint8) error {
 }
 
 func (c *Controller) disableTorque(id uint8) error {
+	if c.driver == nil {
+		return fmt.Errorf("controller not started")
+	}
 	fmt.Printf("Disabling Torque for ID %d...\n", id)
 	return c.driver.Write(id, c.Model.AddrTorqueEnable, []byte{0})
 }
@@ -242,8 +248,9 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		return fmt.Errorf("operating mode verification failed: wrote %d, read back %d", mode, data[0])
 	}
 
-	// Update Active Goal Address (thread-safe)
+	// Update Active Goal Address (thread-safe with defer for safety)
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	switch mode {
 	case OpModeVelocity:
 		c.activeGoalAddr = c.Model.AddrGoalVelocity
@@ -255,7 +262,6 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		fmt.Printf("Warning: Current mode not fully supported, using position address\n")
 		c.activeGoalAddr = c.Model.AddrGoalPosition
 	}
-	c.mu.Unlock()
 
 	// 3. Re-Enable Torque
 	if err := c.enableTorque(id); err != nil {

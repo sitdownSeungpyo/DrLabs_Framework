@@ -269,6 +269,38 @@ type SyncReadData struct {
 	Err  error
 }
 
+// extractPacketFromBuffer extracts a single packet from buffer, returning the packet and remaining bytes
+func extractPacketFromBuffer(data []byte) (packet []byte, remaining []byte, err error) {
+	if len(data) < MinHeaderSize {
+		return nil, data, nil // Not enough data yet
+	}
+
+	startIdx := findPacketStart(data)
+	if startIdx == -1 {
+		return nil, data, nil // No packet header found
+	}
+
+	if len(data) < startIdx+MinHeaderSize {
+		return nil, data, nil // Not enough data for header
+	}
+
+	bodyLen := uint16(data[startIdx+5]) | (uint16(data[startIdx+6]) << 8)
+	if int(bodyLen) > MaxPacketSize-MinHeaderSize {
+		return nil, nil, fmt.Errorf("body length exceeds maximum: %d", bodyLen)
+	}
+
+	totalLen := startIdx + MinHeaderSize + int(bodyLen)
+	if totalLen > MaxPacketSize {
+		return nil, nil, fmt.Errorf("packet length exceeds maximum: %d", totalLen)
+	}
+
+	if len(data) < totalLen {
+		return nil, data, nil // Not enough data for complete packet
+	}
+
+	return data[startIdx:totalLen], data[totalLen:], nil
+}
+
 // SyncRead reads same address from multiple motors
 func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncReadData, error) {
 	if len(ids) == 0 {
@@ -290,24 +322,71 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 		return nil, fmt.Errorf("sync read tx failed: %v", err)
 	}
 
-	// Read responses from each motor using the shared helper
+	// Read all responses using a shared buffer to handle responses arriving together
 	results := make([]SyncReadData, len(ids))
-	for i, id := range ids {
-		results[i].ID = id
+	for i := range ids {
+		results[i].ID = ids[i]
+	}
 
-		rx, err := d.readPacketWithTimeout(d.Timeout)
-		if err != nil {
-			results[i].Err = fmt.Errorf("timeout waiting for motor %d: %v", id, err)
-			continue
+	deadline := time.Now().Add(d.Timeout * time.Duration(len(ids))) // Extend timeout for multiple motors
+	buf := make([]byte, 0, ReadBufferSize)
+	tmp := make([]byte, ReadBufferSize)
+	packetsFound := 0
+
+	for time.Now().Before(deadline) && packetsFound < len(ids) {
+		// Try to extract packets from existing buffer first
+		for packetsFound < len(ids) {
+			packet, remaining, err := extractPacketFromBuffer(buf)
+			if err != nil {
+				// Buffer corrupted, try to recover by finding next header
+				if len(buf) > 3 {
+					buf = buf[1:]
+					continue
+				}
+				break
+			}
+			if packet == nil {
+				break // Need more data
+			}
+
+			// Parse the packet to find which motor it belongs to
+			respID, errCode, readParams, parseErr := ParsePacket(packet)
+			buf = remaining
+
+			// Find matching motor ID in results
+			for i, id := range ids {
+				if id == respID && results[i].Data == nil && results[i].Err == nil {
+					if parseErr != nil {
+						results[i].Err = parseErr
+					} else if errCode != 0 {
+						results[i].Err = fmt.Errorf("motor error code: %02X", errCode)
+					} else {
+						results[i].Data = readParams
+					}
+					packetsFound++
+					break
+				}
+			}
 		}
 
-		_, errCode, readParams, err := ParsePacket(rx)
+		if packetsFound >= len(ids) {
+			break
+		}
+
+		// Read more data from serial port
+		n, err := d.port.Read(tmp)
 		if err != nil {
-			results[i].Err = err
-		} else if errCode != 0 {
-			results[i].Err = fmt.Errorf("motor error code: %02X", errCode)
-		} else {
-			results[i].Data = readParams
+			break
+		}
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+	}
+
+	// Mark any motors that didn't respond with timeout error
+	for i := range results {
+		if results[i].Data == nil && results[i].Err == nil {
+			results[i].Err = fmt.Errorf("timeout waiting for motor %d", ids[i])
 		}
 	}
 

@@ -225,6 +225,26 @@ func (c *Controller) disableTorque(id uint8) error {
 // SetOperatingMode changes the control mode (Torque Disable -> Set Mode -> Torque Enable)
 // Common Modes: 1 (Velocity), 3 (Position), 16 (PWM)
 func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
+	// Check current mode first - skip if already set (avoids unnecessary EEPROM writes)
+	currentMode, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
+	if err == nil && len(currentMode) > 0 && currentMode[0] == mode {
+		fmt.Printf("Motor %d already in mode %d, skipping...\n", id, mode)
+		// Still need to update internal state and ensure torque is on
+		c.mu.Lock()
+		switch mode {
+		case OpModeVelocity:
+			c.activeGoalAddr = c.Model.AddrGoalVelocity
+		case OpModePWM:
+			c.activeGoalAddr = c.Model.AddrGoalPWM
+		case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
+			c.activeGoalAddr = c.Model.AddrGoalPosition
+		case OpModeCurrent:
+			c.activeGoalAddr = c.Model.AddrGoalPosition
+		}
+		c.mu.Unlock()
+		return c.enableTorque(id)
+	}
+
 	// 1. Disable Torque
 	if err := c.disableTorque(id); err != nil {
 		return fmt.Errorf("failed to disable torque: %v", err)

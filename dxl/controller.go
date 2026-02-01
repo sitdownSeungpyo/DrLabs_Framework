@@ -225,24 +225,37 @@ func (c *Controller) disableTorque(id uint8) error {
 // SetOperatingMode changes the control mode (Torque Disable -> Set Mode -> Torque Enable)
 // Common Modes: 1 (Velocity), 3 (Position), 16 (PWM)
 func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
+	// Increase timeout temporarily for EEPROM operations
+	originalTimeout := c.driver.Timeout
+	c.driver.Timeout = 500 * time.Millisecond
+	defer func() { c.driver.Timeout = originalTimeout }()
+
+	// Small delay to ensure previous operations are complete
+	time.Sleep(50 * time.Millisecond)
+
 	// Check current mode first - skip if already set (avoids unnecessary EEPROM writes)
 	currentMode, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
-	if err == nil && len(currentMode) > 0 && currentMode[0] == mode {
-		fmt.Printf("Motor %d already in mode %d, skipping...\n", id, mode)
-		// Still need to update internal state and ensure torque is on
-		c.mu.Lock()
-		switch mode {
-		case OpModeVelocity:
-			c.activeGoalAddr = c.Model.AddrGoalVelocity
-		case OpModePWM:
-			c.activeGoalAddr = c.Model.AddrGoalPWM
-		case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
-			c.activeGoalAddr = c.Model.AddrGoalPosition
-		case OpModeCurrent:
-			c.activeGoalAddr = c.Model.AddrGoalPosition
+	if err != nil {
+		fmt.Printf("Warning: could not read current mode for motor %d: %v\n", id, err)
+	} else if len(currentMode) > 0 {
+		fmt.Printf("Motor %d current mode: %d (target: %d)\n", id, currentMode[0], mode)
+		if currentMode[0] == mode {
+			fmt.Printf("Motor %d already in mode %d, skipping EEPROM write...\n", id, mode)
+			// Still need to update internal state and ensure torque is on
+			c.mu.Lock()
+			switch mode {
+			case OpModeVelocity:
+				c.activeGoalAddr = c.Model.AddrGoalVelocity
+			case OpModePWM:
+				c.activeGoalAddr = c.Model.AddrGoalPWM
+			case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
+				c.activeGoalAddr = c.Model.AddrGoalPosition
+			case OpModeCurrent:
+				c.activeGoalAddr = c.Model.AddrGoalPosition
+			}
+			c.mu.Unlock()
+			return c.enableTorque(id)
 		}
-		c.mu.Unlock()
-		return c.enableTorque(id)
 	}
 
 	// 1. Disable Torque
@@ -257,13 +270,18 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	data, err := c.driver.Read(id, c.Model.AddrTorqueEnable, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not verify torque disable: %v\n", err)
-	} else if len(data) > 0 && data[0] != 0 {
-		// Retry disable if still enabled
-		fmt.Printf("Torque still enabled, retrying...\n")
-		if err := c.disableTorque(id); err != nil {
-			return fmt.Errorf("failed to disable torque (retry): %v", err)
-		}
+		// Add extra delay if verification failed
 		time.Sleep(100 * time.Millisecond)
+	} else if len(data) > 0 {
+		fmt.Printf("Torque status for motor %d: %d\n", id, data[0])
+		if data[0] != 0 {
+			// Retry disable if still enabled
+			fmt.Printf("Torque still enabled, retrying...\n")
+			if err := c.disableTorque(id); err != nil {
+				return fmt.Errorf("failed to disable torque (retry): %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
 	// 2. Set Mode

@@ -231,7 +231,20 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	}
 
 	// Wait for motor to process torque disable before EEPROM write
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify torque is actually disabled before writing to EEPROM
+	data, err := c.driver.Read(id, c.Model.AddrTorqueEnable, 1)
+	if err != nil {
+		fmt.Printf("Warning: could not verify torque disable: %v\n", err)
+	} else if len(data) > 0 && data[0] != 0 {
+		// Retry disable if still enabled
+		fmt.Printf("Torque still enabled, retrying...\n")
+		if err := c.disableTorque(id); err != nil {
+			return fmt.Errorf("failed to disable torque (retry): %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// 2. Set Mode
 	fmt.Printf("Setting Operating Mode to %d for ID %d...\n", mode, id)
@@ -244,7 +257,7 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	time.Sleep(1000 * time.Millisecond)
 
 	// Verify mode was actually set
-	data, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
+	data, err = c.driver.Read(id, c.Model.AddrOperatingMode, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not verify operating mode (read error: %v)\n", err)
 	} else if len(data) > 0 && data[0] != mode {

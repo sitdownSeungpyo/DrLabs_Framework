@@ -230,6 +230,9 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		return fmt.Errorf("failed to disable torque: %v", err)
 	}
 
+	// Wait for motor to process torque disable before EEPROM write
+	time.Sleep(50 * time.Millisecond)
+
 	// 2. Set Mode
 	fmt.Printf("Setting Operating Mode to %d for ID %d...\n", mode, id)
 	if err := c.driver.Write(id, c.Model.AddrOperatingMode, []byte{mode}); err != nil {

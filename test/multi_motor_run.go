@@ -1,10 +1,10 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -12,18 +12,15 @@ import (
 )
 
 func main() {
-	var devicePort string
-	if runtime.GOOS == "windows" {
-		devicePort = "COM3" // Change to your port
-	} else {
-		devicePort = "/dev/ttyUSB0" // Change to your port
-	}
+	portVal := flag.String("port", "COM4", "Serial port name")
+	baudVal := flag.Int("baud", 1000000, "Baudrate")
+	flag.Parse()
 
 	// Create controller for X-Series motors
-	ctrl := dxl.NewController(devicePort, 57600, dxl.ModelXSeries)
+	ctrl := dxl.NewController(*portVal, *baudVal, dxl.ModelXSeries)
 
 	// Configure multiple motors - adjust IDs to match your setup
-	motorIDs := []uint8{1, 2, 3} // Control 3 motors simultaneously
+	motorIDs := []uint8{1, 2} // Control 2 motors simultaneously
 	if err := ctrl.SetMotorIDs(motorIDs); err != nil {
 		fmt.Printf("Invalid motor IDs: %v\n", err)
 		os.Exit(1)

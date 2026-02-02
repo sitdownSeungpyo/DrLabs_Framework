@@ -35,6 +35,11 @@ type SerialPortInterface interface {
 	Close() error
 }
 
+// Flusher is an optional interface for serial ports that support buffer flushing
+type Flusher interface {
+	Flush() error
+}
+
 type Driver struct {
 	port    SerialPortInterface
 	Timeout time.Duration // Configurable timeout for read operations
@@ -42,6 +47,13 @@ type Driver struct {
 
 func NewDriver(port SerialPortInterface) *Driver {
 	return &Driver{port: port, Timeout: DefaultTimeout}
+}
+
+// Flush clears the serial port buffers if supported
+func (d *Driver) Flush() {
+	if flusher, ok := d.port.(Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // findPacketStart finds the start index of a valid packet header (FF FF FD)

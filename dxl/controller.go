@@ -230,8 +230,9 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	c.driver.Timeout = 500 * time.Millisecond
 	defer func() { c.driver.Timeout = originalTimeout }()
 
-	// Small delay to ensure previous operations are complete
-	time.Sleep(50 * time.Millisecond)
+	// Flush serial buffers and wait for previous operations to complete
+	c.driver.Flush()
+	time.Sleep(100 * time.Millisecond)
 
 	// Check current mode first - skip if already set (avoids unnecessary EEPROM writes)
 	currentMode, err := c.driver.Read(id, c.Model.AddrOperatingMode, 1)
@@ -258,15 +259,19 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		}
 	}
 
-	// 1. Disable Torque
+	// 1. Disable Torque - flush buffer first to clear any stale data
+	c.driver.Flush()
+	time.Sleep(10 * time.Millisecond)
+
 	if err := c.disableTorque(id); err != nil {
 		return fmt.Errorf("failed to disable torque: %v", err)
 	}
 
 	// Wait for motor to process torque disable before EEPROM write
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	// Verify torque is actually disabled before writing to EEPROM
+	c.driver.Flush()
 	data, err := c.driver.Read(id, c.Model.AddrTorqueEnable, 1)
 	if err != nil {
 		fmt.Printf("Warning: could not verify torque disable: %v\n", err)

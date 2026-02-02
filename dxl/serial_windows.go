@@ -124,6 +124,18 @@ func (sp *SerialPort) Write(b []byte) (int, error) {
 	return int(n), err
 }
 
+// Flush clears both input and output buffers
+func (sp *SerialPort) Flush() error {
+	r1, _, e1 := procPurgeComm.Call(
+		uintptr(sp.handle),
+		uintptr(PURGE_TXABORT|PURGE_RXABORT|PURGE_TXCLEAR|PURGE_RXCLEAR),
+	)
+	if r1 == 0 {
+		return fmt.Errorf("PurgeComm failed: %v", e1)
+	}
+	return nil
+}
+
 // Internal DLL loading
 var (
 	modkernel32         = syscall.NewLazyDLL("kernel32.dll")

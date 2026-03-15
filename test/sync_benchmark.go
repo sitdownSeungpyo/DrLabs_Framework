@@ -13,10 +13,13 @@ import (
 
 func main() {
 	var devicePort string
-	if runtime.GOOS == "windows" {
-		devicePort = "COM4"
-	} else {
+	switch runtime.GOOS {
+	case "darwin":
+		devicePort = "/dev/tty.usbmodem0000"
+	case "linux":
 		devicePort = "/dev/ttyUSB0"
+	default:
+		devicePort = "COM4"
 	}
 
 	// Open serial port

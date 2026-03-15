@@ -6,11 +6,23 @@ import (
 	"go_dxl/dxl"
 	"os"
 	"os/signal"
+	"runtime"
 	"time"
 )
 
+func defaultSerialPort() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/dev/tty.usbmodem0000"
+	case "linux":
+		return "/dev/ttyUSB0"
+	default:
+		return "COM3"
+	}
+}
+
 func main() {
-	portVal := flag.String("port", "COM3", "Serial port name")
+	portVal := flag.String("port", defaultSerialPort(), "Serial port name")
 	baudVal := flag.Int("baud", 1000000, "Baudrate")
 	idVal := flag.Int("id", 1, "Motor ID")
 	currVal := flag.Int("current", 50, "Goal Current (mA or unit)")

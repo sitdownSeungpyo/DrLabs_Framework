@@ -5,14 +5,26 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	"go_dxl/dxl"
 )
 
+func defaultSerialPort() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/dev/tty.usbmodem0000"
+	case "linux":
+		return "/dev/ttyUSB0"
+	default:
+		return "COM4"
+	}
+}
+
 func main() {
-	portVal := flag.String("port", "COM4", "Serial port name")
+	portVal := flag.String("port", defaultSerialPort(), "Serial port name")
 	baudVal := flag.Int("baud", 1000000, "Baudrate")
 	flag.Parse()
 

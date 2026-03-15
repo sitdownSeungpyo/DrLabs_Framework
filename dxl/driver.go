@@ -1,7 +1,6 @@
 package dxl
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -68,11 +67,11 @@ func findPacketStart(data []byte) int {
 }
 
 // readPacketWithTimeout reads a complete Dynamixel packet from the serial port.
-// It accumulates bytes until a complete packet is received or timeout occurs.
-// Returns the complete packet bytes or an error if timeout/read failure occurs.
+// It accumulates bytes until a valid packet (header + length + CRC) is received or timeout occurs.
+// Stale or corrupted packets are skipped automatically via CRC validation.
 func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
-	buf := bytes.NewBuffer(nil)
+	buf := make([]byte, 0, ReadBufferSize)
 	tmp := make([]byte, ReadBufferSize)
 
 	for time.Now().Before(deadline) {
@@ -80,44 +79,77 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if n > 0 {
-			buf.Write(tmp[:n])
+		if n == 0 {
+			// No data available — yield CPU to avoid busy-waiting.
+			// Critical on macOS/Linux where Read returns (0, nil) when no data.
+			time.Sleep(500 * time.Microsecond)
+			continue
+		}
+		buf = append(buf, tmp[:n]...)
 
-			// Check if we have enough bytes for header + length fields
-			if buf.Len() >= MinHeaderSize {
-				b := buf.Bytes()
-				startIdx := findPacketStart(b)
+		// Try to extract a valid packet from the buffer
+		for len(buf) >= MinHeaderSize {
+			startIdx := findPacketStart(buf)
 
-				if startIdx != -1 && buf.Len() >= startIdx+MinHeaderSize {
-					pkt := buf.Bytes()
-					bodyLen := uint16(pkt[startIdx+5]) | (uint16(pkt[startIdx+6]) << 8)
-
-					// Validate body length before calculating totalLen to prevent overflow
-					if int(bodyLen) > MaxPacketSize-MinHeaderSize {
-						return nil, fmt.Errorf("body length exceeds maximum: %d", bodyLen)
-					}
-
-					totalLen := startIdx + MinHeaderSize + int(bodyLen)
-
-					// Validate packet length bounds
-					if totalLen > MaxPacketSize {
-						return nil, fmt.Errorf("packet length exceeds maximum: %d", totalLen)
-					}
-
-					if buf.Len() >= totalLen {
-						return pkt[startIdx:totalLen], nil
-					}
+			if startIdx == -1 {
+				// No header found — keep last 2 bytes (could be partial FF FF)
+				if len(buf) > 2 {
+					buf = buf[len(buf)-2:]
 				}
+				break
 			}
+
+			// Discard garbage bytes before header
+			if startIdx > 0 {
+				buf = buf[startIdx:]
+			}
+
+			if len(buf) < MinHeaderSize {
+				break
+			}
+
+			bodyLen := uint16(buf[5]) | (uint16(buf[6]) << 8)
+
+			// Invalid body length — skip this header, search for next
+			if int(bodyLen) > MaxPacketSize-MinHeaderSize {
+				buf = buf[3:]
+				continue
+			}
+
+			totalLen := MinHeaderSize + int(bodyLen)
+			if totalLen > MaxPacketSize {
+				buf = buf[3:]
+				continue
+			}
+
+			if len(buf) < totalLen {
+				break // Need more data
+			}
+
+			// Complete packet found — validate CRC before accepting
+			pkt := buf[:totalLen]
+			receivedCRC := uint16(pkt[totalLen-2]) | (uint16(pkt[totalLen-1]) << 8)
+			calcCRC := UpdateCRC(0, pkt[:totalLen-2])
+
+			if receivedCRC == calcCRC {
+				return pkt, nil // Valid packet with correct CRC
+			}
+
+			// CRC mismatch — stale/corrupted packet, skip and continue
+			buf = buf[3:]
 		}
 	}
 
-	return nil, fmt.Errorf("read timeout, buffered: %x", buf.Bytes())
+	return nil, fmt.Errorf("read timeout, buffered: %x", buf)
 }
 
 // Transfer sends a packet and waits for a response.
 // This is the fundamental request-response pattern for Dynamixel communication.
+// Flushes stale input data before sending, matching the official Dynamixel SDK behavior.
 func (d *Driver) Transfer(txPacket []byte) ([]byte, error) {
+	// Clear stale input data (official SDK calls clearPort/tcflush before txPacket)
+	d.Flush()
+
 	_, err := d.port.Write(txPacket)
 	if err != nil {
 		return nil, fmt.Errorf("write failed: %v", err)
@@ -390,9 +422,11 @@ func (d *Driver) SyncRead(addr uint16, dataLength uint16, ids []uint8) ([]SyncRe
 		if err != nil {
 			break
 		}
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+		if n == 0 {
+			time.Sleep(500 * time.Microsecond)
+			continue
 		}
+		buf = append(buf, tmp[:n]...)
 	}
 
 	// Mark any motors that didn't respond with timeout error

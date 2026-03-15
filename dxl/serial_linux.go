@@ -11,9 +11,21 @@ import (
 // Linux Termios Constants (Typical values, validation needed for specific arch.
 // However, syscall package provides these constant mappings usually)
 const (
-	TCGETS = 0x5401
-	TCSETS = 0x5402
+	TCGETS   = 0x5401
+	TCSETS   = 0x5402
+	TCFLSH   = 0x540B
+	TCIOFLUSH = 2 // Flush both input and output
 )
+
+// Flush clears both input and output buffers
+func (sp *SerialPort) Flush() error {
+	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, uintptr(sp.fd),
+		uintptr(TCFLSH), uintptr(TCIOFLUSH))
+	if err != 0 {
+		return fmt.Errorf("TCFLSH failed: %v", err)
+	}
+	return nil
+}
 
 // SerialPort represents a Linux serial file descriptor
 type SerialPort struct {
@@ -44,7 +56,14 @@ func (sp *SerialPort) Close() error {
 }
 
 func (sp *SerialPort) Read(b []byte) (int, error) {
-	return syscall.Read(sp.fd, b)
+	n, err := syscall.Read(sp.fd, b)
+	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		return 0, nil // No data available — match Windows behavior (0 bytes, no error)
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n, err
 }
 
 func (sp *SerialPort) Write(b []byte) (int, error) {

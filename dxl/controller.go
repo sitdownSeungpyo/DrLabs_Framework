@@ -3,10 +3,28 @@ package dxl
 import (
 	"context"
 	"fmt"
+	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Channel buffer size defaults
+const (
+	DefaultCommandChanSize  = 1
+	DefaultFeedbackChanSize = 100
+)
+
+// Timing defaults
+const (
+	DefaultEEPROMWriteDelay  = 1000 * time.Millisecond
+	DefaultTorqueDisableDelay = 150 * time.Millisecond
+)
+
+// PortOpener is a function type that opens a serial port.
+// This enables dependency injection for testing.
+type PortOpener func(devicePort string, baudRate int) (SerialPortInterface, error)
 
 // Controller manages the Dynamixel communication loop
 type Controller struct {
@@ -27,10 +45,20 @@ type Controller struct {
 	Model    MotorModel
 	MotorIDs []uint8 // List of motor IDs to control
 
+	// Configurable timing
+	EEPROMWriteDelay   time.Duration // Delay after EEPROM write (default 1s)
+	TorqueDisableDelay time.Duration // Delay after torque disable (default 150ms)
+
+	// Dependency injection for testing
+	OpenPort PortOpener // Function to open serial port (default: OpenSerial)
+
 	// Internal State
 	mu               sync.RWMutex // Protects shared state
 	activeGoalAddr   uint16
 	useSyncReadWrite bool // Enable sync read/write for better performance
+
+	// Monitoring
+	droppedFeedbacks atomic.Int64 // Count of dropped feedback messages
 }
 
 // MotorModel defines the Control Table addresses for a specific motor type
@@ -39,6 +67,7 @@ type MotorModel struct {
 	AddrGoalPosition    uint16
 	AddrGoalVelocity    uint16
 	AddrGoalPWM         uint16
+	AddrGoalCurrent     uint16 // Goal Current address (X-Series: 102)
 	AddrPresentPosition uint16
 	AddrOperatingMode   uint16
 }
@@ -64,6 +93,7 @@ var (
 		AddrGoalPosition:    116,
 		AddrGoalVelocity:    104,
 		AddrGoalPWM:         100,
+		AddrGoalCurrent:     102,
 		AddrPresentPosition: 132,
 		AddrOperatingMode:   11,
 	}
@@ -73,6 +103,7 @@ var (
 		AddrGoalPosition:    596,
 		AddrGoalVelocity:    600, // Check Manual
 		AddrGoalPWM:         584, // Check Manual
+		AddrGoalCurrent:     590, // Check Manual for specific PRO model
 		AddrPresentPosition: 611,
 		AddrOperatingMode:   11, // PRO Series often shares 11 too, need check
 	}
@@ -91,17 +122,25 @@ const (
 func NewController(devicePort string, baudRate int, model MotorModel) *Controller {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Controller{
-		devicePort:       devicePort,
-		baudRate:         baudRate,
-		CommandChan:      make(chan []Command, 1),
-		FeedbackChan:     make(chan []Feedback, 100),
-		ctx:              ctx,
-		cancel:           cancel,
-		Model:            model,
-		MotorIDs:         []uint8{1}, // Default single motor
-		activeGoalAddr:   model.AddrGoalPosition, // Default Address
-		useSyncReadWrite: false, // Default to individual commands for single motor
+		devicePort:         devicePort,
+		baudRate:           baudRate,
+		CommandChan:        make(chan []Command, DefaultCommandChanSize),
+		FeedbackChan:       make(chan []Feedback, DefaultFeedbackChanSize),
+		ctx:                ctx,
+		cancel:             cancel,
+		Model:              model,
+		MotorIDs:           []uint8{1}, // Default single motor
+		activeGoalAddr:     model.AddrGoalPosition, // Default Address
+		useSyncReadWrite:   false, // Default to individual commands for single motor
+		EEPROMWriteDelay:   DefaultEEPROMWriteDelay,
+		TorqueDisableDelay: DefaultTorqueDisableDelay,
+		OpenPort:           defaultOpenPort,
 	}
+}
+
+// defaultOpenPort is the default PortOpener that calls OpenSerial
+func defaultOpenPort(devicePort string, baudRate int) (SerialPortInterface, error) {
+	return OpenSerial(devicePort, baudRate)
 }
 
 // MaxValidMotorID is the maximum valid Dynamixel motor ID (253-255 are reserved)
@@ -149,8 +188,24 @@ func (c *Controller) getActiveGoalAddr() uint16 {
 
 // Start spawns the control loop goroutine
 func (c *Controller) Start() error {
-	// 1. Open Serial Port (Native Windows)
-	sp, err := OpenSerial(c.devicePort, c.baudRate)
+	// Input validation
+	if c.devicePort == "" {
+		return fmt.Errorf("device port must not be empty")
+	}
+	motorIDs := c.getMotorIDs()
+	if len(motorIDs) == 0 {
+		return fmt.Errorf("no motor IDs configured")
+	}
+	if c.Model.AddrTorqueEnable == 0 || c.Model.AddrPresentPosition == 0 || c.Model.AddrOperatingMode == 0 {
+		return fmt.Errorf("motor model has uninitialized addresses")
+	}
+
+	// 1. Open Serial Port
+	opener := c.OpenPort
+	if opener == nil {
+		opener = defaultOpenPort
+	}
+	sp, err := opener(c.devicePort, c.baudRate)
 	if err != nil {
 		return fmt.Errorf("failed to open serial port: %v", err)
 	}
@@ -158,7 +213,6 @@ func (c *Controller) Start() error {
 	c.driver = NewDriver(sp)
 
 	// 2. Ping and enable torque for all configured motors
-	motorIDs := c.getMotorIDs()
 	for _, id := range motorIDs {
 		fmt.Printf("Pinging Motor ID %d...\n", id)
 		model, err := c.driver.Ping(id)
@@ -244,16 +298,7 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 			fmt.Printf("Motor %d already in mode %d, skipping EEPROM write...\n", id, mode)
 			// Still need to update internal state and ensure torque is on
 			c.mu.Lock()
-			switch mode {
-			case OpModeVelocity:
-				c.activeGoalAddr = c.Model.AddrGoalVelocity
-			case OpModePWM:
-				c.activeGoalAddr = c.Model.AddrGoalPWM
-			case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
-				c.activeGoalAddr = c.Model.AddrGoalPosition
-			case OpModeCurrent:
-				c.activeGoalAddr = c.Model.AddrGoalPosition
-			}
+			c.activeGoalAddr = c.goalAddrForMode(mode)
 			c.mu.Unlock()
 			return c.enableTorque(id)
 		}
@@ -268,7 +313,7 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	}
 
 	// Wait for motor to process torque disable before EEPROM write
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(c.TorqueDisableDelay)
 
 	// Verify torque is actually disabled before writing to EEPROM
 	c.driver.Flush()
@@ -297,7 +342,7 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 
 	// EEPROM Write Delay: Operating Mode change requires reboot/flash time.
 	// This happens ONLY ONCE at startup, so it does not affect control loop performance.
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(c.EEPROMWriteDelay)
 
 	// Verify mode was actually set
 	data, err = c.driver.Read(id, c.Model.AddrOperatingMode, 1)
@@ -307,20 +352,10 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 		return fmt.Errorf("operating mode verification failed: wrote %d, read back %d", mode, data[0])
 	}
 
-	// Update Active Goal Address (thread-safe with defer for safety)
+	// Update Active Goal Address (thread-safe)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	switch mode {
-	case OpModeVelocity:
-		c.activeGoalAddr = c.Model.AddrGoalVelocity
-	case OpModePWM:
-		c.activeGoalAddr = c.Model.AddrGoalPWM
-	case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
-		c.activeGoalAddr = c.Model.AddrGoalPosition
-	case OpModeCurrent:
-		fmt.Printf("Warning: Current mode not fully supported, using position address\n")
-		c.activeGoalAddr = c.Model.AddrGoalPosition
-	}
+	c.activeGoalAddr = c.goalAddrForMode(mode)
+	c.mu.Unlock()
 
 	// 3. Re-Enable Torque
 	if err := c.enableTorque(id); err != nil {
@@ -328,6 +363,27 @@ func (c *Controller) SetOperatingMode(id uint8, mode uint8) error {
 	}
 
 	return nil
+}
+
+// goalAddrForMode returns the appropriate goal address for the given operating mode.
+// Must be called with knowledge of the Model field; does not acquire locks.
+func (c *Controller) goalAddrForMode(mode uint8) uint16 {
+	switch mode {
+	case OpModeVelocity:
+		return c.Model.AddrGoalVelocity
+	case OpModePWM:
+		return c.Model.AddrGoalPWM
+	case OpModeCurrent:
+		if c.Model.AddrGoalCurrent != 0 {
+			return c.Model.AddrGoalCurrent
+		}
+		log.Printf("Warning: AddrGoalCurrent not set in model, falling back to GoalPosition")
+		return c.Model.AddrGoalPosition
+	case OpModePosition, OpModeExtendedPosition, OpModeCurrentBasedPos:
+		return c.Model.AddrGoalPosition
+	default:
+		return c.Model.AddrGoalPosition
+	}
 }
 
 // Stop signals the control loop to exit and waits for it to finish
@@ -379,7 +435,10 @@ func (c *Controller) controlLoop() {
 		if c.isSyncMode() {
 			// Use Sync Read for multiple motors (more efficient)
 			// SyncRead4Byte returns partial results - use values for responding motors
-			values, _ := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
+			values, syncErr := c.driver.SyncRead4Byte(c.Model.AddrPresentPosition, motorIDs)
+			if syncErr != nil {
+				log.Printf("SyncRead error: %v", syncErr)
+			}
 			for _, id := range motorIDs {
 				if val, ok := values[id]; ok {
 					feedbacks = append(feedbacks, Feedback{ID: id, Value: val, Error: nil})
@@ -399,7 +458,15 @@ func (c *Controller) controlLoop() {
 		select {
 		case c.FeedbackChan <- feedbacks:
 		default:
-			// Channel full, drop oldest feedback
+			dropped := c.droppedFeedbacks.Add(1)
+			if dropped == 1 || dropped%1000 == 0 {
+				log.Printf("Warning: feedback channel full, dropped %d total feedbacks", dropped)
+			}
 		}
 	}
+}
+
+// DroppedFeedbacks returns the number of feedback messages dropped due to a full channel.
+func (c *Controller) DroppedFeedbacks() int64 {
+	return c.droppedFeedbacks.Load()
 }

@@ -110,7 +110,7 @@ func main() {
 	fmt.Printf("\nTrajectory 1: %.0f -> %.0f (duration: %.2fs)\n", float64(initialPos1), target1, profile1.TotalTime())
 	fmt.Printf("Trajectory 2: %.0f -> %.0f (duration: %.2fs)\n", float64(initialPos2), target2, profile2.TotalTime())
 	fmt.Println("\nStarting synchronized trajectory execution...")
-	fmt.Println("Press Ctrl+C to stop\n")
+	fmt.Println("Press Ctrl+C to stop")
 
 	// Execute trajectories in parallel using goroutines
 	var wg sync.WaitGroup

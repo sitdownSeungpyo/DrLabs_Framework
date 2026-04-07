@@ -39,13 +39,17 @@ type Flusher interface {
 	Flush() error
 }
 
+// DefaultPollInterval is the sleep duration when no serial data is available.
+const DefaultPollInterval = 500 * time.Microsecond
+
 type Driver struct {
-	port    SerialPortInterface
-	Timeout time.Duration // Configurable timeout for read operations
+	port         SerialPortInterface
+	Timeout      time.Duration // Configurable timeout for read operations
+	PollInterval time.Duration // Sleep between read polls when no data (default 500µs)
 }
 
 func NewDriver(port SerialPortInterface) *Driver {
-	return &Driver{port: port, Timeout: DefaultTimeout}
+	return &Driver{port: port, Timeout: DefaultTimeout, PollInterval: DefaultPollInterval}
 }
 
 // Flush clears the serial port buffers if supported
@@ -82,7 +86,7 @@ func (d *Driver) readPacketWithTimeout(timeout time.Duration) ([]byte, error) {
 		if n == 0 {
 			// No data available — yield CPU to avoid busy-waiting.
 			// Critical on macOS/Linux where Read returns (0, nil) when no data.
-			time.Sleep(500 * time.Microsecond)
+			time.Sleep(d.PollInterval)
 			continue
 		}
 		buf = append(buf, tmp[:n]...)
@@ -223,6 +227,45 @@ func (d *Driver) Ping(id uint8) (modelNum uint16, err error) {
 		modelNum = binary.LittleEndian.Uint16(params[0:])
 	}
 	return modelNum, nil
+}
+
+// Reboot sends a reboot instruction to the specified motor.
+// The motor will restart and re-initialize.
+func (d *Driver) Reboot(id uint8) error {
+	tx := BuildPacket(id, InstReboot, nil)
+	rx, err := d.Transfer(tx)
+	if err != nil {
+		return err
+	}
+	_, errCode, _, err := ParsePacket(rx)
+	if err != nil {
+		return err
+	}
+	if errCode != 0 {
+		return fmt.Errorf("dxl error code: %02X", errCode)
+	}
+	return nil
+}
+
+// FactoryReset resets the motor to factory default settings.
+// Level determines what is reset:
+//   - 0xFF: Reset all values
+//   - 0x01: Reset all except ID
+//   - 0x02: Reset all except ID and baud rate
+func (d *Driver) FactoryReset(id uint8, level uint8) error {
+	tx := BuildPacket(id, InstFactoryReset, []byte{level})
+	rx, err := d.Transfer(tx)
+	if err != nil {
+		return err
+	}
+	_, errCode, _, err := ParsePacket(rx)
+	if err != nil {
+		return err
+	}
+	if errCode != 0 {
+		return fmt.Errorf("dxl error code: %02X", errCode)
+	}
+	return nil
 }
 
 // Write4Byte Helper

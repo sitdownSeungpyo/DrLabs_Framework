@@ -8,15 +8,19 @@ import (
 	"time"
 )
 
-// MockSerialPort implements SerialPortInterface for testing
+// MockSerialPort implements SerialPortInterface for testing.
+// Supports two modes:
+//   - SetResponse: loads data directly into readBuf (for single Transfer or SyncRead tests)
+//   - QueueResponses: loads one response per Write call (for multi-Transfer sequences)
 type MockSerialPort struct {
-	mu           sync.Mutex
-	readBuf      *bytes.Buffer
-	writeBuf     *bytes.Buffer
-	readDelay    time.Duration
-	readErr      error
-	writeErr     error
-	closed       bool
+	mu            sync.Mutex
+	readBuf       *bytes.Buffer
+	writeBuf      *bytes.Buffer
+	responseQueue [][]byte // Responses loaded into readBuf one per Write call
+	readDelay     time.Duration
+	readErr       error
+	writeErr      error
+	closed        bool
 }
 
 func NewMockSerialPort() *MockSerialPort {
@@ -36,6 +40,9 @@ func (m *MockSerialPort) Read(b []byte) (int, error) {
 	if m.readErr != nil {
 		return 0, m.readErr
 	}
+	if m.readBuf.Len() == 0 {
+		return 0, nil // No data available, like a real serial port (not io.EOF)
+	}
 	if m.readDelay > 0 {
 		time.Sleep(m.readDelay)
 	}
@@ -54,6 +61,13 @@ func (m *MockSerialPort) Write(b []byte) (int, error) {
 		return 0, m.writeErr
 	}
 
+	// Load next queued response into readBuf (simulates request-response)
+	if len(m.responseQueue) > 0 {
+		m.readBuf.Reset()
+		m.readBuf.Write(m.responseQueue[0])
+		m.responseQueue = m.responseQueue[1:]
+	}
+
 	return m.writeBuf.Write(b)
 }
 
@@ -64,12 +78,24 @@ func (m *MockSerialPort) Close() error {
 	return nil
 }
 
-// SetResponse sets the data that will be returned by Read
+// SetResponse sets data directly into readBuf.
+// Use for single-Transfer tests or SyncRead tests where all data should be available at once.
 func (m *MockSerialPort) SetResponse(data []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.readBuf.Reset()
 	m.readBuf.Write(data)
+	m.responseQueue = nil // Clear queue to prevent Write from overriding
+}
+
+// QueueResponses sets up responses loaded into readBuf one at a time on each Write call.
+// Use for multi-Transfer sequences (e.g., Ping + enableTorque in Controller.Start).
+func (m *MockSerialPort) QueueResponses(responses ...[]byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readBuf.Reset()
+	m.responseQueue = make([][]byte, len(responses))
+	copy(m.responseQueue, responses)
 }
 
 // GetWritten returns data that was written to the port
@@ -422,5 +448,82 @@ func TestReadPacketWithGarbage(t *testing.T) {
 	}
 	if len(data) != 4 {
 		t.Errorf("Data length: got %d, want 4", len(data))
+	}
+}
+
+func TestDriverReboot(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := NewDriver(mock)
+
+	response := buildStatusPacket(1, 0, nil)
+	mock.SetResponse(response)
+
+	err := driver.Reboot(1)
+	if err != nil {
+		t.Errorf("Reboot failed: %v", err)
+	}
+
+	written := mock.GetWritten()
+	if written[7] != InstReboot {
+		t.Errorf("Wrong instruction: %02X, want %02X", written[7], InstReboot)
+	}
+}
+
+func TestDriverRebootError(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := NewDriver(mock)
+
+	response := buildStatusPacket(1, 0x80, nil) // Hardware alert
+	mock.SetResponse(response)
+
+	err := driver.Reboot(1)
+	if err == nil {
+		t.Error("Expected error for error code response, got nil")
+	}
+}
+
+func TestDriverFactoryReset(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := NewDriver(mock)
+
+	response := buildStatusPacket(1, 0, nil)
+	mock.SetResponse(response)
+
+	err := driver.FactoryReset(1, 0xFF) // Reset all
+	if err != nil {
+		t.Errorf("FactoryReset failed: %v", err)
+	}
+
+	written := mock.GetWritten()
+	if written[7] != InstFactoryReset {
+		t.Errorf("Wrong instruction: %02X, want %02X", written[7], InstFactoryReset)
+	}
+}
+
+func TestDriverFactoryResetExceptID(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := NewDriver(mock)
+
+	response := buildStatusPacket(1, 0, nil)
+	mock.SetResponse(response)
+
+	err := driver.FactoryReset(1, 0x01) // Reset all except ID
+	if err != nil {
+		t.Errorf("FactoryReset (except ID) failed: %v", err)
+	}
+}
+
+func TestDriverPollInterval(t *testing.T) {
+	mock := NewMockSerialPort()
+	driver := NewDriver(mock)
+
+	if driver.PollInterval != DefaultPollInterval {
+		t.Errorf("Default PollInterval = %v, want %v", driver.PollInterval, DefaultPollInterval)
+	}
+
+	// Ensure custom poll interval can be set
+	driver.PollInterval = 1 * time.Millisecond
+	if driver.PollInterval != 1*time.Millisecond {
+		t.Errorf("Custom PollInterval not set correctly")
 	}
 }

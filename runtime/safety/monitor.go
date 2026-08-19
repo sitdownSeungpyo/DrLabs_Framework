@@ -48,6 +48,13 @@ func (t *timer) check(condition bool, now time.Time, duration float64) bool {
 type Monitor struct {
 	Config *Config
 
+	// Units renders the positions, speeds and torques that appear in the
+	// messages this monitor produces.  A nil value means motor space, which
+	// is right for a session driving one controller directly; the robot layer
+	// supplies a joint renderer so that a limit written in radians is not
+	// reported back in revolutions.
+	Units motor.Units
+
 	current timer
 	runaway timer
 	stall   timer
@@ -79,6 +86,7 @@ func (m *Monitor) Reset() {
 // people to bypass it.
 func (m *Monitor) Preflight(identity *motor.Identity, telemetry motor.Telemetry, connected bool) (blocking, advisory []string) {
 	config := m.Config
+	units := motor.Render(m.Units)
 
 	if !connected {
 		blocking = append(blocking, "Not connected.")
@@ -134,11 +142,23 @@ func (m *Monitor) Preflight(identity *motor.Identity, telemetry motor.Telemetry,
 		blocking = append(blocking,
 			"Output position is invalid — the encoder or the motor calibration is not usable.")
 	} else if config.PositionLimitEnabled {
-		if telemetry.Position < config.PositionMin || telemetry.Position > config.PositionMax {
+		// The same margin the running check allows, so that the two agree:
+		// an axis may be armed wherever it would be allowed to keep running.
+		//
+		// Without it the arm check is stricter than the trip check, and the
+		// gap is not theoretical — a target clamped to the envelope limit is
+		// commanded exactly at the bound, and the axis settles a fraction of
+		// a degree outside it through ordinary tracking error.  That is a
+		// position this layer itself asked for, and it left the axis unable
+		// to re-arm while the running check would only have warned.
+		margin := config.PositionTripMargin
+		if telemetry.Position < config.PositionMin-margin || telemetry.Position > config.PositionMax+margin {
 			blocking = append(blocking, fmt.Sprintf(
-				"Current position %.3f rev is outside the host safety envelope [%.3f, %.3f] rev. "+
+				"Current position %s is outside the host safety envelope [%s, %s] plus %s of margin. "+
 					"Widen the envelope, or move the axis back inside — the drive is off, so the shaft is free.",
-				telemetry.Position, config.PositionMin, config.PositionMax))
+				units.Position(telemetry.Position),
+				units.Position(config.PositionMin), units.Position(config.PositionMax),
+				units.Span(margin)))
 		}
 	}
 
@@ -162,6 +182,7 @@ func (m *Monitor) Preflight(identity *motor.Identity, telemetry motor.Telemetry,
 // only way to fix it is to move the axis by hand, and tripping on that would
 // make the fault unrecoverable.
 func (m *Monitor) Evaluate(telemetry motor.Telemetry, commanded motor.Command, armed bool, now time.Time) *Trip {
+	units := motor.Render(m.Units)
 	config := m.Config
 	var warnings []string
 	var trip *Trip
@@ -257,9 +278,10 @@ func (m *Monitor) Evaluate(telemetry motor.Telemetry, commanded motor.Command, a
 		case outside:
 			setTrip(&Trip{
 				Code:    "position_envelope",
-				Message: fmt.Sprintf("Position %.3f rev left the soft envelope", telemetry.Position),
-				Detail: fmt.Sprintf("Envelope [%.3f, %.3f] rev plus %.2f rev margin.",
-					config.PositionMin, config.PositionMax, margin),
+				Message: fmt.Sprintf("Position %s left the soft envelope", units.Position(telemetry.Position)),
+				Detail: fmt.Sprintf("Envelope [%s, %s] plus %s margin.",
+					units.Position(config.PositionMin), units.Position(config.PositionMax),
+					units.Span(margin)),
 			})
 		case telemetry.Position > config.PositionMax || telemetry.Position < config.PositionMin:
 			warnings = append(warnings, "outside soft position limits")
@@ -271,10 +293,11 @@ func (m *Monitor) Evaluate(telemetry motor.Telemetry, commanded motor.Command, a
 		if m.runaway.check(abs(telemetry.Velocity) > ceiling, now, config.RunawayTime) {
 			setTrip(&Trip{
 				Code:    "velocity_runaway",
-				Message: fmt.Sprintf("Velocity %.2f rev/s exceeded %.2f rev/s", telemetry.Velocity, ceiling),
-				Detail: fmt.Sprintf("Held for %.1f s. The ceiling is the velocity limit %.2f rev/s × %.1f. "+
+				Message: fmt.Sprintf("Velocity %s exceeded %s",
+					units.Velocity(telemetry.Velocity), units.Velocity(ceiling)),
+				Detail: fmt.Sprintf("Held for %.1f s. The ceiling is the velocity limit %s × %.1f. "+
 					"Raise the velocity ceiling, lower kp, or pick a looser preset if this was normal overshoot.",
-					config.RunawayTime, config.MaxVelocity, config.RunawayVelocityFactor),
+					config.RunawayTime, units.Velocity(config.MaxVelocity), config.RunawayVelocityFactor),
 			})
 		}
 
@@ -291,9 +314,9 @@ func (m *Monitor) Evaluate(telemetry motor.Telemetry, commanded motor.Command, a
 				setTrip(&Trip{
 					Code:    "stall",
 					Message: fmt.Sprintf("Stall detected: %.1f A with no motion", telemetry.QCurrent),
-					Detail: fmt.Sprintf("Motion was commanded but the axis moved less than %.3f rev/s "+
+					Detail: fmt.Sprintf("Motion was commanded but the axis moved less than %s "+
 						"while drawing more than %.1f A for %.1f s.",
-						config.StallVelocity, config.StallCurrent, config.StallTime),
+						units.Velocity(config.StallVelocity), config.StallCurrent, config.StallTime),
 				})
 			}
 		}

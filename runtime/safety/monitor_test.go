@@ -2,6 +2,7 @@ package safety
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -346,5 +347,59 @@ func TestPresetsTightenAndLoosenTogether(t *testing.T) {
 	}
 	if conservative.BoardTempTrip >= relaxed.BoardTempTrip {
 		t.Error("the conservative preset should trip at a lower temperature")
+	}
+}
+
+// An axis parked exactly on a limit it was commanded to must still arm.
+//
+// This is not a hypothetical position.  A position target is clamped to the
+// envelope, so commanding past a limit puts the target exactly on it, and the
+// axis settles a fraction outside through ordinary tracking error.  Before the
+// arm check carried the same margin as the running check, that left a machine
+// that had done nothing wrong unable to re-arm — while the running check, at
+// the very same position, would only have warned.
+func TestArmingIsAllowedWhereRunningWouldOnlyWarn(t *testing.T) {
+	config := DefaultConfig()
+	config.PositionLimitEnabled = true
+	config.PositionMin = 0.47746 // 3.0 rad through a 1:1 joint
+	config.PositionMax = 0.87535 // 5.5 rad
+	monitor := NewMonitor(&config)
+
+	telemetry := healthy()
+	telemetry.Position = 0.47681 // where the axis actually settled
+
+	blocking, _ := monitor.Preflight(nil, telemetry, true)
+	for _, item := range blocking {
+		if strings.Contains(item, "outside the host safety envelope") {
+			t.Fatalf("arming refused a hair outside the envelope: %s", item)
+		}
+	}
+
+	// And the running check agrees: a warning, not a trip.
+	if trip := monitor.Evaluate(telemetry, motor.NewCommand(motor.CtrlPosition), true, time.Now()); trip != nil {
+		t.Errorf("the running check tripped at the same position: %s", trip.Message)
+	}
+}
+
+// Past the margin it is still refused, or the check would mean nothing.
+func TestArmingIsStillRefusedPastTheMargin(t *testing.T) {
+	config := DefaultConfig()
+	config.PositionLimitEnabled = true
+	config.PositionMin = 0.0
+	config.PositionMax = 1.0
+	monitor := NewMonitor(&config)
+
+	telemetry := healthy()
+	telemetry.Position = -2 * config.PositionTripMargin
+
+	blocking, _ := monitor.Preflight(nil, telemetry, true)
+	found := false
+	for _, item := range blocking {
+		if strings.Contains(item, "outside the host safety envelope") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("arming was allowed %.3f rev outside the envelope: %v", telemetry.Position, blocking)
 	}
 }

@@ -119,9 +119,11 @@ func (s *Session) StartTrajectory(target, maxVelocity, accel float64) error {
 	s.trajectoryStartedAt = time.Now()
 	s.mu.Unlock()
 
+	units := motor.Render(s.units)
 	s.log(LevelOK, "Trajectory started", fmt.Sprintf(
-		"%.4f → %.4f rev · %.2f rev/s · %.2f rev/s² · %.2f s",
-		start, clamped, maxVelocity, accel, profile.TotalTime()))
+		"%s → %s · %s · %s · %.2f s",
+		units.Position(start), units.Position(clamped),
+		units.Velocity(maxVelocity), units.Accel(accel), profile.TotalTime()))
 	s.signal()
 	return nil
 }
@@ -177,7 +179,8 @@ func (s *Session) advanceTrajectoryLocked(now time.Time) (position, feedforward 
 	} else {
 		s.trajectory.Progress = 1
 	}
-	s.trajectory.Status = fmt.Sprintf("%.0f%% · %.3f rev", s.trajectory.Progress*100, point.Position)
+	s.trajectory.Status = fmt.Sprintf("%.0f%% · %s",
+		s.trajectory.Progress*100, motor.Render(s.units).Position(point.Position))
 
 	if elapsed >= s.trajectory.Total {
 		// Hold the target rather than releasing it: the move is finished, the

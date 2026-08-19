@@ -118,6 +118,9 @@ func (r *Robot) bringUpLocked(ctx context.Context) error {
 				Safety:      &envelope,
 				AutoArm:     true,
 				InitialMode: motor.CtrlPosition,
+				// The joint's own units, so that a limit written in radians
+				// is not reported back in revolutions.
+				Units: jointUnits{mapping: mapping},
 			}),
 		}
 

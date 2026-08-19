@@ -118,8 +118,10 @@ func (s *Session) StartShuttle() error {
 	if cycles > 0 {
 		limit = fmt.Sprintf("%d cycles", cycles)
 	}
+	units := motor.Render(s.units)
 	s.log(LevelOK, "Shuttle started",
-		fmt.Sprintf("A %.4f rev ↔ B %.4f rev · dwell %.2f s · %s", a, b, dwell, limit))
+		fmt.Sprintf("A %s ↔ B %s · dwell %.2f s · %s",
+			units.Position(a), units.Position(b), dwell, limit))
 	s.signal()
 	return nil
 }

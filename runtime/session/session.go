@@ -71,6 +71,13 @@ type Options struct {
 	// Safety is the starting envelope.  Zero value means DefaultConfig.
 	Safety *safety.Config
 
+	// Units renders the positions, speeds and torques this session puts in
+	// its log.  Nil means motor space — revolutions at the shaft, torque at
+	// the rotor — which is what somebody driving one controller directly is
+	// thinking in.  A robot supplies a joint renderer instead, so that a
+	// limit written in radians is not reported back in revolutions.
+	Units motor.Units
+
 	// RateHz is the initial control rate.
 	RateHz int
 
@@ -160,6 +167,7 @@ type Session struct {
 	identity *motor.Identity
 
 	safety  safety.Config
+	units   motor.Units
 	monitor *safety.Monitor
 	preset  string
 
@@ -253,6 +261,7 @@ func New(opts Options) *Session {
 
 	s := &Session{
 		safety:      config,
+		units:       opts.Units,
 		preset:      "standard",
 		connection:  Disconnected,
 		mode:        motor.CtrlStop,
@@ -270,6 +279,7 @@ func New(opts Options) *Session {
 		t0:          time.Now(),
 	}
 	s.monitor = safety.NewMonitor(&s.safety)
+	s.monitor.Units = s.units
 	return s
 }
 
@@ -469,19 +479,22 @@ func (s *Session) preflightLocked() (blocking, advisory []string) {
 	if hasBounds && !s.params.IgnorePositionBounds {
 		if motor.Valid(s.telemetry.Position) &&
 			(s.telemetry.Position < lower || s.telemetry.Position > upper) {
+			units := motor.Render(s.units)
 			blocking = append(blocking, fmt.Sprintf(
-				"Axis is at %.3f rev, outside the controller's own range [%.3f, %.3f] rev. "+
+				"Axis is at %s, outside the controller's own range [%s, %s]. "+
 					"Position control would fault immediately. Turn the shaft back inside by hand, "+
 					"re-reference the output while disarmed, or set IgnorePositionBounds.",
-				s.telemetry.Position, lower, upper))
+				units.Position(s.telemetry.Position), units.Position(lower), units.Position(upper)))
 		}
 
+		units := motor.Render(s.units)
 		message := fmt.Sprintf(
-			"Controller limits motion to [%.3f, %.3f] rev; targets are clamped to it.", lower, upper)
+			"Controller limits motion to [%s, %s]; targets are clamped to it.",
+			units.Position(lower), units.Position(upper))
 		if span := upper - lower; span < 0.1 {
 			message += fmt.Sprintf(
-				" That is only %.3f rev of travel — if you expected a free axis, "+
-					"widen the controller's bounds or set IgnorePositionBounds.", span)
+				" That is only %s of travel — if you expected a free axis, "+
+					"widen the controller's bounds or set IgnorePositionBounds.", units.Span(span))
 		}
 		advisory = append(advisory, message)
 	} else if s.identity != nil && !hasBounds {
@@ -536,8 +549,9 @@ func (s *Session) Arm(acknowledged bool) error {
 	maxTorque, maxVelocity := s.safety.MaxTorque, s.safety.MaxVelocity
 	s.mu.Unlock()
 
+	units := motor.Render(s.units)
 	s.log(LevelOK, "Armed", fmt.Sprintf(
-		"torque limit %.2f Nm · velocity limit %.2f rev/s", maxTorque, maxVelocity))
+		"torque limit %s · velocity limit %s", units.Torque(maxTorque), units.Velocity(maxVelocity)))
 	if len(advisory) > 0 {
 		s.log(LevelWarn, "Advisories at arm time", join(advisory))
 	}
@@ -817,7 +831,8 @@ func (s *Session) ZeroOutput(position float64) error {
 	s.pendingSpecial = &cmd
 	s.mu.Unlock()
 
-	s.log(LevelInfo, fmt.Sprintf("Output position re-referenced to %.4f rev", position),
+	s.log(LevelInfo, fmt.Sprintf("Output position re-referenced to %s",
+		motor.Render(s.units).Position(position)),
 		"Runtime only — the controller's stored configuration is untouched.")
 	s.signal()
 	return nil

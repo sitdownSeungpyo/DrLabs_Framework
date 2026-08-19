@@ -446,7 +446,9 @@ func (s *Session) tryAutoArmLocked() {
 		s.setpoint.Velocity = 0
 	}
 
+	units := motor.Render(s.units)
 	s.logLocked(LevelOK, "Armed automatically", fmt.Sprintf(
-		"holding %s at %.4f rev · torque limit %.2f Nm",
-		s.mode, s.setpoint.Position, min(s.params.MaxTorque, s.safety.MaxTorque)))
+		"holding %s at %s · torque limit %s",
+		s.mode, units.Position(s.setpoint.Position),
+		units.Torque(min(s.params.MaxTorque, s.safety.MaxTorque))))
 }

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"go_dxl/dxl"
+	"drlabs/legacy/dxl"
 )
 
 func defaultSerialPort() string {

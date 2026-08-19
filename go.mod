@@ -1,3 +1,3 @@
-module go_dxl
+module drlabs
 
 go 1.24.4

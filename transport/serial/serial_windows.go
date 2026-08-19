@@ -3,6 +3,7 @@ package serial
 import (
 	"fmt"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -166,6 +167,37 @@ func (sp *SerialPort) setTimeouts() error {
 	timeouts.ReadIntervalTimeout = 0
 	timeouts.ReadTotalTimeoutMultiplier = 0
 	timeouts.ReadTotalTimeoutConstant = 10
+	timeouts.WriteTotalTimeoutMultiplier = 0
+	timeouts.WriteTotalTimeoutConstant = 10
+
+	r1, _, e1 := procSetCommTimeouts.Call(uintptr(sp.handle), uintptr(unsafe.Pointer(&timeouts)))
+	if r1 == 0 {
+		return fmt.Errorf("SetCommTimeouts failed: %v", e1)
+	}
+	return nil
+}
+
+// maxDWORD is the sentinel the Windows timeout structure uses.
+const maxDWORD = 0xFFFFFFFF
+
+// SetReadTimeout tunes how long a read may block waiting for data.
+//
+// The combination below is the documented way to say "return as soon as any
+// byte arrives, but wait no longer than this": interval and multiplier both
+// at their sentinel, with the constant carrying the limit.  The alternative —
+// a plain total timeout, which is what this port opens with — makes every
+// read that finds an empty buffer cost the whole timeout, whether or not the
+// answer arrives a microsecond later.
+func (sp *SerialPort) SetReadTimeout(timeout time.Duration) error {
+	milliseconds := uint32(timeout / time.Millisecond)
+	if milliseconds == 0 {
+		milliseconds = 1
+	}
+
+	var timeouts commTimeouts
+	timeouts.ReadIntervalTimeout = maxDWORD
+	timeouts.ReadTotalTimeoutMultiplier = maxDWORD
+	timeouts.ReadTotalTimeoutConstant = milliseconds
 	timeouts.WriteTotalTimeoutMultiplier = 0
 	timeouts.WriteTotalTimeoutConstant = 10
 

@@ -1,286 +1,358 @@
-# dxl_go — Pure Go Dynamixel SDK
+# DrLabs Framework — a pure Go motor control framework
 
-A high-performance, zero-dependency Go implementation of **Dynamixel Protocol 2.0**.
+One vendor-neutral API, a real-time control loop, and a host-side safety layer,
+for brushless controllers and smart servos alike.
 
-**No Cgo, No DLLs, Just Pure Go.**
+**No Cgo. No DLLs. No vendor SDKs.** Every protocol — Dynamixel Protocol 2.0,
+the mjlib multiplex register protocol, the RobStride CAN 2.0B protocol, CAN and
+CAN-FD framing, the fdcanusb line protocol, and the platform serial ports
+underneath them — is implemented in this repository in pure Go.
 
-> Inspired by the official [ROBOTIS DynamixelSDK](https://github.com/ROBOTIS-GIT/DynamixelSDK). This project reimplements the core protocol and driver layers in pure Go for cross-platform compatibility and easy deployment.
+```
+go build ./...
+go run ./cmd/drlabs run -driver moteus-sim -mode position -position 0.25
+```
 
-## Features
+That last command runs the complete stack — state machine, control loop, safety
+monitor, driver, simulated physics — with nothing plugged in.
 
-- **Pure Go** — Native serial port implementation per platform (no C dependencies)
-- **Protocol 2.0** — Full packet construction, parsing, CRC-16 validation, byte stuffing
-- **Sync Read/Write** — Efficient multi-motor communication (3-5x faster than individual commands)
-- **Trajectory Generation** — Trapezoidal velocity profile with smooth acceleration/deceleration
-- **Concurrent Controller** — Channel-based command/feedback loop with context cancellation
-- **Cross-Platform** — Windows, Linux, macOS (including Apple Silicon)
+---
+
+## What this is
+
+**A low-level motor layer.** Something above it decides what the machine does;
+its job is to be energised, waiting, and to execute what it is told — within an
+envelope nothing above it can exceed. That role is `drlabs serve`, and
+`docs/SERVO.md` describes it.
+
+The operator-facing paths — `drlabs run`, the web UI — are the same runtime
+with a human in the loop instead: they start disarmed and make someone read the
+preflight checklist first.
+
+The starting point was a Dynamixel SDK. A framework needs three things the SDK
+did not have:
+
+1. **A seam that is not vendor-shaped.** `motor.Link` is the only interface the
+   runtime is written against. Applications say "go to 0.25 revolutions", not
+   "write 1024 to control table address 116" or "set register 0x020 to 25000".
+2. **A control loop that keeps its period.** Motor control is a real-time
+   problem. A loop that silently runs at 64 Hz while claiming 100 Hz makes every
+   watchdog timeout derived from the nominal rate wrong.
+3. **A safety layer that protects the machine.** Controller firmware protects
+   the *board*. The motor, the gearbox and whatever they are bolted to are not
+   the controller manufacturer's products, so their envelope has to be declared
+   by the operator and enforced on the host.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Application (main.go, test/*.go)                │
-│  - Position/Velocity/Torque control              │
-│  - Trajectory execution                          │
-├──────────────────────────────────────────────────┤
-│  Controller (controller.go)                      │
-│  - Goroutine-based control loop                  │
-│  - Channel I/O (CommandChan / FeedbackChan)      │
-│  - Auto sync mode for multi-motor                │
-│  - Operating mode management                     │
-├──────────────────────────────────────────────────┤
-│  Driver (driver.go)                              │
-│  - Ping / Read / Write / SyncRead / SyncWrite    │
-│  - Packet timeout & CRC validation               │
-│  - Input buffer flush before each Transfer       │
-├──────────────────────────────────────────────────┤
-│  Protocol (protocol.go)                          │
-│  - BuildPacket / ParsePacket                     │
-│  - CRC-16 (XMODEM variant)                      │
-│  - Byte stuffing / destuffing                    │
-├──────────────────────────────────────────────────┤
-│  Serial Port (per-platform)                      │
-│  - serial_windows.go  (Win32 API)                │
-│  - serial_linux.go    (termios + ioctl)          │
-│  - serial_darwin.go   (termios + IOSSIOSPEED)    │
-└──────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Application            cmd/drlabs · examples/ · your code     │
+├────────────────────────────────────────────────────────────────┤
+│  runtime/session        state machine · fixed-rate loop        │
+│                         telemetry history · event log          │
+│  runtime/safety         command clamps · trip conditions       │
+│  runtime/timing         1 ms timers · jitter measurement       │
+├────────────────────────────────────────────────────────────────┤
+│  motor                  Link · Command · Telemetry · Registry  │
+│                         ── the only vendor-neutral seam ──     │
+├────────────────────────────────────────────────────────────────┤
+│  drivers/moteus         multiplex protocol · frames · console  │
+│  drivers/dynamixel      Protocol 2.0 · control tables · units  │
+│  drivers/robstride      CAN 2.0B · per-model scaling · params  │
+│  drivers/odrive         (declared, not yet implemented)        │
+├────────────────────────────────────────────────────────────────┤
+│  transport/fdcanusb     CAN-FD over USB, ASCII line protocol   │
+│  transport/can          CAN / CAN-FD frames and bus interface  │
+│  transport/serial       Win32 · termios · IOSSIOSPEED          │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+## Layout
+
+| Path | What lives there |
+|------|------------------|
+| `motor/` | `Link`, `Command`, `Telemetry`, `Capabilities`, units, driver registry |
+| `drivers/moteus/` | mjbots moteus: multiplex protocol, frame builders, diagnostic console, simulator |
+| `drivers/dynamixel/` | ROBOTIS Dynamixel: Protocol 2.0 driver, control-table profiles, `Link` adapter |
+| `drivers/robstride/` | RobStride RS00–RS06: CAN 2.0B protocol, per-model scaling, parameter table, simulator |
+| `drivers/odrive/` | Declared interface, awaiting implementation |
+| `transport/serial/` | Per-platform serial ports and port enumeration |
+| `transport/can/` | CAN and CAN-FD frame types and the `Bus` interface |
+| `transport/fdcanusb/` | mjbots fdcanusb adapter, including its optional line checksums |
+| `runtime/session/` | Connection lifecycle, control loop, arming, emergency stop, A↔B shuttle |
+| `runtime/safety/` | Operator envelope, command clamps, trip evaluation, sensitivity presets |
+| `runtime/robot/` | A whole machine from one JSON description: joints, gearing, shared buses |
+| `runtime/timing/` | High-resolution scheduling and loop statistics |
+| `trajectory/` | Motor-agnostic trapezoidal motion profiles, driven by `session.StartTrajectory` |
+| `cmd/drlabs/` | Command line front end, including the `serve` servo role |
+| `test/webui/` | Browser control panel built on the runtime — see its own README |
+| `examples/` | Runnable programs, `examples/framework` first; `examples/robots/` holds robot descriptions |
+| `legacy/dxl/` | The original single-package Dynamixel SDK, kept working |
+| `ros2/bridge/` | Planned gRPC bridge for ROS 2 |
+
+## Units
+
+Every shared interface speaks physical units. Drivers convert to and from their
+own wire encodings internally, so application code never learns whether it is
+talking to encoder counts or to 0.00001-revolution register steps.
+
+| Quantity | Unit |
+|----------|------|
+| position | revolutions (rev) |
+| velocity | revolutions per second (rev/s) |
+| torque | newton-metres (Nm) |
+| current | amperes (A) |
+| voltage | volts (V) |
+| temperature | degrees Celsius (°C) |
+| time | seconds (s) |
+
+A `float64` field carries `NaN` when the value is unknown or was not reported.
+Use `motor.Valid` before doing arithmetic on one — an absent temperature sensor
+must not read as a cold motor.
+
+## Quick start
+
+### Command line
+
+```bash
+drlabs drivers                     # what this binary can talk to
+drlabs ports                       # serial ports, CAN adapters first
+
+# The servo role: energise, then execute commands from an upper layer.
+drlabs serve -driver moteus -port COM5 -id 1 -max-torque 0.2
+#   {"cmd":"position","value":0.25}  ->  {"ok":true}
+
+# A whole robot from one description, addressed by joint name.
+drlabs bringup -check robot.json     # validate and print the plan
+drlabs bringup robot.json
+#   {"cmd":"pose","joints":{"r_sh_p":-0.3,"r_elb_p":-2.0}}
+
+# Connect, identify, report, disconnect.  Commands nothing but a stop.
+drlabs probe -driver moteus -port COM7 -id 1
+
+# Drive an axis.
+drlabs run -driver moteus -port COM7 -id 1 \
+           -mode position -position 0.25 -max-torque 0.4
+
+# Browser control panel (connection is made from the page).
+go run ./test/webui -driver moteus -port COM5 -id 1
+
+# Unattended A↔B endurance run.
+drlabs run -driver moteus-sim -shuttle-a -0.25 -shuttle-b 0.25 \
+           -shuttle-dwell 1.0 -shuttle-cycles 100
+```
+
+### Library
+
+```go
+s := session.New(session.Options{RateHz: 200})
+
+err := s.Connect(ctx, motor.Config{
+    Driver: "moteus", Port: "COM7", ID: 1,
+}, false)
+
+safety := s.Safety()
+safety.MaxTorque = 0.5
+safety.PositionMin, safety.PositionMax = -0.6, 0.6
+s.SetSafety(safety)
+
+if blocking, _ := s.Preflight(); len(blocking) > 0 {
+    return fmt.Errorf("cannot arm: %s", blocking[0])
+}
+s.Arm(true)
+s.SetMode(motor.CtrlPosition)
+s.SetPosition(0.25)
+```
+
+See `examples/framework/main.go` for the complete version.
+
+## Supported hardware
+
+### mjbots moteus (`-driver moteus`)
+
+Brushless controller on CAN-FD, reached through an fdcanusb adapter.
+
+- Modes: stop, query, position, velocity, torque, hold (zero velocity), brake,
+  stay-within, set-output
+- Telemetry: mode, position, velocity, torque, q/d current, absolute position,
+  power, bus voltage, board and motor temperature, fault, trajectory and homing
+  state, plus the controller's live command registers
+- The tunnelled diagnostic console, used to read `servopos.position_min/max`
+- Fault and limiting codes decoded to a cause and a remedy
+
+The frame encoder is pinned byte-for-byte against the official `moteus` Python
+library in `drivers/moteus/frames_test.go`.
+
+### ROBOTIS Dynamixel (`-driver dynamixel`)
+
+Smart servos on Protocol 2.0 serial.
+
+- Modes: stop, query, position (extended, multi-turn), velocity, torque, hold
+- Telemetry: position, velocity, current, voltage, temperature, hardware error
+- Control-table profiles for the X-series and XL330 families, with per-family
+  current units
+- The bus watchdog mapped to the framework's watchdog timeout
+
+Torque is reported in newton-metres only when a motor-specific torque constant
+is supplied (`-opt torque_constant=0.35`); otherwise it is reported as
+unmeasured rather than fabricated.
+
+### RobStride (`-driver robstride`)
+
+Quasi-direct-drive actuators on classic CAN 2.0B at 1 Mbit/s, reached through
+the same adapter as moteus.
+
+All seven models are supported — RS00, RS01, RS02, RS03, RS04, RS05, RS06 — and
+**the model is a required option**:
+
+```bash
+drlabs run -driver robstride -port COM7 -id 1 -opt model=RS03 \
+           -mode position -position 0.25 -max-torque 8
+```
+
+That is not ceremony. The torque scale spans ±5.5 Nm on an RS05 to ±120 Nm on
+an RS04, the gain ranges differ by a factor of ten between two halves of the
+family, and **a RobStride cannot report its own model**. Configure the wrong one
+and every torque command is scaled by that factor with nothing on the bus to
+reveal it, so the driver refuses to guess and the session raises an advisory on
+every arm.
+
+- Modes: stop, query, position, velocity, torque, hold, set-output
+- Position uses cyclic synchronous position mode by default, so the commanded
+  velocity limit is honoured; `-opt position_mode=operation` selects the
+  MIT-style mode for impedance control
+- Brake and stay-within are reported as unsupported, because the controller has
+  no equivalent
+- Bus voltage and current live in the parameter table rather than the feedback
+  frame, so they refresh on the wider query profiles
+
+Written against the official manuals and tested against a simulator; see
+`docs/ROBSTRIDE.md` for the protocol notes and the pre-power-up checklist.
+
+### Simulator (`-driver moteus-sim`)
+
+A trapezoidal trajectory generator feeding a torque-limited PD controller,
+driving an inertia with viscous friction, with thermal rise and supply sag. It
+exists so that every control path and every safety trip can be exercised — and
+tested in CI — with no hardware attached.
+
+## Safety
+
+Two independent layers of protection, and this framework is the second one.
+
+**Command clamps**, applied to every outgoing command before it reaches the bus:
+position envelope, velocity ceiling, torque ceiling, gain scales, acceleration.
+
+**Trips**, evaluated against telemetry every cycle, latching an emergency stop:
+
+| Trip | Fires when |
+|------|------------|
+| `controller_fault` | The controller reports a latching fault |
+| `over_voltage` / `under_voltage` | Bus voltage leaves the declared range |
+| `over_current` | Current stays above the limit for longer than the trip time |
+| `board_over_temperature` / `motor_over_temperature` | Either sensor exceeds its limit |
+| `position_envelope` | The axis leaves the soft envelope plus its overshoot margin |
+| `velocity_runaway` | Velocity exceeds the limit by the runaway factor, sustained |
+| `stall` | Motion was commanded, current is high, and the axis is not moving |
+| `comm_loss` | Too many consecutive cycles without a reply |
+| `deadman` | The supervising client stopped sending heartbeats |
+| `link_error` | The transport failed |
+
+Three things about how these are designed are worth knowing:
+
+- **Trips need duration, not a single sample.** A momentary current spike is
+  what acceleration looks like. Every motion and electrical trip requires the
+  condition to hold continuously.
+- **The position envelope only trips while armed.** With the drive off, the
+  operator's only way back inside is to move the axis by hand — latching on
+  that would make the condition unrecoverable.
+- **"Limiting" is not a fault.** Codes that say the output is being capped are
+  surfaced as warnings. They are the single most useful thing to show when a
+  motor accepts commands and does not move.
+
+One-click sensitivity presets tighten or loosen all the motion trips together:
+`conservative` for a first power-up with an unknown motor, `standard`,
+`relaxed` for a machine that is known to overshoot.
+
+## Real-time behaviour
+
+Windows' default timer granularity is 15.6 ms. A naive 100 Hz loop overshoots
+its period by more than the period itself, and runs at about 64 Hz. The runtime
+raises the multimedia timer to 1 ms and spins the final approach to each
+deadline.
+
+Measured on Windows 11 with the simulator:
+
+| Requested | Achieved | Jitter (σ) |
+|-----------|----------|------------|
+| 100 Hz | 100.0 Hz | 0.25 ms |
+| 200 Hz | 200.0 Hz | 0.50 ms |
+
+`Status().Stats` reports the rate actually achieved, not the one requested, and
+the loop warns when it falls below 85% of target. A loop that cannot keep up is
+the most common cause of surprising motor behaviour, and the only way to know is
+to count cycles against the clock.
+
+## Adding a driver
+
+Implement `motor.Link` and register it:
+
+```go
+func init() {
+    motor.Register("mymotor", "My controller over CAN", newLink)
+}
+```
+
+The rest of the framework — the control loop, the safety monitor, the CLI, the
+arming checklist — works without modification. Report honestly through
+`Capabilities` and `Envelope`: a mode you claim and cannot deliver fails at
+command time, and a rating you do not publish simply leaves the operator's
+declared limits in force.
+
+## Tests
+
+```bash
+go test ./...
+```
+
+Nothing in the suite needs hardware. The interesting parts:
+
+- `drivers/moteus/frames_test.go` — every command frame compared byte-for-byte
+  against output from the official `moteus` Python library. This is the only
+  check that the encoder is compatible with real firmware rather than merely
+  self-consistent, so regenerate it against the reference rather than adjusting
+  it to match a change here.
+- `drivers/moteus/multiplex_test.go` — varuint encoding, saturation, the NaN
+  sentinel, subframe grouping, reply parsing including truncation and padding
+- `runtime/safety/monitor_test.go` — every trip, including the cases that must
+  *not* fire
+- `drivers/robstride/protocol_test.go` — addressing against the manuals' own
+  worked example, both byte orders, the per-model scaling table, fault bits
+- `runtime/session/session_test.go` — the whole stack against the simulator:
+  arming, emergency stop, fault handling, the shuttle, the deadman
+
+Describing a machine is `docs/ROBOT.md`; bringing up a new axis is
+`docs/BRINGUP.md`; the testing layers are in
+`docs/TESTING.md`; the servo role is in `docs/SERVO.md`; the protocol notes are
+in `docs/MOTEUS.md` and `docs/ROBSTRIDE.md`.
 
 ## Requirements
 
-### Software
-- Go 1.18+
+- Go 1.24+
+- No external Go dependencies
 
-### Hardware
-- **Motor**: Dynamixel Protocol 2.0 compatible (see [Supported Motors](#supported-motors))
-- **Interface**: USB-Serial adapter that supports your motor's baud rate
-  - [U2D2](https://emanual.robotis.com/docs/en/parts/interface/u2d2/) (ROBOTIS 공식)
-  - [OpenRB-150](https://emanual.robotis.com/docs/en/parts/controller/openrb-150/) (Arduino 호환 보드, USB CDC ACM)
-- **Power**: 모터에 맞는 전원 공급 (예: XL330은 5V, XM430은 12V)
-- **Cable**: JST 3-pin 또는 4-pin 커넥터 케이블
-
-### Verified Setup
-| 항목 | 사양 |
-|------|------|
-| Motor | XL330-M288-T (Model 1200) |
-| Interface | OpenRB-150 (CDC ACM) |
-| Baudrate | 1,000,000 bps |
-| OS | Windows 10/11, macOS (ARM64) |
-
-## Quick Start
-
-### Installation
-
-```bash
-git clone https://github.com/sitdownSeungpyo/dxl_go.git
-cd dxl_go/dxl_go
-go build ./...
-```
-
-### Serial Port 확인
-
-```bash
-# macOS — cu.* 포트 사용 권장 (tty.* 대신)
-ls /dev/cu.usb*
-
-# Linux
-ls /dev/ttyUSB* /dev/ttyACM*
-
-# Windows
-# 장치 관리자에서 COM 포트 번호 확인
-```
-
-### Connection Test
-
-```bash
-# macOS
-go run main.go -port /dev/cu.usbmodem14301 -baud 1000000
-
-# Linux
-go run main.go -port /dev/ttyACM0 -baud 1000000
-
-# Windows
-go run main.go -port COM3 -baud 1000000
-```
-
-## Usage
-
-### Basic: Single Motor Position Control
-
-```go
-package main
-
-import (
-    "fmt"
-    "go_dxl/dxl"
-)
-
-func main() {
-    ctrl := dxl.NewController("/dev/cu.usbmodem14301", 1000000, dxl.ModelXSeries)
-    ctrl.SetMotorIDs([]uint8{1})
-
-    if err := ctrl.Start(); err != nil {
-        panic(err)
-    }
-    defer ctrl.Stop()
-
-    // Set position mode
-    ctrl.SetOperatingMode(1, dxl.OpModePosition)
-
-    // Move to position 2048 (center)
-    ctrl.CommandChan <- []dxl.Command{{ID: 1, Value: 2048}}
-
-    // Read feedback
-    fb := <-ctrl.FeedbackChan
-    fmt.Printf("Position: %d\n", fb[0].Value)
-}
-```
-
-### Multi-Motor Sync Control
-
-```go
-// 2개 이상이면 자동으로 Sync Read/Write 모드 활성화
-ctrl.SetMotorIDs([]uint8{1, 2, 3})
-
-ctrl.CommandChan <- []dxl.Command{
-    {ID: 1, Value: 2048},
-    {ID: 2, Value: 3072},
-    {ID: 3, Value: 1024},
-}
-```
-
-### Trajectory Execution
-
-```go
-// Trapezoidal velocity profile: start=0, target=4096, maxVel=1000, accel=5000
-profile, _ := dxl.NewTrapezoidalProfile(0, 4096, 1000, 5000)
-executor := dxl.NewTrajectoryExecutor(ctrl, 1)
-
-// Execute at 100Hz update rate
-executor.Execute(profile, 100)
-```
-
-### Low-Level Driver Access
-
-```go
-sp, _ := dxl.OpenSerial("/dev/cu.usbmodem14301", 1000000)
-defer sp.Close()
-
-driver := dxl.NewDriver(sp)
-
-// Ping
-model, _ := driver.Ping(1)
-fmt.Printf("Model: %d\n", model)
-
-// Read 4 bytes from address 132 (Present Position)
-pos, _ := driver.Read4Byte(1, 132)
-fmt.Printf("Position: %d\n", pos)
-
-// Write 4 bytes to address 116 (Goal Position)
-driver.Write4Byte(1, 116, 2048)
-```
-
-## Control Modes
-
-| Mode | Constant | Value | Description |
-|------|----------|-------|-------------|
-| Current | `OpModeCurrent` | 0 | 전류(토크) 제어 |
-| Velocity | `OpModeVelocity` | 1 | 속도 제어 |
-| Position | `OpModePosition` | 3 | 위치 제어 (0~4095) |
-| Extended Position | `OpModeExtendedPosition` | 4 | 다중 회전 위치 제어 |
-| Current-based Position | `OpModeCurrentBasedPos` | 5 | 전류 제한 위치 제어 |
-| PWM | `OpModePWM` | 16 | PWM 직접 제어 |
-
-## Supported Motors
-
-Protocol 2.0을 지원하는 모든 Dynamixel 모터에서 동작합니다:
-
-| Series | Models | Control Table |
-|--------|--------|---------------|
-| **X-Series** | XL330, XL430, XC330, XC430, XM430, XM540, XH430, XH540, XW430, XW540 | `ModelXSeries` |
-| **MX-Series** | MX-28, MX-64, MX-106 (Protocol 2.0 펌웨어 필요) | `ModelXSeries` |
-| **Pro-Series** | H54, H42 | `ModelProSeries` |
-
-> Control Table 주소가 다른 모터는 `MotorModel` 구조체를 커스텀하여 사용할 수 있습니다.
-
-## Project Structure
-
-```
-dxl_go/
-├── main.go                     # CLI entry point
-├── dxl/
-│   ├── protocol.go             # Protocol 2.0 (CRC, Packet, Stuffing)
-│   ├── driver.go               # Driver (Ping, Read, Write, SyncRead/Write)
-│   ├── controller.go           # Concurrent control loop
-│   ├── trajectory.go           # Trapezoidal motion profile
-│   ├── serial_windows.go       # Windows serial (Win32 API)
-│   ├── serial_linux.go         # Linux serial (termios)
-│   ├── serial_darwin.go        # macOS serial (termios + IOSSIOSPEED)
-│   ├── protocol_test.go        # Protocol unit tests
-│   ├── driver_test.go          # Driver unit tests
-│   ├── trajectory_test.go      # Trajectory unit tests
-│   └── smoke_test.go           # Integration tests
-├── test/
-│   ├── position_run.go         # Position control test
-│   ├── velocity_run.go         # Velocity control test
-│   ├── torque_run.go           # Torque/PWM control test
-│   ├── trajectory_run.go       # Single motor trajectory
-│   ├── multi_motor_run.go      # Multi-motor sync control
-│   ├── multi_trajectory_run.go # Multi-motor trajectory
-│   ├── smoke_hw_run.go         # Hardware smoke test
-│   └── sync_benchmark.go       # Sync vs individual benchmark
-└── docs/
-    └── TESTING.md              # Test execution guide
-```
-
-## Running Tests
-
-### Unit Tests (하드웨어 불필요)
-
-```bash
-go test ./dxl/ -v
-go test ./dxl/ -cover
-```
-
-### Hardware Tests
-
-```bash
-# 포트/ID를 환경에 맞게 변경하세요
-PORT=/dev/cu.usbmodem14301
-BAUD=1000000
-ID=1
-
-# Ping & 연결 테스트
-go run main.go -port $PORT -baud $BAUD
-
-# Position 제어
-go run test/position_run.go -port $PORT -baud $BAUD -id $ID
-
-# Velocity 제어
-go run test/velocity_run.go -port $PORT -baud $BAUD -id $ID
-
-# Trajectory 실행
-go run test/trajectory_run.go -port $PORT -baud $BAUD -id $ID
-
-# 전체 스모크 테스트
-go run test/smoke_hw_run.go -port $PORT -baud $BAUD -id $ID
-
-# Sync Read/Write 벤치마크
-go run test/sync_benchmark.go
-```
-
-## macOS 참고사항
-
-- **`/dev/cu.*` 포트 사용** — `/dev/tty.*` 대신 `/dev/cu.*`를 사용하세요. CDC ACM 디바이스에서 더 안정적입니다.
-- **OpenRB-150**은 `/dev/cu.usbmodemXXXX` 형태로 인식됩니다.
-- **U2D2**는 `/dev/cu.usbserial-XXXX` 형태로 인식됩니다.
+For hardware: an fdcanusb (or compatible CAN-FD adapter) for moteus, a U2D2 or
+OpenRB-150 for Dynamixel, and a supply matched to the motor.
 
 ## References
 
-- [ROBOTIS DynamixelSDK](https://github.com/ROBOTIS-GIT/DynamixelSDK) — 공식 C/C++/Python SDK (이 프로젝트의 프로토콜 구현 참고)
-- [Dynamixel Protocol 2.0](https://emanual.robotis.com/docs/en/dxl/protocol2/) — 패킷 구조, CRC, Byte Stuffing 명세
-- [XL330-M288-T e-Manual](https://emanual.robotis.com/docs/en/dxl/x/xl330-m288/) — Control Table, 전기적 사양
-- [OpenRB-150](https://emanual.robotis.com/docs/en/parts/controller/openrb-150/) — USB-Serial 인터페이스 보드
+- [moteus reference](https://github.com/mjbots/moteus/blob/main/docs/reference.md) — register map, subframe encoding, value scaling
+- [moteus Python library](https://pypi.org/project/moteus/) — the reference implementation these frames are pinned against
+- [Dynamixel Protocol 2.0](https://emanual.robotis.com/docs/en/dxl/protocol2/) — packet structure, CRC, byte stuffing
+- [Dynamixel control tables](https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/) — addresses and unit scales
+- [RobStride Product_Information](https://github.com/RobStride/Product_Information) — the per-model user manuals these constants are quoted from
+- [sirwart/robstride](https://github.com/sirwart/robstride) — an independent Python SDK, used to cross-check addressing and byte order
 
 ## License
 

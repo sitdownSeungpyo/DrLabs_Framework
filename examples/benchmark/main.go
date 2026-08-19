@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"time"
 
-	"go_dxl/dxl"
+	"drlabs/legacy/dxl"
 )
 
 // Demonstrates the performance difference between individual writes and sync write

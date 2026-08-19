@@ -1,9 +1,9 @@
 package main
 
 import (
+	"drlabs/legacy/dxl"
 	"flag"
 	"fmt"
-	"go_dxl/dxl"
 	"os"
 	"os/signal"
 	"runtime"

@@ -1,5 +1,6 @@
 # Binaries
 *.exe
+*.exe~
 *.dll
 *.so
 *.dylib
@@ -17,3 +18,9 @@
 
 # Claude
 .claude
+# Unrelated content that shares the framework root directory.
+andrej-karpathy-skills/
+
+# Locally built CLI binary.
+drlabs.exe
+webui.exe

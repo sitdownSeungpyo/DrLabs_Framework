@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DrLabs motor control</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <strong>DrLabs</strong>
+    <span id="link-summary" class="muted">not connected</span>
+  </div>
+  <div class="header-state">
+    <span id="armed-pill" class="pill">DISARMED</span>
+    <span id="mode-pill" class="pill">—</span>
+    <span id="rate-pill" class="pill muted">— Hz</span>
+    <button id="estop" class="estop">EMERGENCY STOP</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+
+  <!-- ── connection ──────────────────────────────────────────── -->
+  <section class="card" id="card-connect">
+    <h2>Connection</h2>
+    <div class="grid">
+      <label>Driver
+        <select id="driver"></select>
+      </label>
+      <label>Port
+        <input id="port" list="ports" placeholder="auto">
+        <datalist id="ports"></datalist>
+      </label>
+      <label>Bus address
+        <input id="id" type="number" min="1" max="127" value="1">
+      </label>
+      <label>Model <span class="hint">RobStride only</span>
+        <select id="model">
+          <option value="">—</option>
+          <option>RS00</option><option>RS01</option><option>RS02</option>
+          <option>RS03</option><option>RS04</option><option>RS05</option>
+          <option>RS06</option>
+        </select>
+      </label>
+      <label>Rate (Hz)
+        <input id="rate" type="number" min="10" max="500" value="200">
+      </label>
+      <label class="check">
+        <input id="allow-unknown" type="checkbox">
+        Allow unidentified board
+      </label>
+    </div>
+    <div class="row">
+      <button id="connect" class="primary">Connect</button>
+      <button id="disconnect">Disconnect</button>
+      <button id="refresh-ports">Refresh ports</button>
+    </div>
+    <div id="identity" class="kv muted"></div>
+  </section>
+
+  <!-- ── arming ──────────────────────────────────────────────── -->
+  <section class="card" id="card-arm">
+    <h2>Arming</h2>
+    <div id="blockers" class="checklist"></div>
+    <div id="advisories" class="checklist"></div>
+    <label class="check">
+      <input id="ack" type="checkbox">
+      I have read the checklist and the area is clear
+    </label>
+    <div class="row">
+      <button id="arm" class="primary">Arm</button>
+      <button id="disarm">Disarm</button>
+      <button id="estop-reset">Reset E-stop</button>
+      <button id="zero">Set position = 0</button>
+    </div>
+  </section>
+
+  <!-- ── control ─────────────────────────────────────────────── -->
+  <section class="card" id="card-control">
+    <h2>Control</h2>
+    <div class="modes" id="modes">
+      <button data-mode="stop">Stop</button>
+      <button data-mode="position">Position</button>
+      <button data-mode="velocity">Velocity</button>
+      <button data-mode="hold">Hold</button>
+      <button data-mode="brake">Brake</button>
+      <button data-mode="within">Within</button>
+    </div>
+
+    <div class="setpoint">
+      <label>Position target (rev)
+        <div class="slider-row">
+          <input id="pos-slider" type="range" step="0.001" min="-0.5" max="0.5" value="0">
+          <input id="pos-input" type="number" step="0.001" value="0">
+        </div>
+        <div class="hint" id="pos-range">range —</div>
+      </label>
+      <label>Velocity target (rev/s)
+        <div class="slider-row">
+          <input id="vel-slider" type="range" step="0.01" min="-2" max="2" value="0">
+          <input id="vel-input" type="number" step="0.01" value="0">
+        </div>
+      </label>
+    </div>
+
+    <h3>Parameters</h3>
+    <div class="grid">
+      <label>Max torque (Nm)<input id="p-torque" type="number" step="0.01"></label>
+      <label>Velocity limit (rev/s)<input id="p-vel" type="number" step="0.1"></label>
+      <label>Accel limit (rev/s²)<input id="p-accel" type="number" step="0.1"></label>
+      <label>Kp scale<input id="p-kp" type="number" step="0.05" min="0" max="1"></label>
+      <label>Kd scale<input id="p-kd" type="number" step="0.05" min="0" max="1"></label>
+      <label>Feedforward (Nm)<input id="p-ff" type="number" step="0.01"></label>
+    </div>
+    <div class="row"><button id="apply-params">Apply parameters</button></div>
+  </section>
+
+  <!-- ── trajectory ──────────────────────────────────────────── -->
+  <section class="card" id="card-trajectory">
+    <h2>Trajectory <span class="hint">host-generated trapezoidal profile</span></h2>
+    <p class="muted small">
+      Profiles the move on this host and streams position plus a velocity
+      feedforward every cycle. Use it when the move has to be repeatable, or in
+      a mode where the controller has no profile generator of its own.
+    </p>
+    <div class="grid">
+      <label>Target (rev)<input id="t-target" type="number" step="0.01" value="0.25"></label>
+      <label>Max velocity (rev/s)<input id="t-vel" type="number" step="0.05" value="0.5"></label>
+      <label>Acceleration (rev/s²)<input id="t-accel" type="number" step="0.1" value="2"></label>
+    </div>
+    <div class="row">
+      <button id="traj-start" class="primary">Run trajectory</button>
+      <button id="traj-stop">Stop</button>
+    </div>
+    <div class="progress"><div id="traj-bar"></div></div>
+    <div id="traj-status" class="kv muted"></div>
+  </section>
+
+  <!-- ── shuttle ─────────────────────────────────────────────── -->
+  <section class="card" id="card-shuttle">
+    <h2>A ↔ B shuttle <span class="hint">endurance run</span></h2>
+    <div class="grid">
+      <label>A (rev)<input id="s-a" type="number" step="0.01" value="-0.2"></label>
+      <label>B (rev)<input id="s-b" type="number" step="0.01" value="0.2"></label>
+      <label>Dwell (s)<input id="s-dwell" type="number" step="0.1" value="0.5"></label>
+      <label>Cycles <span class="hint">0 = forever</span><input id="s-cycles" type="number" min="0" value="0"></label>
+    </div>
+    <div class="row">
+      <button id="shuttle-start" class="primary">Start shuttle</button>
+      <button id="shuttle-stop">Stop</button>
+    </div>
+    <div id="shuttle-status" class="kv muted"></div>
+  </section>
+
+  <!-- ── telemetry ───────────────────────────────────────────── -->
+  <section class="card wide" id="card-telemetry">
+    <h2>Telemetry</h2>
+    <div class="readouts">
+      <div class="readout"><span>Position</span><b id="r-pos">—</b><i>rev</i></div>
+      <div class="readout"><span>Velocity</span><b id="r-vel">—</b><i>rev/s</i></div>
+      <div class="readout"><span>Torque</span><b id="r-torque">—</b><i>Nm</i></div>
+      <div class="readout"><span>Current</span><b id="r-cur">—</b><i>A</i></div>
+      <div class="readout"><span>Voltage</span><b id="r-volt">—</b><i>V</i></div>
+      <div class="readout"><span>Board temp</span><b id="r-temp">—</b><i>°C</i></div>
+      <div class="readout"><span>Motor temp</span><b id="r-mtemp">—</b><i>°C</i></div>
+      <div class="readout"><span>Controller</span><b id="r-mode">—</b><i id="r-fault"></i></div>
+    </div>
+    <div class="charts">
+      <figure><figcaption>Position (rev)</figcaption><canvas id="chart-pos" height="130"></canvas></figure>
+      <figure><figcaption>Velocity (rev/s)</figcaption><canvas id="chart-vel" height="130"></canvas></figure>
+      <figure><figcaption>Current (A)</figcaption><canvas id="chart-cur" height="130"></canvas></figure>
+    </div>
+    <div id="loop-stats" class="kv muted"></div>
+  </section>
+
+  <!-- ── safety ──────────────────────────────────────────────── -->
+  <section class="card" id="card-safety">
+    <h2>Safety envelope <span class="hint">host side; never written to the controller</span></h2>
+    <div class="row presets">
+      <button data-preset="conservative">Conservative</button>
+      <button data-preset="standard">Standard</button>
+      <button data-preset="relaxed">Relaxed</button>
+      <span id="preset-name" class="muted"></span>
+    </div>
+    <div class="grid">
+      <label>Torque ceiling (Nm)<input id="sf-torque" type="number" step="0.05"></label>
+      <label>Velocity ceiling (rev/s)<input id="sf-vel" type="number" step="0.1"></label>
+      <label>Accel ceiling (rev/s²)<input id="sf-accel" type="number" step="0.5"></label>
+      <label>Position min (rev)<input id="sf-pmin" type="number" step="0.05"></label>
+      <label>Position max (rev)<input id="sf-pmax" type="number" step="0.05"></label>
+      <label>Current trip (A)<input id="sf-cur" type="number" step="0.5"></label>
+      <label>Bus voltage min (V)<input id="sf-vmin" type="number" step="0.5"></label>
+      <label>Bus voltage max (V)<input id="sf-vmax" type="number" step="0.5"></label>
+      <label>Board temp trip (°C)<input id="sf-btemp" type="number" step="1"></label>
+      <label>Motor temp trip (°C)<input id="sf-mtemp" type="number" step="1"></label>
+      <label class="check"><input id="sf-poslimit" type="checkbox"> Position envelope enabled</label>
+      <label class="check"><input id="sf-stall" type="checkbox"> Stall detection</label>
+    </div>
+    <div class="row"><button id="apply-safety">Apply safety limits</button></div>
+  </section>
+
+  <!-- ── log ─────────────────────────────────────────────────── -->
+  <section class="card wide" id="card-log">
+    <h2>Event log</h2>
+    <div id="log" class="log"></div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

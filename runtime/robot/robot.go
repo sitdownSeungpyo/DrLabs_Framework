@@ -219,7 +219,11 @@ func (r *Robot) linkFor(config JointConfig) (motor.Link, error) {
 		if err != nil {
 			return nil, err
 		}
-		profile := dynamixel.XSeries
+		// The zero Profile leaves the choice to the servo's model number.
+		// Naming one in the description is still worth doing — it is what
+		// catches a joint being rebuilt with a different servo — but a
+		// description that says nothing must not be treated as if it had.
+		var profile dynamixel.Profile
 		if name := config.Options["profile"]; name != "" {
 			found, known := dynamixel.Profiles[name]
 			if !known {

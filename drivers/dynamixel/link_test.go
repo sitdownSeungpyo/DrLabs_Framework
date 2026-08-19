@@ -336,3 +336,133 @@ func TestUnknownModelLeavesTheProfileAlone(t *testing.T) {
 		t.Errorf("an unrecognised model was given the name %q", link.modelName)
 	}
 }
+
+// A caller with nothing to say must not be recorded as having said "X-series".
+//
+// runtime/robot builds links through NewLinkWithPort and has to pass some
+// profile.  When the description names none, passing the default as if it were
+// a declaration turns a servo this build could have identified into a
+// contradiction it refuses to drive — which is what happened to a robot JSON
+// that simply left "profile" out.
+func TestZeroProfileIsNotADeclaration(t *testing.T) {
+	link := NewLinkWithPort(&tuningPort{}, 1, Profile{})
+	if link.profileDeclared {
+		t.Error("the zero profile was recorded as a declaration")
+	}
+	if link.profile.Name != XSeries.Name {
+		t.Errorf("the provisional profile is %q, want the X-series table", link.profile.Name)
+	}
+
+	// And the servo's own model number is then free to choose.
+	if err := link.resolveProfile(1200); err != nil {
+		t.Fatalf("resolving model 1200: %v", err)
+	}
+	if link.profile.Name != XL330.Name {
+		t.Errorf("model 1200 left the profile as %q", link.profile.Name)
+	}
+}
+
+// A real profile still is a declaration, and still gets checked.
+func TestANamedProfileIsStillADeclaration(t *testing.T) {
+	link := NewLinkWithPort(&tuningPort{}, 1, XSeries)
+	if !link.profileDeclared {
+		t.Fatal("a named profile was not recorded as a declaration")
+	}
+	if err := link.resolveProfile(1200); err == nil {
+		t.Error("an X-series declaration on an XL330 was accepted")
+	}
+}
+
+// recordingPort answers a ping and records every write.
+type recordingPort struct {
+	writes []struct {
+		addr uint16
+		data []byte
+	}
+	reply []byte
+}
+
+func (p *recordingPort) SetReadTimeout(time.Duration) error { return nil }
+func (p *recordingPort) Close() error                       { return nil }
+
+func (p *recordingPort) Read(b []byte) (int, error) {
+	n := copy(b, p.reply)
+	p.reply = p.reply[n:]
+	return n, nil
+}
+
+func (p *recordingPort) Write(b []byte) (int, error) {
+	// Status packets are built by the same code that parses them, so a ping
+	// is answered with a model number and everything else with a bare OK.
+	if len(b) > 7 && b[7] == InstPing {
+		params := []byte{0xB0, 0x04, 53} // model 1200, firmware 53
+		p.reply = append(p.reply, buildStatus(b[4], params)...)
+		return len(b), nil
+	}
+	if len(b) > 9 && b[7] == InstWrite {
+		addr := uint16(b[8]) | uint16(b[9])<<8
+		p.writes = append(p.writes, struct {
+			addr uint16
+			data []byte
+		}{addr, append([]byte(nil), b[10:len(b)-2]...)})
+	}
+	p.reply = append(p.reply, buildStatus(b[4], nil)...)
+	return len(b), nil
+}
+
+// buildStatus assembles a Protocol 2.0 status packet reporting no error.
+//
+// Length counts the instruction byte, the error byte, the parameters and the
+// two CRC bytes.
+func buildStatus(id byte, params []byte) []byte {
+	length := len(params) + 4
+	packet := append([]byte{
+		0xFF, 0xFF, 0xFD, 0x00,
+		id,
+		byte(length), byte(length >> 8),
+		0x55, // status
+		0x00, // no error
+	}, params...)
+	crc := UpdateCRC(0, packet)
+	return append(packet, byte(crc), byte(crc>>8))
+}
+
+// Taking control of a servo means clearing what the last session left behind.
+//
+// The bus watchdog latches when it fires: the register reads 0xFF and the servo
+// refuses every goal register with an access error until zero is written to it.
+// A session killed while armed leaves exactly that, so without this the next
+// bring-up connects, arms, and then e-stops on its first command with an error
+// code that names nothing anybody can act on.
+func TestOpenClearsALatchedBusWatchdog(t *testing.T) {
+	port := &recordingPort{}
+	link := NewLinkWithPort(port, 1, XL330)
+
+	if err := link.Open(context.Background()); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	cleared := false
+	for _, w := range port.writes {
+		if w.addr == XL330.AddrBusWatchdog && len(w.data) == 1 && w.data[0] == 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Errorf("Open did not clear the bus watchdog; writes were %v", port.writes)
+	}
+}
+
+// The bare code is not something anyone can act on.
+func TestPacketErrorsAreExplained(t *testing.T) {
+	name, detail := PacketErrorText(0x07)
+	if name != "Access error" {
+		t.Errorf("0x07 is named %q", name)
+	}
+	if !strings.Contains(detail, "watchdog") {
+		t.Errorf("0x07 does not mention the watchdog, which is its usual cause: %q", detail)
+	}
+	if name, _ := PacketErrorText(0x99); name != "Unknown error" {
+		t.Errorf("an unknown code is named %q", name)
+	}
+}

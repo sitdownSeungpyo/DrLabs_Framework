@@ -213,3 +213,29 @@ func decodeHardwareError(status uint8) (name, detail string) {
 	}
 	return "Hardware error", "The motor reports an error this build does not recognise."
 }
+
+// packetErrors names the Protocol 2.0 status packet error codes.
+//
+// These arrive as a bare number, and a bare number is not something anyone can
+// act on.  The one that matters most is 0x07: it is what a servo answers to
+// every goal register while its bus watchdog is latched, and the cause is
+// nowhere near the symptom.
+var packetErrors = map[uint8]struct{ Name, Detail string }{
+	0x01: {"Result fail", "The servo could not carry out the instruction."},
+	0x02: {"Instruction error", "An undefined instruction, or an Action with no prior Reg Write."},
+	0x03: {"CRC error", "The servo's CRC check of the packet failed."},
+	0x04: {"Data range error", "The value is outside what the register accepts."},
+	0x05: {"Data length error", "The write is shorter or longer than the register."},
+	0x06: {"Data limit error", "The value is outside the configured limit for that register."},
+	0x07: {"Access error", "Writing to a read-only register, writing EEPROM while torque is " +
+		"enabled, or — most often — the bus watchdog has latched, which makes every goal " +
+		"register read-only until zero is written to it."},
+}
+
+// PacketErrorText explains a status packet error code.
+func PacketErrorText(code uint8) (name, detail string) {
+	if entry, known := packetErrors[code]; known {
+		return entry.Name, entry.Detail
+	}
+	return "Unknown error", "The servo reported an error code this build does not recognise."
+}

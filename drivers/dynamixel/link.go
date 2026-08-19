@@ -136,11 +136,23 @@ func newLink(cfg motor.Config) (motor.Link, error) {
 // This is what a daisy chain needs: one port opened once, wrapped so that
 // transactions cannot interleave, and one Link per servo id on it.  Close does
 // not close the port — whoever opened it decides when the chain goes away.
+//
+// The zero Profile means "not declared": the servo's own model number chooses,
+// exactly as it does for a Config that names no profile.  A caller that hands
+// over a real Profile is stating what is on the bus, and the servo is checked
+// against it.  The distinction matters because a caller with nothing to say
+// must not be recorded as having said "X-series" — that turns a servo this
+// build could have identified into a contradiction it refuses to drive.
 func NewLinkWithPort(port serial.Port, id uint8, profile Profile) *Link {
+	declared := profile.Name != ""
+	if !declared {
+		// Provisional, and replaced at open by whatever the servo reports.
+		profile = XSeries
+	}
 	return &Link{
 		config:            motor.Config{Driver: "dynamixel", ID: int(id)},
 		profile:           profile,
-		profileDeclared:   true,
+		profileDeclared:   declared,
 		port:              port,
 		driver:            NewDriver(port),
 		id:                id,
@@ -289,6 +301,26 @@ func (l *Link) Open(context.Context) error {
 		l.release()
 		return err
 	}
+
+	// Clear a latched bus watchdog before anything else is attempted.
+	//
+	// The watchdog is the servo's own safety net: set it, stop sending, and
+	// the motor stops on its own.  When it fires it latches — the register
+	// reads 0xFF — and while it is latched the servo refuses every goal
+	// register with an access error, which is exactly the state a session
+	// that was killed while armed leaves behind.
+	//
+	// Without this, the next bring-up connects, identifies the servo, arms it,
+	// and then e-stops on the first command with "dxl error code: 07", and
+	// stays that way until somebody writes zero to a register they have never
+	// heard of.  Taking control of a servo means clearing what the last
+	// session left, the same way the moteus driver forgets its sticky
+	// registers on connect.
+	if err := l.driver.Write(l.id, l.profile.AddrBusWatchdog, []byte{0}); err != nil {
+		l.release()
+		return &motor.LinkError{Op: "open", Err: fmt.Errorf("clearing the bus watchdog: %w", err)}
+	}
+	l.lastWatchdog = math.NaN()
 
 	// Leave the motor free until the caller arms it, matching every other
 	// driver: connecting is not a reason for a machine to become rigid.

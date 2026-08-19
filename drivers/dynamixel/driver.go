@@ -138,7 +138,7 @@ func (d *Driver) Write(id uint8, addr uint16, data []byte) error {
 		return err
 	}
 	if errCode != 0 {
-		return fmt.Errorf("dxl error code: %02X", errCode)
+		return packetError(errCode)
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func (d *Driver) Read(id uint8, addr uint16, length uint16) ([]byte, error) {
 		return nil, err
 	}
 	if errCode != 0 {
-		return nil, fmt.Errorf("dxl error code: %02X", errCode)
+		return nil, packetError(errCode)
 	}
 	return readParams, nil
 }
@@ -178,7 +178,7 @@ func (d *Driver) Ping(id uint8) (modelNum uint16, err error) {
 		return 0, err
 	}
 	if errCode != 0 {
-		return 0, fmt.Errorf("dxl error code: %02X", errCode)
+		return 0, packetError(errCode)
 	}
 	if len(params) >= 3 {
 		modelNum = binary.LittleEndian.Uint16(params[0:])
@@ -199,7 +199,7 @@ func (d *Driver) PingMotor(id uint8) (motor.ModelInfo, error) {
 		return motor.ModelInfo{}, err
 	}
 	if errCode != 0 {
-		return motor.ModelInfo{}, fmt.Errorf("dxl error code: %02X", errCode)
+		return motor.ModelInfo{}, packetError(errCode)
 	}
 
 	info := motor.ModelInfo{}
@@ -224,7 +224,7 @@ func (d *Driver) Reboot(id uint8) error {
 		return err
 	}
 	if errCode != 0 {
-		return fmt.Errorf("dxl error code: %02X", errCode)
+		return packetError(errCode)
 	}
 	return nil
 }
@@ -242,7 +242,7 @@ func (d *Driver) FactoryReset(id uint8, level uint8) error {
 		return err
 	}
 	if errCode != 0 {
-		return fmt.Errorf("dxl error code: %02X", errCode)
+		return packetError(errCode)
 	}
 	return nil
 }
@@ -461,4 +461,10 @@ func (d *Driver) SyncRead4Byte(addr uint16, ids []uint8) (map[uint8]uint32, erro
 		return nil, lastErr
 	}
 	return values, nil
+}
+
+// packetError turns a status packet error code into something actionable.
+func packetError(code uint8) error {
+	name, detail := PacketErrorText(code)
+	return fmt.Errorf("servo error 0x%02X (%s): %s", code, name, detail)
 }

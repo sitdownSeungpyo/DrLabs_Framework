@@ -86,6 +86,36 @@ returns as soon as any byte arrives. A 100 Hz control loop went from a measured
 This is the serial half of the same mistake the CAN side had; see the matching
 section in [MOTEUS.md](MOTEUS.md).
 
+## The bus watchdog latches, and a killed session leaves it latched
+
+The bus watchdog is the servo's own safety net: set register 98 to a timeout,
+stop sending, and the motor stops by itself.  The framework sets it every
+cycle, which is right.
+
+What is easy to miss is what happens after it fires. The register latches at
+0xFF, and while it is latched the servo refuses **every goal register** —
+position, velocity, current, PWM — with an access error, code 0x07.  Profile
+velocity, profile acceleration and the LED still accept writes, which is what
+makes the state so confusing to read from the outside: the servo answers,
+reports no hardware error, identifies itself, arms, and then rejects the first
+command.
+
+A session that ends without releasing the servo leaves exactly that state: a
+killed process, a crash, a pulled cable.  Before `Open` cleared it, the next
+bring-up would come up clean and then e-stop with
+
+```
+error j1  E-STOP · Transport error
+          dxl error code: 07
+```
+
+and stay that way until somebody wrote a zero to a register they had never
+heard of.  Taking control of a servo means clearing what the last session left,
+the same way the moteus driver forgets its sticky registers on connect.
+
+Status packet error codes are decoded rather than printed as a number, because
+`07` names nothing anyone can act on and the cause is nowhere near the symptom.
+
 ## Telemetry is split across two query profiles
 
 Position, velocity and current are one 10-byte read from 126. Voltage,

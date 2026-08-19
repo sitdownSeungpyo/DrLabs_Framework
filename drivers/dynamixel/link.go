@@ -29,6 +29,16 @@ type Link struct {
 	config  motor.Config
 	profile Profile
 
+	// profileDeclared records whether the caller named a profile or is
+	// relying on the servo to identify itself.
+	profileDeclared bool
+
+	// model is what the servo reported on the last ping, and modelName is the
+	// entry KnownModels had for it — empty when this build does not recognise
+	// the number.
+	model     uint32
+	modelName string
+
 	port   serial.Port
 	driver *Driver
 	id     uint8
@@ -107,9 +117,12 @@ func newLink(cfg motor.Config) (motor.Link, error) {
 	}
 	cfg.Baud = baud
 
+	_, declared := cfg.Options["profile"]
+
 	return &Link{
 		config:            cfg,
 		profile:           profile,
+		profileDeclared:   declared,
 		id:                uint8(cfg.ID),
 		currentMode:       -1,
 		lastVelocityLimit: math.NaN(),
@@ -127,6 +140,7 @@ func NewLinkWithPort(port serial.Port, id uint8, profile Profile) *Link {
 	return &Link{
 		config:            motor.Config{Driver: "dynamixel", ID: int(id)},
 		profile:           profile,
+		profileDeclared:   true,
 		port:              port,
 		driver:            NewDriver(port),
 		id:                id,
@@ -136,6 +150,56 @@ func NewLinkWithPort(port serial.Port, id uint8, profile Profile) *Link {
 		lastAccelLimit:    math.NaN(),
 		lastWatchdog:      math.NaN(),
 	}
+}
+
+// resolveProfile settles which control table this servo is actually driven
+// through, now that it has said what it is.
+//
+// The model number arrives on every ping, so the profile never has to be
+// guessed.  It matters because the profile carries the unit scales: an XL330
+// counts current in 1 mA and an XM430 in 2.69 mA, and the wrong one is not a
+// visible failure — the servo still moves, every current reading is simply out
+// by a factor of nearly three, and the voltage range belongs to a different
+// class of motor.
+//
+// Three cases, and the middle one is the reason this exists:
+//
+//   - Nothing declared, model recognised: use the model's own profile.  This
+//     is the ordinary path, and it means a config file that forgets to name a
+//     profile is still driven correctly.
+//   - Declared, and the model says otherwise: refuse.  One of the two is
+//     wrong, and carrying on means reporting numbers scaled for a motor that
+//     is not the one on the bus.
+//   - Model not in this build's table: leave the profile as it stands.
+//     Identify then reports the board as unrecognised unless the caller named
+//     a profile, so the choice is acknowledged rather than assumed.
+func (l *Link) resolveProfile(model uint32) error {
+	l.model = model
+
+	known, recognised := KnownModels[model]
+	if !recognised {
+		return nil
+	}
+	l.modelName = known.Name
+
+	expected, ok := Profiles[known.Profile]
+	if !ok {
+		return nil
+	}
+	if !l.profileDeclared {
+		l.profile = expected
+		return nil
+	}
+	if l.profile.Name != expected.Name {
+		return &motor.LinkError{
+			Op: "open",
+			Err: fmt.Errorf("servo id %d reports model %d (%s), which needs the %q profile, "+
+				"but %q was configured; the profiles disagree on current scale and supply range, "+
+				"so every reading from one of them would be wrong",
+				l.id, model, known.Name, known.Profile, l.profile.Name),
+		}
+	}
+	return nil
 }
 
 // Kind identifies the driver.
@@ -177,9 +241,10 @@ func (l *Link) Capabilities() motor.Capabilities {
 // Envelope reports the family's supply and speed ratings.
 func (l *Link) Envelope() motor.Envelope {
 	return motor.Envelope{
-		VoltageMin:  l.profile.VoltageMin,
-		VoltageMax:  l.profile.VoltageMax,
-		VelocityMax: l.profile.MaxVelocityRevPerSec,
+		VoltageMin:   l.profile.VoltageMin,
+		VoltageMax:   l.profile.VoltageMax,
+		VoltageRated: l.profile.VoltageRated,
+		VelocityMax:  l.profile.MaxVelocityRevPerSec,
 	}
 }
 
@@ -195,13 +260,34 @@ func (l *Link) Open(context.Context) error {
 		l.ownsPort = true
 	}
 
-	if _, err := l.driver.Ping(l.id); err != nil {
+	// Ask the port to return as soon as bytes arrive.
+	//
+	// A serial port opens with a plain total read timeout, and a plain total
+	// timeout means a read blocks until it has the *whole* buffer it asked
+	// for or the timeout expires.  The packet reader asks for a buffer far
+	// larger than any status packet, so it never fills, and every read costs
+	// the full timeout however quickly the servo answered.  Measured on an
+	// XL330 at 1 Mbaud that is 15.0 ms a cycle — 67 Hz, whatever rate the
+	// caller configured, against 1.1 ms once tuned.
+	//
+	// The same thing was found on the CAN side and fixed there; this is the
+	// serial half of it.
+	if tuner, ok := l.port.(serial.ReadTimeouter); ok {
+		_ = tuner.SetReadTimeout(ReadTimeout)
+	}
+
+	model, err := l.driver.Ping(l.id)
+	if err != nil {
 		l.release()
 		return &motor.LinkError{
 			Op: "open",
 			Err: fmt.Errorf("no reply from servo id %d on %s at %d baud: %w",
 				l.id, l.config.Port, l.config.Baud, err),
 		}
+	}
+	if err := l.resolveProfile(uint32(model)); err != nil {
+		l.release()
+		return err
 	}
 
 	// Leave the motor free until the caller arms it, matching every other
@@ -249,7 +335,12 @@ func (l *Link) Identify(context.Context) (*motor.Identity, error) {
 		return nil, err
 	}
 	identity.ModelNumber = uint32(model)
-	identity.Board = fmt.Sprintf("Dynamixel model %d (%s control table)", model, l.profile.Name)
+	if l.modelName != "" {
+		identity.Board = fmt.Sprintf("Dynamixel %s (%s control table)", l.modelName, l.profile.Name)
+	} else {
+		identity.Board = fmt.Sprintf("Dynamixel model %d (%s control table, not confirmed)",
+			model, l.profile.Name)
+	}
 
 	if data, err := l.driver.Read(l.id, l.profile.AddrFirmwareVersion, 1); err == nil && len(data) == 1 {
 		identity.Firmware = strconv.Itoa(int(data[0]))
@@ -259,8 +350,17 @@ func (l *Link) Identify(context.Context) (*motor.Identity, error) {
 	// moteus enforces — position limits exist but only apply in the
 	// single-turn modes — so no bounds are reported and the host envelope is
 	// the only one in force.
-	identity.Status = motor.BoardOK
-	identity.Supported = true
+	// A servo this build recognises, or one whose profile the operator named,
+	// is driven through a control table somebody stands behind.  Anything else
+	// is a guess, and saying so is the difference between an operator who
+	// knows the current readings are unverified and one who trusts them.
+	if l.modelName != "" || l.profileDeclared {
+		identity.Status = motor.BoardOK
+		identity.Supported = true
+	} else {
+		identity.Status = motor.BoardUnknown
+		identity.Supported = false
+	}
 	identity.Known = true
 	return identity, nil
 }

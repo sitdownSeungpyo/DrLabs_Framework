@@ -72,6 +72,15 @@ type Profile struct {
 	// VoltageMin and VoltageMax are the family's supply range.
 	VoltageMin float64
 	VoltageMax float64
+
+	// VoltageRated is the supply the family is designed to run on.
+	//
+	// Without it the safety layer cannot tell whether its voltage trip band is
+	// plausible for the motor in front of it, and keeps the band it inherited
+	// from a 12 V bus.  On a 5 V XL330 that band excludes the rated supply
+	// outright, so a servo that is working perfectly reports 4.8 V, fails
+	// preflight, and cannot be armed at all.
+	VoltageRated float64
 }
 
 // XSeries covers the X-series (XM430, XC430, XH430, XW430 and relatives) with
@@ -109,6 +118,7 @@ var XSeries = Profile{
 	MaxVelocityRevPerSec: 4.0,
 	VoltageMin:           10.0,
 	VoltageMax:           14.8,
+	VoltageRated:         12.0,
 }
 
 // XL330 is the 5 V X-series family.  It shares the control table but uses a
@@ -120,6 +130,7 @@ var XL330 = func() Profile {
 	profile.MaxVelocityRevPerSec = 6.0
 	profile.VoltageMin = 3.7
 	profile.VoltageMax = 6.0
+	profile.VoltageRated = 5.0
 	return profile
 }()
 
@@ -128,6 +139,49 @@ var Profiles = map[string]Profile{
 	"x":       XSeries,
 	"xseries": XSeries,
 	"xl330":   XL330,
+}
+
+// KnownModel is what a reported model number identifies.
+type KnownModel struct {
+	// Name is the model as ROBOTIS writes it, for logs and status.
+	Name string
+	// Profile names the entry in Profiles that describes this model.
+	Profile string
+}
+
+// KnownModels maps the model number a servo reports to the profile that
+// actually describes it.
+//
+// A Dynamixel announces its model number on every ping, so the profile never
+// had to be guessed — and guessing it wrong is not a visible failure.  An
+// XL330 driven through the X-series profile still moves; it just reports every
+// current 2.69 times too high and claims a 12 V supply range, which is enough
+// to make a current trip meaningless and to refuse a perfectly healthy 5 V
+// servo at preflight.
+//
+// A number missing from this table is not an error.  It means this build
+// cannot confirm the profile, so the operator has to name one — the same
+// bargain the moteus driver strikes with an unrecognised board revision.
+var KnownModels = map[uint32]KnownModel{
+	// 5 V families.  These are the ones where the distinction matters most:
+	// they count current in 1 mA rather than 2.69 mA, and they run nowhere
+	// near a 12 V bus.
+	1190: {"XL330-M077-T", "xl330"},
+	1200: {"XL330-M288-T", "xl330"},
+
+	// 12 V X-series.
+	1000: {"XH430-W350", "x"},
+	1010: {"XH430-W210", "x"},
+	1020: {"XM430-W350", "x"},
+	1030: {"XM430-W210", "x"},
+	1040: {"XH430-V350", "x"},
+	1050: {"XH430-V210", "x"},
+	1060: {"XL430-W250", "x"},
+	1070: {"XC430-W150", "x"},
+	1080: {"XC430-W240", "x"},
+	1090: {"2XL430-W250", "x"},
+	1120: {"XM540-W270", "x"},
+	1130: {"XM540-W150", "x"},
 }
 
 // The operating mode constants live in models.go, alongside the control table

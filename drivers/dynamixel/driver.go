@@ -13,6 +13,13 @@ import (
 const (
 	DefaultTimeout      = 100 * time.Millisecond
 	DefaultPollInterval = 500 * time.Microsecond
+
+	// ReadTimeout is how long a single serial read may block waiting for the
+	// servo.  It bounds one read, not one transaction: readPacketWithTimeout
+	// keeps polling until its own deadline, so this only needs to be short
+	// enough that a reply is not sitting in the buffer unnoticed.  A status
+	// packet at 1 Mbaud is about 150 us on the wire.
+	ReadTimeout = time.Millisecond
 )
 
 // Driver implements low-level Dynamixel Protocol 2.0 communication.

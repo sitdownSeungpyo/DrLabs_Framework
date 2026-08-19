@@ -231,8 +231,8 @@ func (c *Config) FitVoltageTo(envelope motor.Envelope) []string {
 	c.BusVoltageMax = envelope.VoltageMax
 
 	return []string{fmt.Sprintf(
-		"bus voltage band widened from [%.0f, %.0f] V to the hardware's rated range [%.0f, %.0f] V, "+
-			"because the declared band excluded this motor's %.0f V rated supply",
+		"bus voltage band widened from [%g, %g] V to the hardware's rated range [%g, %g] V, "+
+			"because the declared band excluded this motor's %g V rated supply",
 		before[0], before[1], c.BusVoltageMin, c.BusVoltageMax, rated)}
 }
 

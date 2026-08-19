@@ -1,8 +1,11 @@
 package dynamixel
 
 import (
+	"context"
 	"math"
+	"strings"
 	"testing"
+	"time"
 
 	"drlabs/motor"
 )
@@ -168,5 +171,168 @@ func TestWatchdogNeverRoundsDownToDisabled(t *testing.T) {
 	}
 	if got := float64(counts) * profile.WatchdogSecondsPerCount; got != 0.020 {
 		t.Errorf("the shortest expressible watchdog is 20 ms, got %v", got)
+	}
+}
+
+// Every profile has to declare the supply it is rated for.
+//
+// Without it the safety layer keeps the voltage trip band it inherited from a
+// 12 V bus, and a 5 V XL330 reporting a perfectly healthy 4.8 V fails preflight
+// and cannot be armed at all.  The band is only widened when the rated supply
+// falls outside it, so the number has to be there for the check to fire.
+func TestProfilesDeclareTheirRatedSupply(t *testing.T) {
+	for name, profile := range Profiles {
+		if profile.VoltageRated <= 0 {
+			t.Errorf("profile %q declares no rated supply", name)
+			continue
+		}
+		if profile.VoltageRated < profile.VoltageMin || profile.VoltageRated > profile.VoltageMax {
+			t.Errorf("profile %q: rated supply %.1f V is outside its own range [%.1f, %.1f] V",
+				name, profile.VoltageRated, profile.VoltageMin, profile.VoltageMax)
+		}
+	}
+}
+
+// The rated supply has to reach the safety layer, not merely exist.
+func TestEnvelopeCarriesTheRatedSupply(t *testing.T) {
+	link, err := motor.New(motor.Config{
+		Driver: "dynamixel", Port: "COM1", ID: 1,
+		Options: map[string]string{"profile": "xl330"},
+	})
+	if err != nil {
+		t.Fatalf("building the link: %v", err)
+	}
+	enveloped, ok := link.(motor.Enveloped)
+	if !ok {
+		t.Fatal("the dynamixel link no longer publishes an envelope")
+	}
+	if got := enveloped.Envelope().VoltageRated; got != 5.0 {
+		t.Errorf("XL330 rated supply reaches the envelope as %v, want 5", got)
+	}
+}
+
+// tuningPort is a serial port that records the read timeout asked of it.
+type tuningPort struct {
+	tuned []time.Duration
+}
+
+func (p *tuningPort) Read([]byte) (int, error)  { return 0, nil }
+func (p *tuningPort) Write(b []byte) (int, error) { return len(b), nil }
+func (p *tuningPort) Close() error                { return nil }
+func (p *tuningPort) SetReadTimeout(d time.Duration) error {
+	p.tuned = append(p.tuned, d)
+	return nil
+}
+
+// Opening has to tune the port's read timeout.
+//
+// A serial port opens with a plain total read timeout, which makes a read block
+// until it has filled the whole buffer it asked for.  The packet reader asks
+// for far more than any status packet, so without this every read costs the
+// full timeout: measured on an XL330 at 1 Mbaud, 15.0 ms a cycle — 67 Hz
+// whatever rate was configured, against 1.1 ms once tuned.
+func TestOpenTunesTheSerialReadTimeout(t *testing.T) {
+	port := &tuningPort{}
+	link := NewLinkWithPort(port, 1, XL330)
+
+	// The ping finds nobody, which is expected; the tuning happens first.
+	_ = link.Open(context.Background())
+
+	if len(port.tuned) == 0 {
+		t.Fatal("Open left the port at its default read timeout")
+	}
+	if got := port.tuned[0]; got != ReadTimeout {
+		t.Errorf("read timeout set to %v, want %v", got, ReadTimeout)
+	}
+}
+
+// Every model in the table has to name a profile that exists.
+func TestKnownModelsNameRealProfiles(t *testing.T) {
+	for model, known := range KnownModels {
+		if known.Name == "" {
+			t.Errorf("model %d has no name", model)
+		}
+		if _, ok := Profiles[known.Profile]; !ok {
+			t.Errorf("model %d (%s) names profile %q, which does not exist",
+				model, known.Name, known.Profile)
+		}
+	}
+}
+
+func linkFor(t *testing.T, options map[string]string) *Link {
+	t.Helper()
+	cfg := motor.Config{Driver: "dynamixel", Port: "COM1", ID: 1, Options: options}
+	link, err := motor.New(cfg)
+	if err != nil {
+		t.Fatalf("building the link: %v", err)
+	}
+	return link.(*Link)
+}
+
+// A config that names no profile is driven by what the servo says it is.
+//
+// This is the case that used to go wrong quietly: an XL330 fell back to the
+// X-series table, and every current reading came out 2.69 times too high while
+// the board still reported itself as supported.
+func TestUndeclaredProfileComesFromTheModelNumber(t *testing.T) {
+	link := linkFor(t, nil)
+	if link.profile.Name != XSeries.Name {
+		t.Fatalf("the default profile changed: %q", link.profile.Name)
+	}
+
+	if err := link.resolveProfile(1200); err != nil {
+		t.Fatalf("resolving model 1200: %v", err)
+	}
+	if link.profile.Name != XL330.Name {
+		t.Errorf("model 1200 selected the %q profile, want %q", link.profile.Name, XL330.Name)
+	}
+	if link.modelName != "XL330-M288-T" {
+		t.Errorf("model name resolved to %q", link.modelName)
+	}
+	if link.profile.CurrentAmpsPerCount != XL330.CurrentAmpsPerCount {
+		t.Errorf("current scale is %v, want the XL330's %v",
+			link.profile.CurrentAmpsPerCount, XL330.CurrentAmpsPerCount)
+	}
+}
+
+// A declaration that matches the hardware is left alone.
+func TestDeclaredProfileThatMatchesIsKept(t *testing.T) {
+	link := linkFor(t, map[string]string{"profile": "xl330"})
+	if err := link.resolveProfile(1200); err != nil {
+		t.Fatalf("resolving model 1200: %v", err)
+	}
+	if link.profile.Name != XL330.Name {
+		t.Errorf("profile became %q", link.profile.Name)
+	}
+}
+
+// A declaration the hardware contradicts is refused.
+//
+// Carrying on would mean reporting current and voltage scaled for a motor that
+// is not the one on the bus, which is worse than not connecting at all.
+func TestDeclaredProfileThatContradictsTheModelIsRefused(t *testing.T) {
+	link := linkFor(t, map[string]string{"profile": "x"})
+	err := link.resolveProfile(1200)
+	if err == nil {
+		t.Fatal("an X-series profile on an XL330 was accepted")
+	}
+	for _, want := range []string{"1200", "XL330-M288-T", "xl330"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// A model this build does not know is left as configured, not guessed at.
+func TestUnknownModelLeavesTheProfileAlone(t *testing.T) {
+	link := linkFor(t, map[string]string{"profile": "xl330"})
+	if err := link.resolveProfile(65000); err != nil {
+		t.Fatalf("an unrecognised model should not be an error: %v", err)
+	}
+	if link.profile.Name != XL330.Name {
+		t.Errorf("profile changed to %q", link.profile.Name)
+	}
+	if link.modelName != "" {
+		t.Errorf("an unrecognised model was given the name %q", link.modelName)
 	}
 }

@@ -20,6 +20,7 @@
 .claude
 # Unrelated content that shares the framework root directory.
 andrej-karpathy-skills/
+miles-dev-skills/
 
 # Locally built CLI binary.
 drlabs.exe

@@ -1,0 +1,11 @@
+[package]
+name = "drlabs-timing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The scheduling accuracy a motor control loop needs."
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media"] }

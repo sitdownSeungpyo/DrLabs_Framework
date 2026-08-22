@@ -5,6 +5,8 @@ resolver = "2"
 # layout is in docs/RUST.md; nothing is listed here until it builds.
 members = [
     "crates/drlabs-core",
+    "crates/drlabs-timing",
+    "crates/drivers/drlabs-moteus",
 ]
 
 [workspace.package]
@@ -16,6 +18,8 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 
 [workspace.dependencies]
 drlabs-core = { path = "crates/drlabs-core" }
+drlabs-timing = { path = "crates/drlabs-timing" }
+drlabs-moteus = { path = "crates/drivers/drlabs-moteus" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

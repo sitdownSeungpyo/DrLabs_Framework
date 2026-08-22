@@ -1,0 +1,12 @@
+[package]
+name = "drlabs-moteus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The mjbots moteus brushless controller: the mjlib multiplex register protocol, CAN-FD framing, and the tunnelled diagnostic console."
+
+[dependencies]
+drlabs-core = { workspace = true }
+thiserror = { workspace = true }

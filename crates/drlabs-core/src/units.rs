@@ -112,7 +112,11 @@ quantity!(RevPerSec, "rev/s", "A speed at the motor shaft.");
 quantity!(RadPerSec, "rad/s", "A speed at the joint output.");
 quantity!(RevPerSec2, "rev/s²", "An acceleration at the motor shaft.");
 quantity!(RadPerSec2, "rad/s²", "An acceleration at the joint output.");
-quantity!(Nm, "Nm", "A torque. Which side of a gearbox it refers to is the caller's to track.");
+quantity!(
+    Nm,
+    "Nm",
+    "A torque. Which side of a gearbox it refers to is the caller's to track."
+);
 quantity!(Amps, "A", "A current.");
 quantity!(Volts, "V", "A voltage.");
 quantity!(Celsius, "°C", "A temperature.");

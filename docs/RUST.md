@@ -81,9 +81,9 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | Crate | State | Tests |
 |---|---|---|
 | `drlabs-core` | done | 19 passing |
-| `drlabs-timing` | not started | |
+| `drlabs-timing` | done | 7 passing |
 | `drlabs-transport` | not started | |
-| `drlabs-moteus` | not started | |
+| `drlabs-moteus` | protocol primitives done; frames, driver, console to come | 15 passing |
 | `drlabs-dynamixel` | not started | |
 | `drlabs-robstride` | not started | |
 | `drlabs-odrive` | not started | |

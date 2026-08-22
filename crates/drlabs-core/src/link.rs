@@ -165,7 +165,11 @@ mod tests {
     #[test]
     fn capabilities_answer_what_a_ui_needs_to_ask() {
         let capabilities = Capabilities {
-            modes: vec![ControlMode::Position, ControlMode::Velocity, ControlMode::Stop],
+            modes: vec![
+                ControlMode::Position,
+                ControlMode::Velocity,
+                ControlMode::Stop,
+            ],
             ..Default::default()
         };
         assert!(capabilities.supports(ControlMode::Position));

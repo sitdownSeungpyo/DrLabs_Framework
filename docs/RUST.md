@@ -83,7 +83,7 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-core` | done | 19 passing |
 | `drlabs-timing` | done | 7 passing |
 | `drlabs-transport` | not started | |
-| `drlabs-moteus` | protocol primitives done; frames, driver, console to come | 15 passing |
+| `drlabs-moteus` | protocol and frames done — **reference bytes match**; driver, console to come | 38 passing |
 | `drlabs-dynamixel` | not started | |
 | `drlabs-robstride` | not started | |
 | `drlabs-odrive` | not started | |
@@ -95,6 +95,17 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 
 A crate joins the workspace `members` list when it builds and its tests pass,
 so `cargo test` on this branch is always green.
+
+### The reference bytes match
+
+The eleven pinned moteus frames — stop, brake, query-only, a minimal position
+cycle, a full parameter set, a deferred torque limit, velocity with its NaN
+position, set-output and stay-within — encode byte for byte as the official
+`moteus` Python package produces them. That is the evidence the port is
+faithful at the wire level, and it was worth having: the first version of the
+combiner wrote every subframe header before any value, producing a frame with
+all the framing at the front. Nothing about it looked wrong, and the bytes
+caught it in one run.
 
 ## How it gets verified
 

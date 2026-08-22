@@ -29,6 +29,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "drlabs-odrive"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-transport",
+ "thiserror",
+]
+
+[[package]]
+name = "drlabs-robstride"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-transport",
+ "thiserror",
+]
+
+[[package]]
 name = "drlabs-timing"
 version = "0.1.0"
 dependencies = [

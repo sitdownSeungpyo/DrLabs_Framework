@@ -9,6 +9,8 @@ members = [
     "crates/drlabs-transport",
     "crates/drivers/drlabs-dynamixel",
     "crates/drivers/drlabs-moteus",
+    "crates/drivers/drlabs-odrive",
+    "crates/drivers/drlabs-robstride",
 ]
 
 [workspace.package]
@@ -24,6 +26,8 @@ drlabs-timing = { path = "crates/drlabs-timing" }
 drlabs-transport = { path = "crates/drlabs-transport" }
 drlabs-dynamixel = { path = "crates/drivers/drlabs-dynamixel" }
 drlabs-moteus = { path = "crates/drivers/drlabs-moteus" }
+drlabs-odrive = { path = "crates/drivers/drlabs-odrive" }
+drlabs-robstride = { path = "crates/drivers/drlabs-robstride" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -92,8 +92,8 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
 | `drlabs-moteus` | complete: protocol, frames, driver, console | 66 passing |
 | `drlabs-dynamixel` | complete: protocol, driver, sync read/write, link | 30 passing |
-| `drlabs-robstride` | not started | |
-| `drlabs-odrive` | not started | |
+| `drlabs-robstride` | complete: protocol, parameters, controller, link | 46 passing |
+| `drlabs-odrive` | **implemented, never bench tested** — see below | 23 passing |
 | `drlabs-safety` | not started | |
 | `drlabs-session` | not started | |
 | `drlabs-robot` | not started | |
@@ -121,6 +121,21 @@ faithful at the wire level, and it was worth having: the first version of the
 combiner wrote every subframe header before any value, producing a frame with
 all the framing at the front. Nothing about it looked wrong, and the bytes
 caught it in one run.
+
+### ODrive is now code, and says what it is
+
+In the Go tree `drivers/odrive` was eight lines of doc comment: the CAN
+addressing scheme, the shape of an ASCII command, and no implementation. The
+Rust crate implements what those eight lines described — CANSimple's
+`(node_id << 5) | command_id` and its message layouts, and the line protocol —
+with tests pinned against the published documentation.
+
+That is a real standard, and not the same as the others. No ODrive has been on
+this bench. So the driver reports its board status as unknown and puts "never
+bench tested" in the board name, and it claims no envelope at all: an ODrive is
+a controller rather than a motor, and its board ratings are not the axis's.
+Everything else here has been watched moving; this has not, and the code says
+so rather than leaving an operator to assume.
 
 ## How it gets verified
 

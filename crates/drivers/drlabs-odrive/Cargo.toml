@@ -1,0 +1,13 @@
+[package]
+name = "drlabs-odrive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ODrive motor controllers over CANSimple and the ASCII protocol"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-transport = { workspace = true }
+thiserror = { workspace = true }

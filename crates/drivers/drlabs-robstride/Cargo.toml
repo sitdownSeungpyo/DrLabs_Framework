@@ -1,0 +1,13 @@
+[package]
+name = "drlabs-robstride"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RobStride quasi-direct-drive actuators over CAN 2.0B"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-transport = { workspace = true }
+thiserror = { workspace = true }

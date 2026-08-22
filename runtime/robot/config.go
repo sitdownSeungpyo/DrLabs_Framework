@@ -23,12 +23,14 @@ type Config struct {
 	// Robot is a name for logs and status.  Not otherwise used.
 	Robot string `json:"robot"`
 
-	// RateHz is the control rate for every joint.
+	// RateHz is the default control rate for every joint.
 	//
-	// It is per robot rather than per joint because the binding constraint is
-	// shared: every joint on a bus takes a transaction, so the bus carries
-	// joints × rate transactions a second whatever the joints individually
-	// want.  Bringing a robot up reports the load it implies.
+	// It is not per joint, because the binding constraint is not a joint's:
+	// every joint on a bus takes a transaction, so the bus carries joints ×
+	// rate transactions a second whatever the joints individually want.  A
+	// bus that cannot keep up is the one place this shows, so a bus may
+	// override it — see BusConfig.RateHz.  Bringing a robot up reports the
+	// load each bus is being asked for.
 	RateHz int `json:"rate_hz"`
 
 	Buses  []BusConfig   `json:"buses"`
@@ -49,6 +51,17 @@ type BusConfig struct {
 
 	// Baud applies to serial transports only.
 	Baud int `json:"baud"`
+
+	// RateHz overrides the robot's rate for the joints on this bus.  Zero
+	// means use the robot's.
+	//
+	// The bus is where the constraint actually lives.  A CAN-FD adapter will
+	// carry several hundred transactions a second without complaint and a
+	// Dynamixel chain will not, so a machine with both is either throttled to
+	// what the slowest bus can take or pushed past what it can — and a bus
+	// pushed past its budget does not degrade gently.  It falls behind, the
+	// servo's own watchdog latches, and the joint stops.
+	RateHz int `json:"rate_hz"`
 }
 
 // JointConfig is one joint and the motor that drives it.
@@ -155,6 +168,9 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("bus %q: unknown transport %q (fdcanusb or serial)", bus.Name, bus.Transport)
 		}
+		if bus.RateHz != 0 && (bus.RateHz < 10 || bus.RateHz > 500) {
+			return fmt.Errorf("bus %q: rate_hz %d is outside 10..500", bus.Name, bus.RateHz)
+		}
 	}
 
 	seen := map[string]bool{}
@@ -238,6 +254,14 @@ func (c *Config) JointNames() []string {
 	return names
 }
 
+// RateForBus is the control rate the joints on this bus run at.
+func (c *Config) RateForBus(name string) int {
+	if bus, ok := c.Bus(name); ok && bus.RateHz > 0 {
+		return bus.RateHz
+	}
+	return c.RateHz
+}
+
 // BusLoad reports how many transactions a second each bus will carry.
 //
 // This is the number that decides whether a rate is achievable: every joint on
@@ -246,7 +270,7 @@ func (c *Config) JointNames() []string {
 func (c *Config) BusLoad() map[string]int {
 	load := map[string]int{}
 	for _, joint := range c.Joints {
-		load[joint.Bus] += c.RateHz
+		load[joint.Bus] += c.RateForBus(joint.Bus)
 	}
 	return load
 }

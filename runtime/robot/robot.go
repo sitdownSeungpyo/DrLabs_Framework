@@ -114,7 +114,8 @@ func (r *Robot) bringUpLocked(ctx context.Context) error {
 			Mapping: mapping,
 			link:    link,
 			Session: session.New(session.Options{
-				RateHz:      r.Config.RateHz,
+				// The bus decides the rate, because the bus is what runs out.
+				RateHz:      r.Config.RateForBus(config.Bus),
 				Safety:      &envelope,
 				AutoArm:     true,
 				InitialMode: motor.CtrlPosition,

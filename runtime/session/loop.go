@@ -52,7 +52,25 @@ func (s *Session) run(ctx context.Context) {
 	for {
 		period = s.currentPeriod()
 		spin := time.Duration(math.Min(float64(timing.DefaultSpin), float64(period)/4))
-		timing.SleepUntil(ctx, next, s.wake, spin)
+
+		// Wait for the next slot.  A command wakes this early so that the
+		// loop notices it without polling — but the slot itself does not
+		// move.
+		//
+		// It used to.  A wake ran a cycle immediately, so a client that
+		// commanded faster than the rate simply got a faster loop: measured
+		// on this bench, a robot configured for 100 Hz ran its CAN joint at
+		// 801 Hz and its serial joint at 345 Hz under a flood of poses from a
+		// slider drag.  The serial bus cannot carry 345 Hz, so it fell behind,
+		// the servo's own watchdog latched, and that joint e-stopped — a
+		// machine stopped by the rate of somebody's mouse.
+		//
+		// The rate in the description is what the buses were budgeted for.
+		// A caller may ask for attention; it may not spend more of the bus
+		// than the description allows.
+		if timing.SleepUntil(ctx, next, s.wake, spin) && ctx.Err() == nil {
+			timing.SleepUntil(ctx, next, nil, spin)
+		}
 
 		if ctx.Err() != nil {
 			return

@@ -126,6 +126,43 @@ transaction per cycle, so eight joints at 200 Hz ask the adapter for 1600 round
 trips a second. That number, not the joints individually, decides whether a
 rate is achievable.
 
+## The rate is a ceiling, and it belongs to the bus
+
+`rate_hz` on the robot is the default control rate; a bus may override it:
+
+```json
+"buses": [
+  { "name": "can0", "transport": "fdcanusb", "port": "COM5", "rate_hz": 200 },
+  { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 1000000, "rate_hz": 100 }
+]
+```
+
+The bus is where the constraint actually lives. A CAN-FD adapter carries
+several hundred transactions a second without complaint and a Dynamixel chain
+does not, so a machine with both is otherwise either throttled to what the
+slowest bus can take or pushed past what it can. `bringup` prints the rate and
+the load each bus is being asked for, which is the number that decides whether
+the description is achievable at all.
+
+It is a ceiling, not a suggestion. A command wakes the loop so that it is
+noticed without polling, but it does not move the slot: the loop cycles at the
+declared rate however fast commands arrive.
+
+That is not decoration. Before it, a wake ran a cycle there and then, so a
+client commanding faster than the rate simply got a faster loop — measured on
+a two-actuator bench under a flood of poses from a slider drag:
+
+| | configured | measured |
+|---|---|---|
+| moteus on CAN | 100 Hz | 801 Hz |
+| XL330 on serial | 100 Hz | 345 Hz, then 13 Hz, then e-stopped |
+
+The serial bus could not carry 345 Hz. It fell behind, the servo's own bus
+watchdog latched, and that joint stopped — a machine halted by how fast
+somebody moved a mouse. With the ceiling in place the same flood, 32,282 poses
+a second for six seconds, leaves both joints at exactly their declared rates
+and no fault.
+
 ## Bring-up is all or nothing
 
 The first joint that cannot be brought up takes the whole robot down with it,

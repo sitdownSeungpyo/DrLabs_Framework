@@ -3,8 +3,8 @@
   "rate_hz": 100,
 
   "buses": [
-    { "name": "can0", "transport": "fdcanusb", "port": "COM5" },
-    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 1000000 }
+    { "name": "can0", "transport": "fdcanusb", "port": "COM5", "rate_hz": 200 },
+    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 1000000, "rate_hz": 100 }
   ],
 
   "joints": [

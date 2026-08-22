@@ -385,3 +385,116 @@ func TestAPoseWithAnUnknownJointMovesNothing(t *testing.T) {
 		t.Errorf("joint a moved to %v on a pose that named an unknown joint", got)
 	}
 }
+
+
+// The rate in the description is a ceiling, not a suggestion.
+//
+// A command used to wake the loop and run a cycle there and then, so a client
+// that commanded faster than the rate simply got a faster loop.  Measured on
+// the bench: a robot configured for 100 Hz ran its CAN joint at 801 Hz and its
+// serial joint at 345 Hz under a flood of poses from a slider drag — and the
+// serial bus, which cannot carry 345 Hz, fell behind until the servo's own
+// watchdog latched and the joint e-stopped.
+func TestCommandsCannotOutrunTheConfiguredRate(t *testing.T) {
+	config := &Config{
+		Robot: "fast", RateHz: 20,
+		Joints: []JointConfig{
+			{Name: "a", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2,
+					MaxVelocityRadS: 2, MaxAccelRadS2: 8}},
+		},
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	machine, err := New(config)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := machine.BringUp(ctx); err != nil {
+		t.Fatalf("bring-up: %v", err)
+	}
+	defer machine.Shutdown()
+	time.Sleep(500 * time.Millisecond)
+
+	// Command as fast as the process can, for long enough to measure.
+	deadline := time.Now().Add(2 * time.Second)
+	sent := 0
+	for time.Now().Before(deadline) {
+		if err := machine.SetPositions(map[string]float64{"a": 0.1}); err != nil {
+			t.Fatalf("pose: %v", err)
+		}
+		sent++
+	}
+	if sent < 1000 {
+		t.Fatalf("only %d commands sent; the flood is not floodng", sent)
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	var rate float64
+	for _, state := range machine.State() {
+		if state.Name == "a" {
+			rate = state.RateHz
+		}
+	}
+	// Some overshoot is the measurement window, not the loop; anything near
+	// the command rate means the ceiling is gone.
+	if rate > float64(config.RateHz)*1.5 {
+		t.Errorf("loop ran at %.0f Hz against a configured %d Hz after %d commands",
+			rate, config.RateHz, sent)
+	}
+	if rate < float64(config.RateHz)*0.5 {
+		t.Errorf("loop ran at %.0f Hz, well under the configured %d Hz", rate, config.RateHz)
+	}
+}
+
+// A bus may set its own rate, because the bus is what runs out.
+func TestABusCanOverrideTheRobotRate(t *testing.T) {
+	config := &Config{
+		Robot: "mixed", RateHz: 100,
+		Buses: []BusConfig{
+			{Name: "fast", Transport: "fdcanusb", RateHz: 200},
+			{Name: "slow", Transport: "serial", RateHz: 25},
+			{Name: "plain", Transport: "serial"},
+		},
+		Joints: []JointConfig{
+			{Name: "a", Bus: "fast", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2, MaxVelocityRadS: 2}},
+			{Name: "b", Bus: "slow", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2, MaxVelocityRadS: 2}},
+			{Name: "c", Bus: "plain", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2, MaxVelocityRadS: 2}},
+		},
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	for bus, want := range map[string]int{"fast": 200, "slow": 25, "plain": 100} {
+		if got := config.RateForBus(bus); got != want {
+			t.Errorf("bus %q runs at %d Hz, want %d", bus, got, want)
+		}
+	}
+	load := config.BusLoad()
+	for bus, want := range map[string]int{"fast": 200, "slow": 25, "plain": 100} {
+		if load[bus] != want {
+			t.Errorf("bus %q load %d transactions/s, want %d", bus, load[bus], want)
+		}
+	}
+}
+
+// An unusable bus rate is caught while reading the file.
+func TestABusRateOutsideTheRangeIsRefused(t *testing.T) {
+	config := &Config{
+		Robot: "bad", RateHz: 100,
+		Buses: []BusConfig{{Name: "b", Transport: "serial", RateHz: 5000}},
+		Joints: []JointConfig{
+			{Name: "a", Bus: "b", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2, MaxVelocityRadS: 2}},
+		},
+	}
+	if err := config.Validate(); err == nil {
+		t.Error("a 5000 Hz bus rate was accepted")
+	}
+}

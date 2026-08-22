@@ -144,7 +144,7 @@ func printPlan(config *robot.Config) {
 
 	fmt.Println()
 	w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "BUS\tTRANSPORT\tPORT\tLOAD")
+	fmt.Fprintln(w, "BUS\tTRANSPORT\tPORT\tRATE\tLOAD")
 	load := config.BusLoad()
 	for _, name := range config.SortedBusNames() {
 		bus, _ := config.Bus(name)
@@ -152,7 +152,12 @@ func printPlan(config *robot.Config) {
 		if port == "" {
 			port = "auto"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d transactions/s\n", name, bus.Transport, port, load[name])
+		rate := fmt.Sprintf("%d Hz", config.RateForBus(name))
+		if bus.RateHz == 0 {
+			rate += " (default)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d transactions/s\n",
+			name, bus.Transport, port, rate, load[name])
 	}
 	_ = w.Flush()
 }

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+
+# Crates join this list as they are written and their tests pass.  The full
+# layout is in docs/RUST.md; nothing is listed here until it builds.
+members = [
+    "crates/drlabs-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
+
+[workspace.dependencies]
+drlabs-core = { path = "crates/drlabs-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# The machine ships as one file.  Optimise for that: one codegen unit, fat LTO,
+# and panics that abort rather than unwind -- there is nothing above a control
+# loop to catch an unwind and carry on sensibly.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,12 @@
+[package]
+name = "drlabs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The vendor-neutral surface every DrLabs driver implements: units, commands, telemetry, and the Link trait."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

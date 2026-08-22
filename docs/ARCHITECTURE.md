@@ -223,4 +223,6 @@ firmware rather than merely self-consistent.
 - SocketCAN is not implemented; CAN transport is fdcanusb only.
 - The race detector needs cgo, so `go test -race` requires a C toolchain that
   a plain Go install does not provide.
-- `ros2/bridge` is a design note, not an implementation.
+- `ros2/drlabs_bridge` is implemented and host-tested, but its ROS 2 node has
+  never been run: no machine with `rclpy` was available. The link underneath it
+  is verified against a real bringup server. See `docs/ROS2.md`.

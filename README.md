@@ -89,7 +89,7 @@ did not have:
 | `test/webui/` | Browser control panel built on the runtime — see its own README |
 | `examples/` | Runnable programs, `examples/framework` first; `examples/robots/` holds robot descriptions |
 | `legacy/dxl/` | The original single-package Dynamixel SDK, kept working |
-| `ros2/bridge/` | Planned gRPC bridge for ROS 2 |
+| `ros2/drlabs_bridge/` | ROS 2 bridge — joint_states and joint_commands over the servo protocol |
 
 ## Units
 

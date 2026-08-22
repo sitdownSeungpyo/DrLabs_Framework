@@ -25,3 +25,8 @@ miles-dev-skills/
 # Locally built CLI binary.
 drlabs.exe
 webui.exe
+
+# Python bytecode and test caches from the ROS 2 package.
+__pycache__/
+*.py[cod]
+.pytest_cache/

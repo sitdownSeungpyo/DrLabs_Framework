@@ -165,9 +165,46 @@ ports with its test as well.
 
 **On the bench.** The same procedure the Go version was put through, on the
 same hardware: a moteus r4.11 on an fdcanusb at COM5 and a Dynamixel
-XL330-M288-T at COM6. Connect and identify, every control mode, position
-clamping in both directions, e-stop and reset, a sustained loop at the
-configured rate with no dropped replies, and two joints driven at once from the
-panel.
+XL330-M288-T at COM6.
 
-Nothing is claimed as working on the strength of it having compiled.
+| | result |
+|---|---|
+| moteus identify — registers, and travel bounds through the console | r4.11, fw 0.0.5, −5.0 … 5.0 rev |
+| Dynamixel identify — model number chooses the profile, undeclared | XL330-M288-T, 4.7 V, 3.7–6.0 V range |
+| moteus loop | 100 Hz sustained, no dropped replies |
+| Dynamixel loop | 100 Hz sustained |
+| moteus motion — shuttle 0 ↔ 0.35 rev | arrives within 0.9 mrev, 0.7 rev/s cruise |
+| Dynamixel motion — shuttle 0.65 ↔ 0.90 rev | arrives at both ends |
+| both joints at once, per-bus rates | CAN 200 Hz **and** serial 100 Hz, together |
+| flood: poses as fast as a thread can send them | both rates unchanged, nothing tripped |
+| position clamping, both directions | ±5.0 rev commanded → ±0.199 rev against a ±0.2 ceiling |
+| hard kill while armed, then reconnect | re-arms; the latched bus watchdog is cleared |
+
+The flood row is the one worth reading. In the Go version that exact scenario
+drove the CAN joint to 801 Hz and the serial joint to 345 Hz until the servo's
+own watchdog latched and e-stopped it.
+
+### What the bench found that the tests had not
+
+Two defects, both invisible off the hardware, both now pinned by a test that
+fails without the fix.
+
+**An unset register decoded as a very large number.** The verify query reads the
+controller's live command registers; a velocity limit a moteus has never been
+given comes back as the int32 NaN sentinel. Decoded as a plain integer and
+scaled, that is −21474.836 rev/s — finite, plausible-looking, and wrong. The
+session compared it against the 1.000 it had set, concluded the controller had
+lost the parameter, and re-sent the whole set on every verify cycle. Nothing
+looked broken: the axis held, the loop kept 100 Hz, and the log filled with a
+mismatch that was not one. `nanify` existed; the reader simply never called it.
+
+**Connecting never opened the link.** `Session::connect` described and
+identified the link but never called `open`, which is where a driver takes
+control of what the last session left — a moteus still driving, a Dynamixel
+with a latched watchdog — and where it tunes the transport. The servo answered,
+armed and held position, so nothing reported an error. It just ran at 44 Hz
+against a 100 Hz configuration, because an unopened port keeps its default
+ten-millisecond read timeout and the loop reads twice a cycle. Opening it took
+the same loop to exactly 100.
+
+Nothing here is claimed as working on the strength of it having compiled.

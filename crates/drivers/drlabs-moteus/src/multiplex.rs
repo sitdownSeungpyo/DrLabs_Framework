@@ -291,7 +291,7 @@ impl<'a> Reader<'a> {
         }
         let bytes = &self.data[self.offset..self.offset + width];
         self.offset += width;
-        Ok(match resolution {
+        let raw = match resolution {
             Resolution::Int8 => f64::from(bytes[0] as i8),
             Resolution::Int16 => f64::from(i16::from_le_bytes([bytes[0], bytes[1]])),
             Resolution::Int32 => {
@@ -300,7 +300,11 @@ impl<'a> Reader<'a> {
             Resolution::F32 => {
                 f64::from(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
-        })
+        };
+        // The sentinel has to be turned back into a NaN *here*, where the width
+        // is still known. Past this point it is just a very large negative
+        // number that scales into something plausible.
+        Ok(nanify(raw, resolution))
     }
 }
 
@@ -486,6 +490,29 @@ mod tests {
         assert_eq!(saturate(f64::NAN, Resolution::Int32, 0.001), -2147483648.0);
         assert_eq!(saturate(f64::INFINITY, Resolution::Int16, 0.1), -32768.0);
         assert_eq!(saturate(f64::NEG_INFINITY, Resolution::Int8, 1.0), -128.0);
+    }
+
+    /// Found on the bench, on a moteus r4.11 at 24 V.
+    ///
+    /// The verify query reads the controller's live command registers, and a
+    /// velocity limit the controller has never been given comes back as the
+    /// int32 NaN sentinel. Decoded as a plain integer and scaled, that is
+    /// -21474.836 rev/s — a number, finite, and wrong. The session compared it
+    /// against the 1.000 it had set, decided the controller had lost the
+    /// parameter, and re-sent the whole set every verify cycle for ever.
+    ///
+    /// Nothing looked broken: the axis held position, the loop kept 100 Hz, and
+    /// the log filled up with a mismatch that was not one.
+    #[test]
+    fn an_unset_register_reads_as_nan_rather_than_as_a_huge_number() {
+        let sentinel = i32::MIN.to_le_bytes();
+        let mut reader = Reader::new(&sentinel);
+        let value = reader.read_value(Resolution::Int32).unwrap();
+        assert!(
+            value.is_nan(),
+            "the sentinel decoded as {value}, which scales to {} rev/s",
+            value * 0.00001
+        );
     }
 
     #[test]

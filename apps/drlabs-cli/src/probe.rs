@@ -209,6 +209,10 @@ const RUN_FLAGS: &[(&str, Kind)] = &[
     ("seconds", Kind::Value),
     ("position", Kind::Value),
     ("shuttle", Kind::Value),
+    ("min", Kind::Value),
+    ("max", Kind::Value),
+    ("torque", Kind::Value),
+    ("velocity", Kind::Value),
 ];
 
 /// Runs a control session on one axis.
@@ -228,10 +232,31 @@ pub fn run(args: &[String]) -> Result<(), String> {
     };
     let shuttle = flags.string("shuttle", "");
 
-    let mut link = link_for(&target)?;
-    link.open().map_err(|error| error.to_string())?;
+    // The travel envelope is the operator's, not the driver's, so it has to be
+    // sayable on the command line. A default of ±0.5 rev is right for a first
+    // power-up and wrong for an axis that is parked anywhere else — and a
+    // motor that cannot be armed because of a default nobody chose is the sort
+    // of thing people work around by disabling the check.
+    let mut safety = drlabs_safety::Config {
+        max_torque: drlabs_core::units::Nm(flags.number("torque", 0.3)?),
+        max_velocity: drlabs_core::units::RevPerSec(flags.number("velocity", 2.0)?),
+        ..Default::default()
+    };
+    if let Ok(min) = flags.number::<f64>("min", f64::NAN) {
+        if min.is_finite() {
+            safety.position_min = Rev(min);
+        }
+    }
+    if let Ok(max) = flags.number::<f64>("max", f64::NAN) {
+        if max.is_finite() {
+            safety.position_max = Rev(max);
+        }
+    }
+
+    let link = link_for(&target)?;
 
     let session = Session::new(Options {
+        safety,
         rate_hz: rate,
         auto_arm: true,
         require_acknowledgement: false,
@@ -240,6 +265,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     session
         .connect(link, true)
         .map_err(|error| error.to_string())?;
+
+    session.set_params(drlabs_session::Params {
+        max_torque: drlabs_core::units::Nm(flags.number("torque", 0.3)?),
+        velocity_limit: drlabs_core::units::RevPerSec(flags.number("velocity", 1.0)?),
+        ..Default::default()
+    });
 
     // Give the loop long enough to arm before anything is commanded.
     wait_until_armed(&session, Duration::from_secs(5))?;

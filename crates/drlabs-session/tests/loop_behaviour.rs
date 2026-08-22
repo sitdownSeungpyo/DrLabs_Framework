@@ -21,12 +21,17 @@ use drlabs_session::{Options, Session};
 #[derive(Clone, Default)]
 struct FakeController {
     cycles: Arc<AtomicU64>,
+    opens: Arc<AtomicU64>,
     position: Arc<std::sync::Mutex<Rev>>,
 }
 
 impl FakeController {
     fn count(&self) -> u64 {
         self.cycles.load(Ordering::Relaxed)
+    }
+
+    fn opens(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
     }
 }
 
@@ -40,6 +45,7 @@ impl Link for FakeController {
     }
 
     fn open(&mut self) -> Result<()> {
+        self.opens.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -287,4 +293,25 @@ fn the_status_reports_a_measured_rate() {
     );
     assert!(status.cycles > 20);
     assert_eq!(status.timeouts, 0);
+}
+
+/// Found on the bench, on an XL330 at 1 Mbaud.
+///
+/// Connecting has to *open* the link, not merely describe and identify it.
+/// Open is where a driver takes control of what the last session left behind —
+/// a moteus still driving, a Dynamixel with a latched bus watchdog — and where
+/// it tunes the transport for a control loop.
+///
+/// Skipping it looked harmless: the servo answered, armed, and held position.
+/// It just did so at 44 Hz against a 100 Hz configuration, because an unopened
+/// port keeps its default ten-millisecond read timeout and the loop reads twice
+/// a cycle. Nothing reported an error. Opening it took the same loop to 100.
+#[test]
+fn connecting_opens_the_link() {
+    let (_session, controller) = connected(100);
+    assert_eq!(
+        controller.opens(),
+        1,
+        "connect must open the link exactly once"
+    );
 }

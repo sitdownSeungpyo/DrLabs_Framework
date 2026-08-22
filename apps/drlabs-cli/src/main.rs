@@ -109,9 +109,16 @@ run flags:
   -seconds  how long to run; 0 runs until Ctrl+C (default 0)
   -position position target, in revolutions
   -shuttle  A,B,dwell — run the A↔B sequencer instead
+  -min      travel envelope, lower bound in revolutions (default -0.5)
+  -max      travel envelope, upper bound (default 0.5)
+  -torque   torque ceiling in Nm (default 0.3)
+  -velocity velocity ceiling in rev/s (default 1.0)
 
 bringup flags:
   -check    validate the description and print the plan, opening nothing
+  -seconds  how long to hold the machine up; 0 runs until Ctrl+C
+  -sweep    drive every joint through this fraction of its travel, together
+  -flood    command poses as fast as possible, to test the rate ceiling
 "#
     );
 }

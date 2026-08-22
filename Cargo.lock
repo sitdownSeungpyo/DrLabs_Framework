@@ -12,6 +12,7 @@ dependencies = [
  "drlabs-odrive",
  "drlabs-robot",
  "drlabs-robstride",
+ "drlabs-safety",
  "drlabs-session",
  "drlabs-transport",
  "thiserror",

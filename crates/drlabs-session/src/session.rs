@@ -215,6 +215,20 @@ impl Session {
             state.connect_error.clear();
         }
 
+        // Open before anything else. This is where a driver takes control of
+        // what the last session left behind — a moteus still driving, a
+        // Dynamixel with a latched bus watchdog — and where it tunes the
+        // transport for a control loop. Skipping it is not a small omission:
+        // an unopened Dynamixel keeps its port's default ten-millisecond read
+        // timeout, and a loop that reads twice a cycle runs at 44 Hz however
+        // it is configured. Measured on this bench, exactly that way.
+        if let Err(error) = link.open() {
+            let mut state = self.shared.state();
+            state.connection = Connection::Disconnected;
+            state.connect_error = error.to_string();
+            return Err(error);
+        }
+
         let description = link.describe();
         let identity = match link.identify() {
             Ok(identity) => identity,

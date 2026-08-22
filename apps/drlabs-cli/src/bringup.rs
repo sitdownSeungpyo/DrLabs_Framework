@@ -10,7 +10,12 @@ use drlabs_robot::{Config, Robot};
 
 use crate::flags::{Flags, Kind};
 
-const BRINGUP_FLAGS: &[(&str, Kind)] = &[("check", Kind::Switch), ("seconds", Kind::Value)];
+const BRINGUP_FLAGS: &[(&str, Kind)] = &[
+    ("check", Kind::Switch),
+    ("seconds", Kind::Value),
+    ("sweep", Kind::Value),
+    ("flood", Kind::Switch),
+];
 
 pub fn bringup(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, BRINGUP_FLAGS).map_err(|error| error.to_string())?;
@@ -19,6 +24,10 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
         None => return Err("usage: drlabs bringup [flags] <robot.json>".into()),
     };
     let seconds: f64 = flags.number("seconds", 0.0)?;
+    // A fraction of each joint's own travel, so one number suits a machine
+    // whose joints do not share an envelope.
+    let sweep: f64 = flags.number("sweep", 0.0)?;
+    let flood = flags.switch("flood");
 
     let config = Config::load(std::path::Path::new(&path)).map_err(|error| error.to_string())?;
     print_plan(&config);
@@ -49,9 +58,70 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
         println!("  Ctrl+C to stop");
     }
 
+    // A coordinated sweep drives every joint at once, which is the only way to
+    // find out whether they interfere. On this bench that is exactly what the
+    // Go version's two worst defects needed: one joint's commands starving the
+    // other's bus, and a pose that reached some joints and not others.
+    let sweep_targets: Vec<(String, f64, f64)> = if sweep > 0.0 {
+        robot
+            .config
+            .joints
+            .iter()
+            .map(|joint| {
+                let centre = (joint.limits.min_rad + joint.limits.max_rad) / 2.0;
+                let half = (joint.limits.max_rad - joint.limits.min_rad) / 2.0;
+                (joint.name.clone(), centre, half * sweep.clamp(0.0, 1.0))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !sweep_targets.is_empty() {
+        println!(
+            "
+Sweeping {} joints…",
+            sweep_targets.len()
+        );
+        if flood {
+            println!("  commanding as fast as this thread can, to test the rate ceiling");
+        }
+    }
+
     let started = Instant::now();
     loop {
-        std::thread::sleep(Duration::from_millis(500));
+        if sweep_targets.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+        } else {
+            // Either one pose per 20 ms, or as fast as the thread manages —
+            // which is what a slider drag looks like from the loop's side.
+            let deadline = Instant::now() + Duration::from_millis(if flood { 500 } else { 20 });
+            loop {
+                let phase = started.elapsed().as_secs_f64() * std::f64::consts::TAU / 4.0;
+                let pose: std::collections::BTreeMap<String, drlabs_core::units::Rad> =
+                    sweep_targets
+                        .iter()
+                        .map(|(name, centre, amplitude)| {
+                            (
+                                name.clone(),
+                                drlabs_core::units::Rad(centre + amplitude * phase.sin()),
+                            )
+                        })
+                        .collect();
+                if let Err(error) = robot.set_positions(&pose) {
+                    println!(
+                        "
+pose refused: {error}"
+                    );
+                    break;
+                }
+                if !flood || Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if !flood {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         robot.heartbeat();
 
         // A joint that stopped itself is the whole machine's problem: the rest
@@ -72,6 +142,25 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
         if seconds > 0.0 && started.elapsed().as_secs_f64() >= seconds {
             print_state(&robot);
             break;
+        }
+        if sweep_targets.is_empty() {
+            continue;
+        }
+        // While sweeping, report often enough to watch both joints move.
+        if started.elapsed().as_millis() % 1000 < 25 {
+            let state = robot.state();
+            let line: Vec<String> = state
+                .iter()
+                .map(|joint| {
+                    format!(
+                        "{} {:+.3} rad @ {:.0} Hz",
+                        joint.name,
+                        joint.position_rad.unwrap_or(f64::NAN),
+                        joint.rate_hz
+                    )
+                })
+                .collect();
+            println!("  {}", line.join("   "));
         }
     }
 

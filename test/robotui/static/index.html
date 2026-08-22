@@ -31,6 +31,13 @@
 
     <p id="message" class="message" role="status" aria-live="polite"></p>
 
+    <section class="log">
+      <h2>Robot log</h2>
+      <ol id="events" class="events">
+        <li class="muted">Nothing yet.</li>
+      </ol>
+    </section>
+
     <p class="muted note">
       The sliders are bounded by the description this panel was started with.
       The envelope that actually protects the machine is enforced on the far
@@ -43,6 +50,7 @@
       <div class="joint-head">
         <h2 class="joint-name"></h2>
         <span class="joint-driver muted"></span>
+        <span class="joint-mode pill pill-off">—</span>
         <span class="joint-armed pill pill-off">disarmed</span>
       </div>
 

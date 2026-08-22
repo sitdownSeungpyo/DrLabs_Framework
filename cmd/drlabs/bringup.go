@@ -228,6 +228,10 @@ func (s *robotServer) handle(ctx context.Context, conn net.Conn) {
 	if s.stateRate > 0 {
 		go s.streamState(clientCtx, send)
 	}
+	// A joint that trips latches on its own, and the reason is the only thing
+	// that makes that state actionable.  Printing it on this process's console
+	// is no use to whatever is holding the socket, so it goes out here too.
+	go s.streamEvents(clientCtx, send)
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 4096), 256*1024)
@@ -236,6 +240,48 @@ func (s *robotServer) handle(ctx context.Context, conn net.Conn) {
 			continue
 		}
 		_ = send(s.execute(scanner.Bytes()))
+	}
+}
+
+// streamEvents pushes each joint's log to one client as it happens.
+//
+// The client gets its own cursor, so a panel that connects late is not handed
+// the whole bring-up over again, and two clients cannot steal each other's
+// events.
+func (s *robotServer) streamEvents(ctx context.Context, send func(any) error) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Start from the beginning of the retained log rather than from now.
+	//
+	// The question a client most often has is "why is this joint stopped",
+	// and the answer was logged when it tripped — before anyone thought to
+	// connect.  Withholding it because the client is late leaves them looking
+	// at a latched axis with no reason attached, which is the state this
+	// stream exists to prevent.
+	var seen map[string]uint64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			events, advanced := s.robot.Events(seen)
+			seen = advanced
+			for _, event := range events {
+				if err := send(map[string]any{
+					"type":    "event",
+					"joint":   event.Joint,
+					"level":   event.Level,
+					"message": event.Message,
+					"detail":  event.Detail,
+					"at":      event.At,
+					"seq":     event.Seq,
+				}); err != nil {
+					return
+				}
+			}
+		}
 	}
 }
 

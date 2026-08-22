@@ -617,6 +617,29 @@ func (s *Session) ResetEStop() error {
 	return nil
 }
 
+// CanCommand reports whether a command in this mode would be accepted, and
+// changes nothing.
+//
+// It exists so that a caller commanding several axes can find out before it
+// starts.  Discovering halfway through that the third joint is latched leaves
+// two joints somewhere nobody asked for, and there is no undo for that — the
+// machine is already there.
+func (s *Session) CanCommand(mode motor.ControlMode) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.link != nil && !s.link.Capabilities().Supports(mode) {
+		return fmt.Errorf("session: %s does not support %s mode", s.link.Kind(), mode)
+	}
+	if mode != motor.CtrlStop && !s.armed {
+		return errors.New("session: arm the axis first")
+	}
+	if s.estop {
+		return errors.New("session: emergency stop is latched")
+	}
+	return nil
+}
+
 // SetMode selects what the loop commands.
 func (s *Session) SetMode(mode motor.ControlMode) error {
 	s.mu.Lock()

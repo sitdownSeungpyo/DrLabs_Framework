@@ -4,7 +4,7 @@
 
   "buses": [
     { "name": "can0", "transport": "fdcanusb", "port": "COM5" },
-    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 57600 }
+    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 1000000 }
   ],
 
   "joints": [
@@ -31,16 +31,16 @@
       "bus": "dxl0",
       "driver": "dynamixel",
       "id": 1,
-      "options": { "profile": "x" },
+      "options": { "profile": "xl330" },
 
       "gear_ratio": 1.0,
       "direction": 1,
-      "offset_rad": 3.1416,
+      "offset_rad": 4.5974,
 
       "limits": {
         "min_rad": -1.2,
         "max_rad": 1.2,
-        "max_torque_nm": 0.5,
+        "max_torque_nm": 0.3,
         "max_velocity_rad_s": 2.0,
         "max_accel_rad_s2": 8.0
       }

@@ -122,3 +122,29 @@ main { max-width: 60rem; }
 .message.bad { color: var(--bad); }
 
 .note { margin-top: 1.75rem; max-width: 46rem; }
+
+/* The robot's own log.  A joint that trips says why exactly once, here. */
+.log { margin-top: 1.5rem; }
+.log h2 { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+.events {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  max-height: 15rem;
+  overflow-y: auto;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+.events li { padding: 0.2rem 0; display: flex; gap: 0.6rem; align-items: baseline; }
+.events .who { color: var(--muted); min-width: 5.5rem; }
+.events .what { flex: 1; }
+.events .why { color: var(--muted); display: block; font-size: 0.8rem; }
+.events .lvl { min-width: 3rem; font-weight: 600; font-size: 0.72rem; text-transform: uppercase; }
+.events .lvl-ok    { color: var(--on); }
+.events .lvl-warn  { color: #d9a441; }
+.events .lvl-error { color: var(--bad); }
+.events .lvl-info  { color: var(--muted); }

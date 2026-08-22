@@ -1,11 +1,14 @@
 package robot
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"drlabs/runtime/safety"
 )
@@ -273,5 +276,112 @@ func TestExampleDescriptionsAreValid(t *testing.T) {
 		if _, err := Load(path); err != nil {
 			t.Errorf("%s: %v", filepath.Base(path), err)
 		}
+	}
+}
+
+
+// simPair brings up two simulated joints and hands back a live robot.
+func simPair(t *testing.T) *Robot {
+	t.Helper()
+	config := &Config{
+		Robot: "pair", RateHz: 100,
+		Joints: []JointConfig{
+			{Name: "a", Driver: "moteus-sim", ID: 1, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2,
+					MaxVelocityRadS: 2, MaxAccelRadS2: 8}},
+			{Name: "b", Driver: "moteus-sim", ID: 2, GearRatio: 1, Direction: 1,
+				Limits: JointLimits{MinRad: -1, MaxRad: 1, MaxTorqueNm: 2,
+					MaxVelocityRadS: 2, MaxAccelRadS2: 8}},
+		},
+	}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	machine, err := New(config)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := machine.BringUp(ctx); err != nil {
+		t.Fatalf("bring-up: %v", err)
+	}
+	t.Cleanup(machine.Shutdown)
+	time.Sleep(300 * time.Millisecond)
+	return machine
+}
+
+func targetOf(t *testing.T, machine *Robot, name string) float64 {
+	t.Helper()
+	for _, state := range machine.State() {
+		if state.Name == name {
+			return state.TargetRad
+		}
+	}
+	t.Fatalf("no joint named %q", name)
+	return 0
+}
+
+// A pose one joint refuses must move no joint at all.
+//
+// Before this, SetPositions ranged the targets map and returned on the first
+// refusal — so which joints had already been commanded depended on Go's map
+// iteration order, and the same command against the same machine produced a
+// different posture from one call to the next.  Measured on two simulated
+// joints with one latched: 35 of 40 identical poses moved the other joint, 5
+// moved nothing.
+func TestARefusedPoseMovesNothing(t *testing.T) {
+	machine := simPair(t)
+
+	b, err := machine.Joint("b")
+	if err != nil {
+		t.Fatalf("joint b: %v", err)
+	}
+	b.Session.EStop("test", "Emergency stop", "one joint tripped")
+	time.Sleep(200 * time.Millisecond)
+
+	before := targetOf(t, machine, "a")
+	for i := 0; i < 20; i++ {
+		err := machine.SetPositions(map[string]float64{"a": 0.5, "b": 0.5})
+		if err == nil {
+			t.Fatal("a pose was accepted while one joint was latched")
+		}
+		if !strings.Contains(err.Error(), "b") {
+			t.Errorf("the refusal does not name the joint that refused: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if got := targetOf(t, machine, "a"); got != before {
+			t.Fatalf("joint a was commanded to %v by a pose that was refused", got)
+		}
+	}
+}
+
+// The joints are visited in declaration order, not map order.
+func TestAPoseIsAppliedInDeclarationOrder(t *testing.T) {
+	machine := simPair(t)
+
+	if err := machine.SetPositions(map[string]float64{"b": -0.3, "a": 0.3}); err != nil {
+		t.Fatalf("pose: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := targetOf(t, machine, "a"); math.Abs(got-0.3) > 1e-6 {
+		t.Errorf("joint a target %v, want 0.3", got)
+	}
+	if got := targetOf(t, machine, "b"); math.Abs(got+0.3) > 1e-6 {
+		t.Errorf("joint b target %v, want -0.3", got)
+	}
+}
+
+// An unknown name is still caught before anything moves.
+func TestAPoseWithAnUnknownJointMovesNothing(t *testing.T) {
+	machine := simPair(t)
+
+	before := targetOf(t, machine, "a")
+	if err := machine.SetPositions(map[string]float64{"a": 0.4, "nope": 0.1}); err == nil {
+		t.Fatal("a pose naming an unknown joint was accepted")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := targetOf(t, machine, "a"); got != before {
+		t.Errorf("joint a moved to %v on a pose that named an unknown joint", got)
 	}
 }

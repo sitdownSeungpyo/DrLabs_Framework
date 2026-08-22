@@ -45,12 +45,31 @@ type jointState struct {
 	RateHz    *float64 `json:"rate_hz"`
 }
 
+// eventLine is one entry from a joint's log.
+//
+// It is the half of the picture the state lines cannot carry.  A joint that
+// trips latches on its own and then simply reads "e-stopped"; the reason it
+// tripped only ever exists here, and a panel that drops it leaves the operator
+// looking at a stopped machine with nothing to act on.
+type eventLine struct {
+	Joint   string `json:"joint"`
+	Level   string `json:"level"`
+	Message string `json:"message"`
+	Detail  string `json:"detail"`
+	Seq     uint64 `json:"seq"`
+}
+
+// eventHistory is how many log lines the panel keeps.  Enough to hold the
+// bring-up of a small machine and whatever went wrong after it.
+const eventHistory = 60
+
 type robotLink struct {
 	addr string
 
 	mu     sync.RWMutex
 	state  string
 	joints []jointState
+	events []eventLine
 
 	sendMu sync.Mutex
 	conn   net.Conn
@@ -120,6 +139,16 @@ func (l *robotLink) read(conn net.Conn) {
 			l.mu.Lock()
 			l.joints = envelope.Joints
 			l.mu.Unlock()
+		case "event":
+			var event eventLine
+			if json.Unmarshal(line, &event) == nil {
+				l.mu.Lock()
+				l.events = append(l.events, event)
+				if len(l.events) > eventHistory {
+					l.events = l.events[len(l.events)-eventHistory:]
+				}
+				l.mu.Unlock()
+			}
 		case "reply":
 			var reply map[string]any
 			if json.Unmarshal(line, &reply) == nil {
@@ -173,12 +202,14 @@ func (l *robotLink) send(command map[string]any) (map[string]any, error) {
 	}
 }
 
-func (l *robotLink) snapshot() (string, []jointState) {
+func (l *robotLink) snapshot() (string, []jointState, []eventLine) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	joints := make([]jointState, len(l.joints))
 	copy(joints, l.joints)
-	return l.state, joints
+	events := make([]eventLine, len(l.events))
+	copy(events, l.events)
+	return l.state, joints, events
 }
 
 func (l *robotLink) setState(state string) {

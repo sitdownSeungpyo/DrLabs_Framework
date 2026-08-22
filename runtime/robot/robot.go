@@ -386,17 +386,39 @@ func (r *Robot) SetPosition(name string, radians float64) error {
 // An unknown joint name fails the whole call before anything is commanded,
 // because a pose applied to half a machine is not a pose.
 func (r *Robot) SetPositions(targets map[string]float64) error {
+	// Everything is checked before anything is commanded, and the joints are
+	// visited in the order they were declared.
+	//
+	// Both halves of that matter.  Ranging a map applies a pose in whatever
+	// order Go feels like today, so a joint that refuses leaves a different
+	// subset of the machine moved every time — the same command, the same
+	// state, a different posture.  And a posture assembled out of the joints
+	// that happened to be reached first is not the pose anybody asked for.
 	r.mu.RLock()
-	for name := range targets {
-		if _, known := r.joints[name]; !known {
+	ordered := make([]string, 0, len(targets))
+	for _, name := range r.order {
+		if _, wanted := targets[name]; wanted {
+			ordered = append(ordered, name)
+		}
+	}
+	if len(ordered) != len(targets) {
+		for name := range targets {
+			if _, known := r.joints[name]; !known {
+				r.mu.RUnlock()
+				return fmt.Errorf("robot: no joint named %q", name)
+			}
+		}
+	}
+	for _, name := range ordered {
+		if err := r.joints[name].Session.CanCommand(motor.CtrlPosition); err != nil {
 			r.mu.RUnlock()
-			return fmt.Errorf("robot: no joint named %q", name)
+			return fmt.Errorf("joint %q: %w (the pose was not applied)", name, err)
 		}
 	}
 	r.mu.RUnlock()
 
-	for name, radians := range targets {
-		if err := r.SetPosition(name, radians); err != nil {
+	for _, name := range ordered {
+		if err := r.SetPosition(name, targets[name]); err != nil {
 			return err
 		}
 	}

@@ -142,10 +142,11 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			state, joints := s.link.snapshot()
+			state, joints, events := s.link.snapshot()
 			payload, err := json.Marshal(map[string]any{
 				"connection": state,
 				"joints":     joints,
+				"events":     events,
 			})
 			if err != nil {
 				continue

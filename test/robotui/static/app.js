@@ -108,6 +108,7 @@ function buildJoints(description) {
       slider,
       touched: false,
       armedPill: node.querySelector(".joint-armed"),
+      modePill: node.querySelector(".joint-mode"),
       commandCell: node.querySelector(".joint-command"),
       positionCell: node.querySelector(".joint-position"),
       targetCell: node.querySelector(".joint-target"),
@@ -148,6 +149,14 @@ function render(payload) {
     entry.armedPill.className =
       "pill " + (state.estop ? "pill-bad" : state.armed ? "pill-on" : "pill-off");
 
+    // The mode is the difference between an axis that is holding and one
+    // that is merely energised.  "Stop (release)" leaves a joint armed and
+    // limp, and without this the panel showed that as "armed" next to a stale
+    // target — which reads as a joint that should be where it is not.
+    entry.modePill.textContent = state.mode || "—";
+    entry.modePill.className =
+      "pill " + (state.mode === "stop" || !state.mode ? "pill-off" : "pill-on");
+
     entry.positionCell.textContent = number(state.position_rad, 4, "rad");
     entry.targetCell.textContent = number(state.target_rad, 4, "rad");
     entry.torqueCell.textContent = number(state.torque_nm, 3, "Nm");
@@ -161,7 +170,47 @@ function render(payload) {
       entry.slider.disabled = true;
       entry.armedPill.textContent = "no link";
       entry.armedPill.className = "pill pill-off";
+      entry.modePill.textContent = "—";
+      entry.modePill.className = "pill pill-off";
     }
+  }
+}
+
+const eventList = document.getElementById("events");
+let lastEventSeq = null;
+
+function renderEvents(events) {
+  if (!events || !events.length) return;
+  const newest = events[events.length - 1];
+  const key = newest.joint + ":" + newest.seq;
+  if (key === lastEventSeq) return;
+  lastEventSeq = key;
+
+  eventList.textContent = "";
+  // Newest first: a machine that just tripped should not need scrolling.
+  for (const event of events.slice().reverse()) {
+    const item = document.createElement("li");
+
+    const level = document.createElement("span");
+    level.className = "lvl lvl-" + (event.level || "info");
+    level.textContent = event.level || "info";
+
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = event.joint;
+
+    const what = document.createElement("span");
+    what.className = "what";
+    what.textContent = event.message;
+    if (event.detail) {
+      const why = document.createElement("span");
+      why.className = "why";
+      why.textContent = event.detail;
+      what.appendChild(why);
+    }
+
+    item.append(level, who, what);
+    eventList.appendChild(item);
   }
 }
 
@@ -169,7 +218,9 @@ function stream() {
   const source = new EventSource("/api/state");
   source.onmessage = (event) => {
     try {
-      render(JSON.parse(event.data));
+      const payload = JSON.parse(event.data);
+      render(payload);
+      renderEvents(payload.events);
     } catch (err) {
       /* a malformed frame is not worth tearing the page down for */
     }

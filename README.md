@@ -90,6 +90,7 @@ did not have:
 | `examples/` | Runnable programs, `examples/framework` first; `examples/robots/` holds robot descriptions |
 | `legacy/dxl/` | The original single-package Dynamixel SDK, kept working |
 | `ros2/drlabs_bridge/` | ROS 2 bridge — joint_states and joint_commands over the servo protocol |
+| `test/robotui/` | Browser panel with a slider per joint, for driving a robot by hand |
 
 ## Units
 

@@ -1,0 +1,124 @@
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1c1f25;
+  --line: #2b3038;
+  --ink: #e6e9ef;
+  --muted: #8b93a1;
+  --on: #3fb950;
+  --bad: #f0553a;
+  --accent: #4c8dff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 1.5rem;
+}
+
+h1 { font-size: 1.25rem; margin: 0; }
+h2 { font-size: 1rem; margin: 0; }
+.muted { color: var(--muted); margin: 0.15rem 0 0; font-size: 0.85rem; }
+
+main { max-width: 60rem; }
+
+.joints { display: grid; gap: 1rem; }
+
+.joint {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.15rem 1.15rem;
+}
+.joint.faulted { border-color: var(--bad); }
+
+.joint-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.9rem;
+}
+.joint-head .joint-driver { margin-left: auto; }
+
+.joint-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  height: 1.75rem;
+  cursor: grab;
+}
+.joint-slider:disabled { cursor: not-allowed; opacity: 0.4; }
+
+.joint-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -0.35rem;
+}
+
+.joint-readout {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 1rem 0 0;
+}
+.joint-readout div { display: flex; flex-direction: column; }
+.joint-readout dt { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.joint-readout dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.pill {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.pill-on  { background: rgba(63,185,80,0.15);  color: var(--on);    border-color: rgba(63,185,80,0.4); }
+.pill-off { background: rgba(139,147,161,0.12); color: var(--muted); border-color: var(--line); }
+.pill-bad { background: rgba(240,85,58,0.15);   color: var(--bad);   border-color: rgba(240,85,58,0.45); }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.btn {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.55rem 1rem;
+  font: inherit;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); }
+
+/* The one control that must never be hunted for. */
+.btn-estop {
+  margin-left: auto;
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.message { min-height: 1.4rem; margin: 0.75rem 0 0; font-size: 0.9rem; }
+.message.bad { color: var(--bad); }
+
+.note { margin-top: 1.75rem; max-width: 46rem; }

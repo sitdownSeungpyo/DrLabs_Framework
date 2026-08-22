@@ -198,6 +198,28 @@ preflight reasons instead.
 Start on `examples/robots/sim_arm.json`, which needs no hardware at all, then
 change `driver` and `port` to the real thing.
 
+### A browser panel
+
+`test/robotui` is the same thing with sliders, for driving a machine by hand
+while watching what it does:
+
+```
+drlabs bringup test/shoulder_pair.json
+go run ./test/robotui -robot test/shoulder_pair.json
+```
+
+Then open `http://localhost:8080`. It reads the description for the joint
+names and travel limits, so the sliders are bounded — but only as a courtesy.
+The panel is not privileged: it speaks the same JSON down the same socket as
+any other client and is refused by the same envelope.
+
+Two things it deliberately does not do. It never snaps a slider to the measured
+position while somebody is holding it — the command and the measurement are
+separate readouts, because a control that chases the measurement hides exactly
+the disagreement worth seeing. And it never paints the machine as stopped
+because the operator pressed stop; `armed`, `e-stopped` and the fault come only
+from state the robot actually sent.
+
 ## Verified
 
 Three simulated joints, 100 Hz, one with `direction: -1` and two geared 6:1:

@@ -1,0 +1,49 @@
+{
+  "robot": "shoulder_pair",
+  "rate_hz": 100,
+
+  "buses": [
+    { "name": "can0", "transport": "fdcanusb", "port": "COM5" },
+    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 57600 }
+  ],
+
+  "joints": [
+    {
+      "name": "r_sh_p",
+      "bus": "can0",
+      "driver": "moteus",
+      "id": 1,
+
+      "gear_ratio": 1.0,
+      "direction": 1,
+      "offset_rad": 0.0,
+
+      "limits": {
+        "min_rad": -1.4,
+        "max_rad": 1.4,
+        "max_torque_nm": 2.0,
+        "max_velocity_rad_s": 2.0,
+        "max_accel_rad_s2": 8.0
+      }
+    },
+    {
+      "name": "l_sh_p",
+      "bus": "dxl0",
+      "driver": "dynamixel",
+      "id": 1,
+      "options": { "profile": "x" },
+
+      "gear_ratio": 1.0,
+      "direction": 1,
+      "offset_rad": 3.1416,
+
+      "limits": {
+        "min_rad": -1.2,
+        "max_rad": 1.2,
+        "max_torque_nm": 0.5,
+        "max_velocity_rad_s": 2.0,
+        "max_accel_rad_s2": 8.0
+      }
+    }
+  ]
+}

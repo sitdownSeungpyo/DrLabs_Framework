@@ -5,6 +5,8 @@ resolver = "2"
 # layout is in docs/RUST.md; nothing is listed here until it builds.
 members = [
     "crates/drlabs-core",
+    "crates/drlabs-safety",
+    "crates/drlabs-session",
     "crates/drlabs-timing",
     "crates/drlabs-transport",
     "crates/drivers/drlabs-dynamixel",
@@ -22,6 +24,8 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 
 [workspace.dependencies]
 drlabs-core = { path = "crates/drlabs-core" }
+drlabs-safety = { path = "crates/drlabs-safety" }
+drlabs-session = { path = "crates/drlabs-session" }
 drlabs-timing = { path = "crates/drlabs-timing" }
 drlabs-transport = { path = "crates/drlabs-transport" }
 drlabs-dynamixel = { path = "crates/drivers/drlabs-dynamixel" }

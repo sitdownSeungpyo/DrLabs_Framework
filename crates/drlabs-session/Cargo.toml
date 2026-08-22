@@ -1,0 +1,14 @@
+[package]
+name = "drlabs-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One axis: the control loop, the state machine, trajectories and the shuttle"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-safety = { workspace = true }
+drlabs-timing = { workspace = true }
+thiserror = { workspace = true }

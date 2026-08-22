@@ -47,6 +47,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "drlabs-safety"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+]
+
+[[package]]
+name = "drlabs-session"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-safety",
+ "drlabs-timing",
+ "thiserror",
+]
+
+[[package]]
 name = "drlabs-timing"
 version = "0.1.0"
 dependencies = [

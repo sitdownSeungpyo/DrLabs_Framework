@@ -87,21 +87,35 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 
 | Crate | State | Tests |
 |---|---|---|
-| `drlabs-core` | done | 19 passing |
+| `drlabs-core` | done, plus the unit renderer | 23 passing |
 | `drlabs-timing` | done | 7 passing |
 | `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
 | `drlabs-moteus` | complete: protocol, frames, driver, console | 66 passing |
 | `drlabs-dynamixel` | complete: protocol, driver, sync read/write, link | 30 passing |
 | `drlabs-robstride` | complete: protocol, parameters, controller, link | 46 passing |
 | `drlabs-odrive` | **implemented, never bench tested** — see below | 23 passing |
-| `drlabs-safety` | not started | |
-| `drlabs-session` | not started | |
+| `drlabs-safety` | complete: clamps, trips, presets, preflight | 27 passing |
+| `drlabs-session` | complete: loop, state machine, trajectory, shuttle | 40 passing |
 | `drlabs-robot` | not started | |
 | `drlabs-cli` | not started | |
 | `drlabs-panel` | not started | |
 
 A crate joins the workspace `members` list when it builds and its tests pass,
 so `cargo test` on this branch is always green.
+
+### The rate ceiling is checked by reproducing the runaway
+
+The worst defect the Go version had on this bench was not a wrong number, it
+was a loop that obeyed its callers instead of its configuration: a wake ran a
+cycle immediately, so a slider drag drove a 100 Hz robot's CAN joint at 801 Hz
+and its serial joint at 345 Hz, until the servo's own watchdog latched and
+e-stopped it. A machine stopped by the rate of somebody's mouse.
+
+`crates/drlabs-session/tests/loop_behaviour.rs` floods a session with commands
+for six hundred milliseconds and asserts the loop stayed near its configured
+rate. Removing the ceiling and re-running it gives **520,564 Hz against a
+50 Hz configuration** — so the test is known to catch the thing it was written
+for, rather than merely passing.
 
 ### Every platform's serial code is at least compiled
 

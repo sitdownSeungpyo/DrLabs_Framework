@@ -16,11 +16,13 @@
 pub mod command;
 pub mod error;
 pub mod link;
+pub mod render;
 pub mod telemetry;
 pub mod units;
 
 pub use command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
 pub use error::{Error, Result};
 pub use link::{BoardStatus, Capabilities, Envelope, Identity, Link};
+pub use render::{render, MotorUnits, Units};
 pub use telemetry::Telemetry;
 pub use units::{Amps, Celsius, Nm, Rad, RadPerSec, RadPerSec2, Rev, RevPerSec, RevPerSec2, Volts};

@@ -1,0 +1,30 @@
+{
+  "robot": "test_servo",
+  "rate_hz": 100,
+
+  "buses": [
+    { "name": "dxl0", "transport": "serial", "port": "COM6", "baud": 1000000 }
+  ],
+
+  "joints": [
+    {
+      "name": "j1",
+      "bus": "dxl0",
+      "driver": "dynamixel",
+      "id": 1,
+      "options": { "profile": "xl330" },
+
+      "gear_ratio": 1.0,
+      "direction": 1,
+      "offset_rad": 0.0,
+
+      "limits": {
+        "min_rad": 3.0,
+        "max_rad": 5.5,
+        "max_torque_nm": 0.1,
+        "max_velocity_rad_s": 2.0,
+        "max_accel_rad_s2": 8.0
+      }
+    }
+  ]
+}

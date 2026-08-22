@@ -4,7 +4,9 @@ resolver = "2"
 # Crates join this list as they are written and their tests pass.  The full
 # layout is in docs/RUST.md; nothing is listed here until it builds.
 members = [
+    "apps/drlabs-cli",
     "crates/drlabs-core",
+    "crates/drlabs-robot",
     "crates/drlabs-safety",
     "crates/drlabs-session",
     "crates/drlabs-timing",
@@ -24,6 +26,7 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 
 [workspace.dependencies]
 drlabs-core = { path = "crates/drlabs-core" }
+drlabs-robot = { path = "crates/drlabs-robot" }
 drlabs-safety = { path = "crates/drlabs-safety" }
 drlabs-session = { path = "crates/drlabs-session" }
 drlabs-timing = { path = "crates/drlabs-timing" }

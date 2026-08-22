@@ -128,14 +128,17 @@ pub(crate) fn looks_like_can_adapter(text: &str) -> bool {
 /// If two servos' exchanges interleave, each read consumes the other's reply
 /// and both time out. Locking the individual calls would not help; the whole
 /// exchange has to be held together, which is why the guard is the only way in.
+/// Cloning one hands out another handle to the *same* port, which is what a
+/// daisy chain needs: one port opened once, and one driver per servo id on it.
+#[derive(Clone)]
 pub struct SharedPort {
-    port: Mutex<Box<dyn SerialPort>>,
+    port: std::sync::Arc<Mutex<Box<dyn SerialPort>>>,
 }
 
 impl SharedPort {
     pub fn new(port: Box<dyn SerialPort>) -> Self {
         Self {
-            port: Mutex::new(port),
+            port: std::sync::Arc::new(Mutex::new(port)),
         }
     }
 
@@ -187,6 +190,32 @@ mod tests {
         });
         let paths: Vec<&str> = ports.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(paths, ["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyUSB1"]);
+    }
+
+    /// Two handles on one port are two ways into the same lock, not two ports.
+    /// A daisy chain depends on that: if cloning duplicated the port, two
+    /// servos' transactions would interleave and each would read the other's
+    /// reply.
+    #[test]
+    fn cloning_a_shared_port_shares_the_same_lock() {
+        struct Counter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl SerialPort for Counter {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(buf.len())
+            }
+        }
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = SharedPort::new(Box::new(Counter(writes.clone())));
+        let second = first.clone();
+
+        first.lock().write(b"a").unwrap();
+        second.lock().write(b"b").unwrap();
+        assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// A port that cannot honour a request says so by doing nothing, rather

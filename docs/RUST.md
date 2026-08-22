@@ -96,8 +96,8 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-odrive` | **implemented, never bench tested** — see below | 23 passing |
 | `drlabs-safety` | complete: clamps, trips, presets, preflight | 27 passing |
 | `drlabs-session` | complete: loop, state machine, trajectory, shuttle | 40 passing |
-| `drlabs-robot` | not started | |
-| `drlabs-cli` | not started | |
+| `drlabs-robot` | complete: description, joint mapping, atomic pose | 31 passing |
+| `drlabs-cli` | ports, drivers, probe, run, bringup | 8 passing |
 | `drlabs-panel` | not started | |
 
 A crate joins the workspace `members` list when it builds and its tests pass,

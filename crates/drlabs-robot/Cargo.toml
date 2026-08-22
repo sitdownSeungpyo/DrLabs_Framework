@@ -1,0 +1,21 @@
+[package]
+name = "drlabs-robot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A machine from a JSON description: joints, buses, and the one conversion between motor and joint space"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-safety = { workspace = true }
+drlabs-session = { workspace = true }
+drlabs-transport = { workspace = true }
+drlabs-moteus = { workspace = true }
+drlabs-dynamixel = { workspace = true }
+drlabs-robstride = { workspace = true }
+drlabs-odrive = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

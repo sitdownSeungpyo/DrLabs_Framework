@@ -1,0 +1,23 @@
+[package]
+name = "drlabs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The framework's command line front end"
+
+[[bin]]
+name = "drlabs"
+path = "src/main.rs"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-robot = { workspace = true }
+drlabs-session = { workspace = true }
+drlabs-transport = { workspace = true }
+drlabs-moteus = { workspace = true }
+drlabs-dynamixel = { workspace = true }
+drlabs-robstride = { workspace = true }
+drlabs-odrive = { workspace = true }
+thiserror = { workspace = true }

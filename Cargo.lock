@@ -11,6 +11,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "drlabs-dynamixel"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-transport",
+ "thiserror",
+]
+
+[[package]]
 name = "drlabs-moteus"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "drlabs-dynamixel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ROBOTIS Dynamixel servos over Protocol 2.0"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-transport = { workspace = true }
+thiserror = { workspace = true }

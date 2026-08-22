@@ -7,6 +7,7 @@ members = [
     "crates/drlabs-core",
     "crates/drlabs-timing",
     "crates/drlabs-transport",
+    "crates/drivers/drlabs-dynamixel",
     "crates/drivers/drlabs-moteus",
 ]
 
@@ -21,6 +22,7 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 drlabs-core = { path = "crates/drlabs-core" }
 drlabs-timing = { path = "crates/drlabs-timing" }
 drlabs-transport = { path = "crates/drlabs-transport" }
+drlabs-dynamixel = { path = "crates/drivers/drlabs-dynamixel" }
 drlabs-moteus = { path = "crates/drivers/drlabs-moteus" }
 
 serde = { version = "1", features = ["derive"] }

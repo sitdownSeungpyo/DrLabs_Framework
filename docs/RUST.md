@@ -72,9 +72,16 @@ Three changes from the Go tree, all aimed at reading it six months from now:
   you look for them nor what they are.
 * **Descriptions live in one place.** `configs/`, rather than split between
   `test/*.json` and `examples/robots/*.json`.
-* **`legacy/dxl` is ported, not preserved as a second tree.** It exists in Go
-  because callers had not moved over yet; the Rust tree has one Dynamixel
-  driver.
+* **`legacy/dxl` is ported, not preserved as a second tree.** The Go tree
+  carried three Dynamixel layers that had accumulated rather than been
+  designed: `legacy/dxl`, `drivers/dynamixel/driver.go`, and the `Link` that
+  replaced them. Every *capability* of the older two is in the Rust driver —
+  register access, ping, reboot, factory reset, and the sync read and sync
+  write that let a daisy chain move on one period instead of one per servo.
+  What is gone is the goroutine-and-channel calling convention the oldest layer
+  wrapped around them. That was a way of calling the driver, not something the
+  driver could do, and a second copy of it would mean two places to fix the
+  next time the wire turns out to work differently than anyone thought.
 
 ## Progress
 
@@ -84,7 +91,7 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-timing` | done | 7 passing |
 | `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
 | `drlabs-moteus` | complete: protocol, frames, driver, console | 66 passing |
-| `drlabs-dynamixel` | not started | |
+| `drlabs-dynamixel` | complete: protocol, driver, sync read/write, link | 30 passing |
 | `drlabs-robstride` | not started | |
 | `drlabs-odrive` | not started | |
 | `drlabs-safety` | not started | |

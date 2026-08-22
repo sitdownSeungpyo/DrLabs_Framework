@@ -22,8 +22,23 @@ dependencies = [
 name = "drlabs-timing"
 version = "0.1.0"
 dependencies = [
- "windows-sys",
+ "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "drlabs-transport"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "libc"
+version = "0.2.189"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "proc-macro2"
@@ -120,6 +135,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
 
 [[package]]
 name = "windows-sys"

@@ -432,8 +432,9 @@ mod tests {
             ignore_position_bounds: val(0.0),
             ..Default::default()
         };
-        let want = format!(
-            "{}{}{}{}{}{}{}{}{}{}{}{}",
+        // Assembled from the pieces the reference produces, so a mismatch
+        // points at one subframe rather than at a wall of hex.
+        let want = [
             "01000A",
             "0A20",
             "2DCFFFFF00000000",
@@ -445,8 +446,10 @@ mod tests {
             "2800",
             "0A28F04902001FA10700", // velocity limit, accel limit
             "052BFF7F",             // ilimit scale
-            format!("012D00{FAST_QUERY_SUFFIX}"), // ignore position bounds
-        );
+            "012D00",               // ignore position bounds
+            FAST_QUERY_SUFFIX,
+        ]
+        .concat();
         assert_eq!(
             hex(&position(
                 &command,
@@ -530,8 +533,7 @@ mod tests {
             ilimit_scale: val(1.0),
             ignore_position_bounds: val(0.0),
         };
-        let want = format!(
-            "{}{}{}{}{}{}{}{}{}",
+        let want = [
             "01000D",
             "0A40",
             "D18AFFFF2F750000", // lower -0.3, upper 0.3
@@ -540,8 +542,10 @@ mod tests {
             "0945",
             "F4010000",
             "06462800FF7F", // watchdog, ilimit
-            format!("014800{FAST_QUERY_SUFFIX}"),
-        );
+            "014800",
+            FAST_QUERY_SUFFIX,
+        ]
+        .concat();
         assert_eq!(
             hex(&stay_within(
                 &command,

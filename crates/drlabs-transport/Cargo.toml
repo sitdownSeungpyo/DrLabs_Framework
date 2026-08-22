@@ -1,0 +1,23 @@
+[package]
+name = "drlabs-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Serial ports and CAN buses: the wires under every driver"
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_Communication",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

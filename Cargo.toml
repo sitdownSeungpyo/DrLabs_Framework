@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     "crates/drlabs-core",
     "crates/drlabs-timing",
+    "crates/drlabs-transport",
     "crates/drivers/drlabs-moteus",
 ]
 
@@ -19,6 +20,7 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 [workspace.dependencies]
 drlabs-core = { path = "crates/drlabs-core" }
 drlabs-timing = { path = "crates/drlabs-timing" }
+drlabs-transport = { path = "crates/drlabs-transport" }
 drlabs-moteus = { path = "crates/drivers/drlabs-moteus" }
 
 serde = { version = "1", features = ["derive"] }

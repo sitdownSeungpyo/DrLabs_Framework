@@ -82,7 +82,7 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 |---|---|---|
 | `drlabs-core` | done | 19 passing |
 | `drlabs-timing` | done | 7 passing |
-| `drlabs-transport` | not started | |
+| `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
 | `drlabs-moteus` | protocol and frames done — **reference bytes match**; driver, console to come | 38 passing |
 | `drlabs-dynamixel` | not started | |
 | `drlabs-robstride` | not started | |
@@ -95,6 +95,14 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 
 A crate joins the workspace `members` list when it builds and its tests pass,
 so `cargo test` on this branch is always green.
+
+### Every platform's serial code is at least compiled
+
+The Go tree had a Linux and a macOS serial implementation that nothing on this
+bench had built since they were written. Here `cargo check --target
+x86_64-unknown-linux-gnu` and `--target aarch64-apple-darwin` both pass, so the
+termios path is known to compile even though it cannot be exercised here. That
+is not the same as knowing it works, and it is not claimed to be.
 
 ### The reference bytes match
 

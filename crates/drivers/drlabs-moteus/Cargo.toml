@@ -9,4 +9,5 @@ description = "The mjbots moteus brushless controller: the mjlib multiplex regis
 
 [dependencies]
 drlabs-core = { workspace = true }
+drlabs-transport = { workspace = true }
 thiserror = { workspace = true }

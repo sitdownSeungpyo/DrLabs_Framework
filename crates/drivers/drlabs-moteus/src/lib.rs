@@ -6,7 +6,11 @@
 //! `drlabs_core::Link` and never see a register.
 
 pub mod combiner;
+pub mod controller;
 pub mod frames;
+pub mod hardware;
+pub mod link;
 pub mod multiplex;
 pub mod query;
 pub mod registers;
+pub mod stream;

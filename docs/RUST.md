@@ -83,7 +83,7 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-core` | done | 19 passing |
 | `drlabs-timing` | done | 7 passing |
 | `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
-| `drlabs-moteus` | protocol and frames done — **reference bytes match**; driver, console to come | 38 passing |
+| `drlabs-moteus` | complete: protocol, frames, driver, console | 66 passing |
 | `drlabs-dynamixel` | not started | |
 | `drlabs-robstride` | not started | |
 | `drlabs-odrive` | not started | |

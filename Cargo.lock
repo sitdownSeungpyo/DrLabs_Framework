@@ -15,6 +15,7 @@ name = "drlabs-moteus"
 version = "0.1.0"
 dependencies = [
  "drlabs-core",
+ "drlabs-transport",
  "thiserror",
 ]
 

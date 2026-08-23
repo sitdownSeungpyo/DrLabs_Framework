@@ -58,6 +58,27 @@ pub fn drivers() -> Result<(), String> {
 /// Builds a link for one axis from the command line.
 pub fn link_for(target: &Target) -> Result<Box<dyn Link>, String> {
     match target.driver.as_str() {
+        // A motor that is not there, so the whole stack — state machine,
+        // control loop, safety monitor — runs with nothing plugged in.
+        "sim" | "moteus-sim" | "robstride-sim" => {
+            let physics = drlabs_sim::Physics {
+                inertia: parse_option(target, "inertia", 0.006)?,
+                friction: parse_option(target, "friction", 0.02)?,
+                torque_constant: parse_option(target, "torque_constant", 0.06)?,
+                ..Default::default()
+            };
+            if physics.inertia <= 0.0 || physics.torque_constant <= 0.0 {
+                return Err("inertia and torque_constant must be positive".into());
+            }
+            let kind = match target.driver.as_str() {
+                "moteus-sim" => "moteus-sim",
+                "robstride-sim" => "robstride-sim",
+                _ => "sim",
+            };
+            Ok(Box::new(drlabs_sim::SimLink::with_physics(
+                target.id, kind, physics,
+            )))
+        }
         "moteus" | "robstride" | "odrive" => {
             let port = match target.port.as_str() {
                 "" => auto_detect()?,
@@ -101,6 +122,16 @@ pub fn link_for(target: &Target) -> Result<Box<dyn Link>, String> {
             ))
         }
         other => Err(format!("unknown driver {other:?}")),
+    }
+}
+
+/// A numeric driver option, or its default.
+fn parse_option(target: &Target, name: &str, default: f64) -> Result<f64, String> {
+    match target.options.get(name) {
+        Some(text) => text
+            .parse()
+            .map_err(|_| format!("option {name}={text:?} is not a number")),
+        None => Ok(default),
     }
 }
 

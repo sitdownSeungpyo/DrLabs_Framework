@@ -11,6 +11,7 @@ description = "A machine from a JSON description: joints, buses, and the one con
 drlabs-core = { workspace = true }
 drlabs-safety = { workspace = true }
 drlabs-session = { workspace = true }
+drlabs-sim = { workspace = true }
 drlabs-transport = { workspace = true }
 drlabs-moteus = { workspace = true }
 drlabs-dynamixel = { workspace = true }

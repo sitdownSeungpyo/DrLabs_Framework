@@ -7,6 +7,7 @@
 //! drlabs run     -driver … -id …     run a control session on one axis
 //! drlabs bringup [-check] robot.json bring a whole machine up
 //! drlabs panel   robot.json          bring it up and drive it from a browser
+//! drlabs serve   -driver … -id …     the servo role: energised, over a socket
 //! ```
 //!
 //! Every subcommand goes through the same `Link` and the same session an
@@ -17,6 +18,7 @@ mod bringup;
 mod flags;
 mod panel;
 mod probe;
+mod serve;
 
 use std::process::ExitCode;
 
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
         "run" => probe::run(rest),
         "bringup" => bringup::bringup(rest),
         "panel" => panel::panel(rest),
+        "serve" => serve::serve(rest),
         "-h" | "--help" | "help" => {
             usage();
             return ExitCode::SUCCESS;
@@ -101,9 +104,11 @@ Usage:
                                      description and hold it there
   drlabs panel   [flags] <robot.json>
                                      The same, with a browser panel to drive it
+  drlabs serve   [flags]             The servo role: energise one axis and take
+                                     newline-delimited JSON commands over TCP
 
 Common flags:
-  -driver   moteus | dynamixel | robstride | odrive   (default moteus)
+  -driver   moteus | dynamixel | robstride | odrive | sim   (default moteus)
   -port     serial port; empty auto-detects a CAN adapter
   -baud     serial baud rate, Dynamixel only (default 1000000)
   -id       bus address: CAN id or servo id (default 1)
@@ -118,6 +123,19 @@ run flags:
   -max      travel envelope, upper bound (default 0.5)
   -torque   torque ceiling in Nm (default 0.3)
   -velocity velocity ceiling in rev/s (default 1.0)
+
+serve flags:
+  -addr             address to listen on (default 127.0.0.1:7777)
+  -rate             control rate in Hz (default 200)
+  -state-rate       unsolicited state lines a second (default 50, 0 disables)
+  -max-torque       torque ceiling in Nm (default 0.3)
+  -velocity-limit   velocity ceiling in rev/s (default 1.0)
+  -position-min     soft envelope, lower bound in rev (default -0.5)
+  -position-max     soft envelope, upper bound (default 0.5)
+  -command-timeout  seconds of silence after which a velocity or torque
+                    command reverts to holding position (default 1, 0 disables)
+  -deadman          seconds without a client before stopping (0 disables)
+  -no-auto-arm      connect but do not energise until told to
 
 panel flags:
   -addr     address to listen on (default 127.0.0.1:8080)

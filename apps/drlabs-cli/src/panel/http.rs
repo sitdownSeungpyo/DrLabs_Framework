@@ -197,40 +197,21 @@ where
 
 /// Reads a flat `{"name": number}` object.
 ///
-/// A whole JSON parser is not needed for the one shape this panel posts, and
-/// the panel is not the only thing that could post it — so anything that does
-/// not fit the shape is rejected rather than half-read.
+/// Anything that does not fit that shape is rejected rather than half-read: a
+/// target that is not a number must not quietly become zero, which would
+/// command the joint to its origin.
 pub fn parse_pose(body: &str) -> Result<BTreeMap<String, f64>, String> {
-    let trimmed = body.trim();
-    let inner = trimmed
-        .strip_prefix('{')
-        .and_then(|rest| rest.strip_suffix('}'))
-        .ok_or("a pose must be a JSON object")?;
-
-    let mut out = BTreeMap::new();
-    if inner.trim().is_empty() {
-        return Ok(out);
-    }
-    for entry in inner.split(',') {
-        let (key, value) = entry
-            .split_once(':')
-            .ok_or_else(|| format!("{entry:?} is not name: value"))?;
-        let key = key.trim().trim_matches('"');
-        if key.is_empty() {
+    let pose: BTreeMap<String, f64> =
+        serde_json::from_str(body).map_err(|error| error.to_string())?;
+    for (name, value) in &pose {
+        if name.is_empty() {
             return Err("a pose entry has no joint name".into());
         }
-        let value: f64 = value.trim().parse().map_err(|_| {
-            format!(
-                "{key:?} was given {:?}, which is not a number",
-                value.trim()
-            )
-        })?;
         if !value.is_finite() {
-            return Err(format!("{key:?} was given a non-finite target"));
+            return Err(format!("{name:?} was given a non-finite target"));
         }
-        out.insert(key.to_string(), value);
     }
-    Ok(out)
+    Ok(pose)
 }
 
 #[cfg(test)]
@@ -258,6 +239,15 @@ mod tests {
     #[test]
     fn a_pose_entry_without_a_name_is_refused() {
         assert!(parse_pose(r#"{"": 1.0}"#).is_err());
+    }
+
+    /// A non-finite target would reach the physics and poison everything
+    /// downstream of it.
+    #[test]
+    fn a_non_finite_target_is_refused() {
+        // JSON has no NaN literal, so this is the shape a client can actually
+        // send: a number too large to be finite as an f64.
+        assert!(parse_pose(r#"{"j": 1e400}"#).is_err());
     }
 
     /// The panel shows the framework's own messages, and those contain quotes

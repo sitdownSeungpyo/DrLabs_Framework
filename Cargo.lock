@@ -14,7 +14,10 @@ dependencies = [
  "drlabs-robstride",
  "drlabs-safety",
  "drlabs-session",
+ "drlabs-sim",
  "drlabs-transport",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -64,6 +67,7 @@ dependencies = [
  "drlabs-robstride",
  "drlabs-safety",
  "drlabs-session",
+ "drlabs-sim",
  "drlabs-transport",
  "serde",
  "serde_json",
@@ -94,6 +98,13 @@ dependencies = [
  "drlabs-safety",
  "drlabs-timing",
  "thiserror",
+]
+
+[[package]]
+name = "drlabs-sim"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
 ]
 
 [[package]]

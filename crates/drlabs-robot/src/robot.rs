@@ -230,6 +230,11 @@ impl Robot {
                         .with_port_name(&bus.port, baud),
                 ))
             }
+            // A simulated joint needs no bus at all, which is what lets a
+            // whole machine be brought up and exercised on a laptop.
+            "sim" | "moteus-sim" | "robstride-sim" => {
+                Ok(Box::new(drlabs_sim::SimLink::new(config.id as u8)))
+            }
             other => Err(format!("unknown driver {other:?}")),
         }
     }

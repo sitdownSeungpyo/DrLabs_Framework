@@ -8,6 +8,7 @@ members = [
     "crates/drlabs-core",
     "crates/drlabs-robot",
     "crates/drlabs-safety",
+    "crates/drlabs-sim",
     "crates/drlabs-session",
     "crates/drlabs-timing",
     "crates/drlabs-transport",
@@ -28,6 +29,7 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 drlabs-core = { path = "crates/drlabs-core" }
 drlabs-robot = { path = "crates/drlabs-robot" }
 drlabs-safety = { path = "crates/drlabs-safety" }
+drlabs-sim = { path = "crates/drlabs-sim" }
 drlabs-session = { path = "crates/drlabs-session" }
 drlabs-timing = { path = "crates/drlabs-timing" }
 drlabs-transport = { path = "crates/drlabs-transport" }

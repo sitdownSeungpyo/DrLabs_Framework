@@ -1,7 +1,22 @@
-# DrLabs Framework — a pure Go motor control framework
+# DrLabs Framework — a pure Rust motor control framework
 
 One vendor-neutral API, a real-time control loop, and a host-side safety layer,
 for brushless controllers and smart servos alike.
+
+> **This branch is the Rust port.** The framework was written in Go first; this
+> is the same machine control, rebuilt so that units cannot be mixed up at
+> compile time, "not reported" cannot be read as zero, and a robot ships as one
+> 0.7 MB executable plus a JSON file. `docs/RUST.md` is the plan, the progress,
+> and the record of what the bench found. The Go tree is still here and still
+> builds; nothing has been deleted.
+>
+> ```
+> cargo build --release
+> ./target/release/drlabs panel configs/shoulder_pair.json
+> ```
+>
+> That brings a two-joint machine up from its description and serves a browser
+> panel to drive it, with nothing installed on the target but the binary.
 
 **No Cgo. No DLLs. No vendor SDKs.** Every protocol — Dynamixel Protocol 2.0,
 the mjlib multiplex register protocol, the RobStride CAN 2.0B protocol, CAN and

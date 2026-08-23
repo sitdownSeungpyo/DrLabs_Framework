@@ -97,8 +97,8 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-safety` | complete: clamps, trips, presets, preflight | 27 passing |
 | `drlabs-session` | complete: loop, state machine, trajectory, shuttle | 40 passing |
 | `drlabs-robot` | complete: description, joint mapping, atomic pose | 31 passing |
-| `drlabs-cli` | ports, drivers, probe, run, bringup | 8 passing |
-| `drlabs-panel` | not started | |
+| `drlabs-cli` | ports, drivers, probe, run, bringup, panel | 17 passing |
+| `drlabs-panel` | folded into the CLI, assets compiled in | — |
 
 A crate joins the workspace `members` list when it builds and its tests pass,
 so `cargo test` on this branch is always green.
@@ -179,6 +179,7 @@ XL330-M288-T at COM6.
 | flood: poses as fast as a thread can send them | both rates unchanged, nothing tripped |
 | position clamping, both directions | ±5.0 rev commanded → ±0.199 rev against a ±0.2 ceiling |
 | hard kill while armed, then reconnect | re-arms; the latched bus watchdog is cleared |
+| the panel, in a browser | both joints driven from sliders, E-STOP and recovery |
 
 The flood row is the one worth reading. In the Go version that exact scenario
 drove the CAN joint to 801 Hz and the serial joint to 345 Hz until the servo's
@@ -198,6 +199,13 @@ lost the parameter, and re-sent the whole set on every verify cycle. Nothing
 looked broken: the axis held, the loop kept 100 Hz, and the log filled with a
 mismatch that was not one. `nanify` existed; the reader simply never called it.
 
+**A restyled element lost the class it was found by.** Only a browser has this
+one. `render` looked up `.joint-armed`, then assigned `className = "pill
+pill-ok"` — throwing the marker away. The first render worked; every one after
+it hit a null and threw halfway through, so the panel sat on stale numbers with
+its connection pill flickering to "disconnected" while the machine was
+perfectly alive and the server was answering every request with a 200.
+
 **Connecting never opened the link.** `Session::connect` described and
 identified the link but never called `open`, which is where a driver takes
 control of what the last session left — a moteus still driving, a Dynamixel
@@ -206,5 +214,14 @@ armed and held position, so nothing reported an error. It just ran at 44 Hz
 against a 100 Hz configuration, because an unopened port keeps its default
 ten-millisecond read timeout and the loop reads twice a cycle. Opening it took
 the same loop to exactly 100.
+
+### One binary, 0.7 MB
+
+`cargo build --release` produces a single `drlabs.exe` of 0.7 MB: four drivers,
+serial and CAN transports for three platforms, the safety layer, the control
+loop, the robot layer, the command line and the web panel with its assets
+compiled in. Nothing else has to be on the target — which was the point.
+
+The release binary was run against the live pair, not just built.
 
 Nothing here is claimed as working on the strength of it having compiled.

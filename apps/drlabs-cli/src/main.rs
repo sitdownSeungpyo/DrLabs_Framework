@@ -6,6 +6,7 @@
 //! drlabs probe   -driver … -id …     connect, identify, report, disconnect
 //! drlabs run     -driver … -id …     run a control session on one axis
 //! drlabs bringup [-check] robot.json bring a whole machine up
+//! drlabs panel   robot.json          bring it up and drive it from a browser
 //! ```
 //!
 //! Every subcommand goes through the same `Link` and the same session an
@@ -14,6 +15,7 @@
 
 mod bringup;
 mod flags;
+mod panel;
 mod probe;
 
 use std::process::ExitCode;
@@ -34,6 +36,7 @@ fn main() -> ExitCode {
         "probe" => probe::probe(rest),
         "run" => probe::run(rest),
         "bringup" => bringup::bringup(rest),
+        "panel" => panel::panel(rest),
         "-h" | "--help" | "help" => {
             usage();
             return ExitCode::SUCCESS;
@@ -96,6 +99,8 @@ Usage:
   drlabs bringup [flags] <robot.json>
                                      Bring a whole machine up from a
                                      description and hold it there
+  drlabs panel   [flags] <robot.json>
+                                     The same, with a browser panel to drive it
 
 Common flags:
   -driver   moteus | dynamixel | robstride | odrive   (default moteus)
@@ -113,6 +118,10 @@ run flags:
   -max      travel envelope, upper bound (default 0.5)
   -torque   torque ceiling in Nm (default 0.3)
   -velocity velocity ceiling in rev/s (default 1.0)
+
+panel flags:
+  -addr     address to listen on (default 127.0.0.1:8080)
+  -check    validate the description and exit
 
 bringup flags:
   -check    validate the description and print the plan, opening nothing

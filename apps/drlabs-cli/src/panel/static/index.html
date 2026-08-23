@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>drlabs robot panel</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="robot-name">robot</h1>
+      <p id="robot-detail" class="muted"></p>
+    </div>
+    <span id="connection" class="pill pill-off">connecting</span>
+  </header>
+
+  <main>
+    <section id="joints" class="joints">
+      <p class="muted">Waiting for the robot…</p>
+    </section>
+
+    <section class="controls">
+      <button id="hold" class="btn">Hold where they are</button>
+      <button id="stop" class="btn">Stop (release)</button>
+      <button id="reset" class="btn">Clear e-stop</button>
+      <button id="estop" class="btn btn-estop">E-STOP</button>
+    </section>
+
+    <p id="message" class="message" role="status" aria-live="polite"></p>
+
+    <p class="muted note">
+      The sliders are bounded by the description this panel was started with.
+      The envelope that actually protects the machine is enforced underneath —
+      this panel is refused there like any other client.
+    </p>
+  </main>
+
+  <template id="joint-template">
+    <article class="joint">
+      <div class="joint-head">
+        <h2 class="joint-name"></h2>
+        <span class="joint-driver muted"></span>
+        <span class="joint-mode pill pill-off">—</span>
+        <span class="joint-armed pill pill-off">disarmed</span>
+      </div>
+
+      <input class="joint-slider" type="range" step="0.005" disabled>
+
+      <div class="joint-scale muted">
+        <span class="joint-min"></span>
+        <span class="joint-max"></span>
+      </div>
+
+      <dl class="joint-readout">
+        <div><dt>commanded</dt><dd class="joint-command">—</dd></div>
+        <div><dt>position</dt><dd class="joint-position">—</dd></div>
+        <div><dt>target</dt><dd class="joint-target">—</dd></div>
+        <div><dt>torque</dt><dd class="joint-torque">—</dd></div>
+        <div><dt>rate</dt><dd class="joint-rate">—</dd></div>
+        <div><dt>note</dt><dd class="joint-note">—</dd></div>
+      </dl>
+    </article>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>

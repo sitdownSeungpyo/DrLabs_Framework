@@ -7,8 +7,11 @@ for brushless controllers and smart servos alike.
 > is the same machine control, rebuilt so that units cannot be mixed up at
 > compile time, "not reported" cannot be read as zero, and a robot ships as one
 > 0.7 MB executable plus a JSON file. `docs/RUST.md` is the plan, the progress,
-> and the record of what the bench found. The Go tree is still here and still
-> builds; nothing has been deleted.
+> and the record of what the bench found.
+>
+> The Go tree is gone from *this branch* — every feature it had is here and was
+> verified on hardware. It is untouched on `main`, and in this repository's
+> history: `git show main:drivers/moteus/link.go` still works.
 >
 > ```
 > cargo build --release
@@ -18,14 +21,15 @@ for brushless controllers and smart servos alike.
 > That brings a two-joint machine up from its description and serves a browser
 > panel to drive it, with nothing installed on the target but the binary.
 
-**No Cgo. No DLLs. No vendor SDKs.** Every protocol — Dynamixel Protocol 2.0,
-the mjlib multiplex register protocol, the RobStride CAN 2.0B protocol, CAN and
-CAN-FD framing, the fdcanusb line protocol, and the platform serial ports
-underneath them — is implemented in this repository in pure Go.
+**No C. No DLLs. No vendor SDKs.** Every protocol — Dynamixel Protocol 2.0, the
+mjlib multiplex register protocol, the RobStride CAN 2.0B protocol, ODrive's
+CANSimple, CAN and CAN-FD framing, the fdcanusb line protocol, and the platform
+serial ports underneath them — is implemented in this repository in safe Rust,
+with the Win32 and termios calls each behind one audited module.
 
 ```
-go build ./...
-go run ./cmd/drlabs run -driver moteus-sim -mode position -position 0.25
+cargo build --release
+./target/release/drlabs run -driver sim -position 0.25
 ```
 
 That last command runs the complete stack — state machine, control loop, safety

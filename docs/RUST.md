@@ -103,6 +103,24 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 A crate joins the workspace `members` list when it builds and its tests pass,
 so `cargo test` on this branch is always green.
 
+`drlabs-sim` is one simulator, not one per driver. The Go tree had a `sim.go` in
+the moteus package and another in the robstride one; the physics in both was the
+same rotor, the same friction and the same inner loop, differing only in what
+they called their modes. Two copies of an integrator is two places for it to
+drift.
+
+### The Go tree is gone from this branch
+
+Every feature it had is here, and each was exercised on hardware or against the
+simulator before the source was removed — including the two that were missing
+when the port was first called complete: the simulator itself, and the servo
+role (`drlabs serve`, newline-delimited JSON over TCP).
+
+It is untouched on `main`, and in this repository's history. Keeping both on one
+branch would mean two places to fix the next time a wire detail turns out to
+work differently than anyone thought, which is the opposite of why this port
+was done.
+
 ### The rate ceiling is checked by reproducing the runaway
 
 The worst defect the Go version had on this bench was not a wrong number, it

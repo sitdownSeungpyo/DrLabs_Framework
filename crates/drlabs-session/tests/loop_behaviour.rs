@@ -14,7 +14,7 @@ use drlabs_core::error::Result;
 use drlabs_core::link::{BoardStatus, Capabilities, Envelope, Identity, Link};
 use drlabs_core::telemetry::Telemetry;
 use drlabs_core::units::{Amps, Celsius, Rev, RevPerSec, Volts};
-use drlabs_session::{Options, Session};
+use drlabs_session::{Connection, Options, Session};
 
 /// A controller that always answers, instantly, and counts how often it was
 /// asked.
@@ -293,6 +293,11 @@ fn the_status_reports_a_measured_rate() {
     );
     assert!(status.cycles > 20);
     assert_eq!(status.timeouts, 0);
+    assert!(
+        status.transaction.count > 20,
+        "transaction stats should be populated: {:?}",
+        status.transaction
+    );
 }
 
 /// Found on the bench, on an XL330 at 1 Mbaud.
@@ -314,4 +319,81 @@ fn connecting_opens_the_link() {
         1,
         "connect must open the link exactly once"
     );
+}
+
+/// A transport error mid-cycle is a link the driver has declared dead — the
+/// clearest case being the moteus full-deadline timeout, where every retry
+/// holds the shared adapter for the whole budget. The loop must latch the
+/// e-stop, close the link, and disconnect, rather than retry it five times.
+#[test]
+fn a_transport_error_tears_the_link_down() {
+    #[derive(Clone, Default)]
+    struct DeadController {
+        closes: Arc<AtomicU64>,
+    }
+
+    impl Link for DeadController {
+        fn kind(&self) -> &'static str {
+            "dead"
+        }
+        fn describe(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn open(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn identify(&mut self) -> Result<Option<Identity>> {
+            Ok(Some(Identity {
+                board: "dead controller".into(),
+                status: BoardStatus::Supported,
+                ..Identity::new("dead")
+            }))
+        }
+        fn cycle(&mut self, _command: &Command, _profile: QueryProfile) -> Result<Option<Telemetry>> {
+            Err(drlabs_core::error::Error::transport(
+                "test transaction",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply"),
+            ))
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn envelope(&self) -> Option<Envelope> {
+            None
+        }
+    }
+
+    let controller = DeadController::default();
+    let session = Session::new(Options {
+        rate_hz: 100,
+        auto_arm: false,
+        require_acknowledgement: false,
+        ..Default::default()
+    });
+    session
+        .connect(Box::new(controller.clone()), false)
+        .expect("the dead controller still connects");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    let status = session.status();
+    assert_eq!(
+        status.connection,
+        Connection::Disconnected,
+        "the loop kept a dead link"
+    );
+    let estop = status.estop.expect("no e-stop latched");
+    assert_eq!(estop.code, "link_error");
+    assert!(
+        controller.closes.load(Ordering::Relaxed) >= 1,
+        "the link was dropped without being closed"
+    );
+
+    // And the loop is idle on it now: no further cycles hammer a dead bus.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(controller.closes.load(Ordering::Relaxed), 1);
 }

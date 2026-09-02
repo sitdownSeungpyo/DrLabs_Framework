@@ -111,6 +111,10 @@ pub struct Status {
     pub replies: u64,
     pub timeouts: u64,
     pub jitter: drlabs_timing::Statistics,
+    /// Time spent inside `link.cycle()` — the wire transaction alone,
+    /// as opposed to `jitter`, which measures the loop's cadence. A
+    /// full-query spike shows up here first.
+    pub transaction: drlabs_timing::Statistics,
 }
 
 /// Drives exactly one controller.
@@ -373,6 +377,28 @@ impl Session {
     }
 
     /// Releases the axis without latching anything.
+    /// Turns automatic arming on or off while the session is running.
+    ///
+    /// A robot's joints arm themselves, because there is nobody at the axis to
+    /// press a button. That is right for driving and wrong for anything that
+    /// needs the machine to *stay* released: disarming a joint that arms itself
+    /// again on the next cycle is not releasing it, and an operator who was
+    /// told the machine is limp would be leaning on a live one.
+    pub fn set_auto_arm(&self, enabled: bool) {
+        let mut state = self.shared.state();
+        if state.auto_arm == enabled {
+            return;
+        }
+        state.auto_arm = enabled;
+        state.auto_arm_reported_at = None;
+        drop(state);
+        self.signal();
+    }
+
+    pub fn auto_arm(&self) -> bool {
+        self.shared.state().auto_arm
+    }
+
     pub fn disarm(&self, reason: &str) {
         let mut state = self.shared.state();
         if !state.armed {
@@ -752,7 +778,12 @@ impl Session {
             cycles: state.stats.cycles,
             replies: state.stats.replies,
             timeouts: state.stats.timeouts,
-            jitter: drlabs_timing::summarise(&state.stats.periods),
+            // Collected out of the ring: `summarise` wants a slice, and this
+            // runs at status-poll rate, not loop rate.
+            jitter: drlabs_timing::summarise(&Vec::from_iter(state.stats.periods.iter().copied())),
+            transaction: drlabs_timing::summarise(&Vec::from_iter(
+                state.stats.durations.iter().copied(),
+            )),
         }
     }
 
@@ -791,9 +822,10 @@ fn achieved_rate(state: &State) -> f64 {
     if window.len() < 2 {
         return 0.0;
     }
-    let span = window[window.len() - 1]
-        .duration_since(window[0])
-        .as_secs_f64();
+    let (Some(first), Some(last)) = (window.front(), window.back()) else {
+        return 0.0;
+    };
+    let span = last.duration_since(*first).as_secs_f64();
     if span <= 0.0 {
         return 0.0;
     }

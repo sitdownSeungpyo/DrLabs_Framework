@@ -348,7 +348,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
         let status = session.status();
         print!(
-            "\r{:>8.4} rev  {:>7.3} rev/s  {:>6.2} A  {:>5.1} V  {:>4.0} Hz  {}   ",
+            "\r{:>8.4} rev  {:>7.3} rev/s  {:>6.2} A  {:>5.1} V  {:>4.0} Hz  tx {:>5.2}/{:>5.2}/{:>5.2} ms  {}   ",
             status
                 .telemetry
                 .position
@@ -370,6 +370,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .map(|v| v.value())
                 .unwrap_or(f64::NAN),
             status.achieved_rate_hz,
+            status.transaction.mean.as_secs_f64() * 1e3,
+            status.transaction.p95.as_secs_f64() * 1e3,
+            status.transaction.max.as_secs_f64() * 1e3,
             if status.armed { "armed" } else { "idle " }
         );
         use std::io::Write;

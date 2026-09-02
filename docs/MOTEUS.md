@@ -314,3 +314,16 @@ loop turned a 0-in-400 loss rate into 400-in-400.
 wedged adapter, not to enforce the period, and when it fires the link should be
 torn down rather than reused. A single missed reply inside the budget is
 reported as a dropped cycle (nil telemetry, nil error), not as a failure.
+
+The Rust link now acts on "torn down rather than reused". A transaction that
+consumed the whole two-second budget comes back from `cycle` as a transport
+error, not as a dropped cycle, and the session's control loop closes the link
+and disconnects on it. This is the difference between one two-second stall and
+five: the recv held the shared bus the whole while, and reporting a droppable
+timeout would let four more of those stalls accrue before comm_loss latched —
+about ten seconds during which every other joint on the adapter also stood
+still. A reply that simply does not arrive within the budget, without
+consuming it, is still a dropped cycle. The motor itself is stopped by its own
+watchdog, carried on every command frame; what the teardown protects is the
+rest of the bus and the operator's ten seconds. Reopening the adapter is the
+operator's move — the bus may be shared with joints the session does not own.

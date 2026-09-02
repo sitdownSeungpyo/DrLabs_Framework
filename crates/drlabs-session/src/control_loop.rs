@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use drlabs_core::command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
+use drlabs_core::error::Error;
 use drlabs_core::link::Link;
 use drlabs_core::render::render;
 use drlabs_core::units::{Nm, Rev, RevPerSec};
@@ -119,6 +120,14 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
         }
     };
 
+    // A Transport error (or a link closed underneath the loop) is a link the
+    // driver has declared unusable — not a dropped cycle. It must be closed,
+    // not retried: the clearest case is the moteus full-deadline timeout,
+    // where each retry holds the shared bus for the whole two-second budget
+    // and freezes every other joint on the adapter with it. A plain Timeout
+    // stays what it always was — one dropped cycle, counted and survived.
+    let link_dead = matches!(&outcome, Err(Error::Transport { .. }) | Err(Error::Closed));
+
     let mut trip: Option<Trip> = None;
     let mut estop: Option<EStop> = None;
     let rate_warning: Option<(String, String)>;
@@ -129,9 +138,9 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
         state.stats.cycles += 1;
         LoopStats::record(&mut state.stats.durations, started.elapsed());
         if state.stats.rate_window.len() >= RATE_WINDOW {
-            state.stats.rate_window.remove(0);
+            state.stats.rate_window.pop_front();
         }
-        state.stats.rate_window.push(started);
+        state.stats.rate_window.push_back(started);
 
         match outcome {
             Err(error) => {
@@ -170,8 +179,12 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
                 state.telemetry.merge(&telemetry);
 
                 let elapsed = started.duration_since(state.started_at);
-                let snapshot = state.telemetry.clone();
-                state.samples.append(elapsed, &snapshot);
+                {
+                    // Disjoint fields through one reborrow: no Telemetry
+                    // clone (four heap strings) inside the state lock.
+                    let state = &mut *state;
+                    state.samples.append(elapsed, &state.telemetry);
+                }
 
                 if let Some(fault) = &state.telemetry.fault {
                     if fault.hard {
@@ -184,8 +197,8 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
 
                 let armed = state.armed;
                 let now = Instant::now();
-                let telemetry = state.telemetry.clone();
-                trip = state.monitor.evaluate(&telemetry, &command, armed, now);
+                let state = &mut *state;
+                trip = state.monitor.evaluate(&state.telemetry, &command, armed, now);
             }
         }
 
@@ -237,6 +250,28 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
         } else if let Some(estop) = estop {
             latch_estop(shared, estop);
         }
+    }
+
+    if link_dead {
+        // Close and drop the link, and say so. The motor itself is stopped by
+        // its own watchdog, which every cycle's command carries; what is being
+        // protected here is the rest of the bus, and the operator's ten
+        // seconds. Reconnecting is the operator's move — a link that died
+        // mid-cycle is not one to quietly reopen.
+        if let Some(mut link) = shared.link.lock().expect("link poisoned").take() {
+            let _ = link.close();
+        }
+        let mut state = shared.state();
+        state.armed = false;
+        state.connection = Connection::Disconnected;
+        state.connect_error = "the link failed mid-cycle and was closed".into();
+        state.shuttle.stop("link error");
+        state.trajectory.running = false;
+        state.log(
+            Level::Error,
+            "Link torn down",
+            "A transport failure ended the session; reconnect to continue.",
+        );
     }
 }
 
@@ -507,9 +542,10 @@ fn check_achieved_rate(
         return None;
     }
     let window = &state.stats.rate_window;
-    let span = window[window.len() - 1]
-        .duration_since(window[0])
-        .as_secs_f64();
+    let (Some(first), Some(last)) = (window.front(), window.back()) else {
+        return None;
+    };
+    let span = last.duration_since(*first).as_secs_f64();
     if span <= 0.0 {
         return None;
     }
@@ -560,9 +596,9 @@ fn try_auto_arm(state: &mut State) {
         return;
     }
 
-    let telemetry = state.telemetry.clone();
-    let identity = state.identity.clone();
-    let preflight = state.monitor.preflight(identity.as_ref(), &telemetry, true);
+    let preflight = state
+        .monitor
+        .preflight(state.identity.as_ref(), &state.telemetry, true);
 
     if !preflight.may_arm() {
         // Say why, but once a second rather than at the control rate.

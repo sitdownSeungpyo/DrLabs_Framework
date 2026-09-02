@@ -151,10 +151,13 @@ pub struct LoopStats {
     pub timeouts: u64,
     pub consecutive_timeouts: u32,
 
-    /// Transaction times and measured intervals between cycles.
-    pub durations: Vec<Duration>,
-    pub periods: Vec<Duration>,
-    pub rate_window: Vec<Instant>,
+    /// Transaction times and measured intervals between cycles. Ring-shaped:
+    /// a full window drops from the front, which on a `VecDeque` is a pointer
+    /// bump where `Vec::remove(0)` was a six-kilobyte memmove per cycle,
+    /// inside the state lock.
+    pub durations: std::collections::VecDeque<Duration>,
+    pub periods: std::collections::VecDeque<Duration>,
+    pub rate_window: std::collections::VecDeque<Instant>,
 
     pub last_cycle_at: Option<Instant>,
     pub rate_warned_at: Option<Instant>,
@@ -164,11 +167,11 @@ pub const STATS_WINDOW: usize = 400;
 pub const RATE_WINDOW: usize = 200;
 
 impl LoopStats {
-    pub fn record(sample: &mut Vec<Duration>, value: Duration) {
+    pub fn record(sample: &mut std::collections::VecDeque<Duration>, value: Duration) {
         if sample.len() >= STATS_WINDOW {
-            sample.remove(0);
+            sample.pop_front();
         }
-        sample.push(value);
+        sample.push_back(value);
     }
 }
 

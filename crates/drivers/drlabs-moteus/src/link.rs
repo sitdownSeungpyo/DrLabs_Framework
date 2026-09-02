@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use drlabs_core::command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
 use drlabs_core::error::{Error, Result};
@@ -508,8 +508,29 @@ impl Link for MoteusLink {
             payload.extend_from_slice(&data);
         }
 
+        let started = Instant::now();
         match self.controller.transact(&bus, &payload, expect_reply)? {
             Some(values) => Ok(Some(decode(&values))),
+            // A reply that never came and consumed the whole transaction
+            // deadline is not a dropped cycle — it is the controller's
+            // "tear this link down rather than reuse it" case that the
+            // timeout's own comment describes. Recv held the shared bus the
+            // whole while, and every joint on the adapter stood still for
+            // it; reporting a droppable timeout here would buy four more of
+            // those stalls before comm_loss latched. A Transport error is
+            // the session's signal to close the link instead.
+            None if expect_reply && started.elapsed() >= self.controller.timeout => {
+                Err(Error::transport(
+                    "moteus transaction",
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "no reply within {:?}; the adapter's pending state                              can no longer be trusted",
+                            self.controller.timeout
+                        ),
+                    ),
+                ))
+            }
             None => Ok(None),
         }
     }
@@ -622,6 +643,63 @@ mod tests {
         }
         fn drain(&mut self, _quiet: Duration) -> drlabs_transport::can::Result<()> {
             Ok(())
+        }
+    }
+
+    /// The controller timeout's own comment says a transaction that consumed
+    /// the whole deadline leaves the adapter in a state that must not be
+    /// reused. The link now says so in its type: a full-deadline expiry comes
+    /// back as a Transport error, which is the session's signal to close the
+    /// link, where a plain dropped cycle stays `Ok(None)`.
+    #[test]
+    fn a_transaction_that_consumes_the_whole_deadline_is_a_dead_link() {
+        struct SilentBus;
+        impl drlabs_transport::can::Bus for SilentBus {
+            fn send(
+                &mut self,
+                _frame: &drlabs_transport::can::Frame,
+            ) -> drlabs_transport::can::Result<()> {
+                Ok(())
+            }
+            fn recv(
+                &mut self,
+                timeout: Duration,
+            ) -> drlabs_transport::can::Result<drlabs_transport::can::Frame> {
+                // A real adapter with nothing to say burns the whole budget.
+                std::thread::sleep(timeout);
+                Err(drlabs_transport::can::Error::Timeout)
+            }
+            fn drain(&mut self, _quiet: Duration) -> drlabs_transport::can::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut link = MoteusLink::new(Arc::new(SharedBus::new(Box::new(SilentBus))), 1);
+        link.controller.timeout = Duration::from_millis(20);
+        let command = Command {
+            position: Field::Set(Rev(0.0)),
+            ..Command::new(Mode::Position)
+        };
+
+        match link.cycle(&command, QueryProfile::Fast) {
+            Err(Error::Transport { .. }) => {}
+            other => panic!("expected a Transport error, got {other:?}"),
+        }
+    }
+
+    /// An adapter that says "nothing here" without burning the deadline is
+    /// still a dropped cycle, not a dead link.
+    #[test]
+    fn a_quick_empty_answer_is_still_a_dropped_cycle() {
+        let mut link = link(); // NullBus: recv gives up immediately
+        let command = Command {
+            position: Field::Set(Rev(0.0)),
+            ..Command::new(Mode::Position)
+        };
+
+        match link.cycle(&command, QueryProfile::Fast) {
+            Ok(None) => {}
+            other => panic!("expected a dropped cycle, got {other:?}"),
         }
     }
 

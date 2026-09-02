@@ -11,11 +11,11 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use drlabs_core::units::Rad;
-use drlabs_robot::{Config, Robot};
+use drlabs_core::units::{Rad, RadPerSec, RadPerSec2};
+use drlabs_robot::{Config, RangeLearner, Robot};
 
 use crate::flags::{Flags, Kind};
-use http::{parse_pose, quote, Request, Response};
+use http::{parse_learn, parse_limits, parse_move, parse_pose, quote, Request, Response};
 
 const INDEX: &str = include_str!("static/index.html");
 const APP_JS: &str = include_str!("static/app.js");
@@ -58,6 +58,7 @@ pub fn panel(args: &[String]) -> Result<(), String> {
     println!("  Ctrl+C to stop\n");
 
     let robot = Arc::new(robot);
+    let learner = RangeLearner::new();
 
     // The deadman wants to hear from a supervisor. The panel polls, but a
     // browser that has been closed does not, and the machine should not be left
@@ -69,12 +70,27 @@ pub fn panel(args: &[String]) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(200));
     });
 
-    let serving = robot.clone();
-    http::serve(listener, move |request| handle(&serving, request));
+    let ctx = Arc::new(Panel {
+        robot: robot.clone(),
+        learner,
+        path: std::path::PathBuf::from(&path),
+    });
+    http::serve(listener, move |request| handle(&ctx, request));
     Ok(())
 }
 
-fn handle(robot: &Robot, request: &Request) -> Response {
+/// What a request handler needs: the machine, the recorder, and the file the
+/// machine was described by.
+struct Panel {
+    robot: Arc<Robot>,
+    learner: RangeLearner,
+    /// The description this panel was started with. Edited limits go back to
+    /// exactly this file and nowhere else.
+    path: std::path::PathBuf,
+}
+
+fn handle(ctx: &Panel, request: &Request) -> Response {
+    let robot: &Robot = &ctx.robot;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => Response::html(INDEX),
         ("GET", "/app.js") => Response::javascript(APP_JS),
@@ -93,6 +109,74 @@ fn handle(robot: &Robot, request: &Request) -> Response {
                     Err(error) => Response::refused(&error.to_string()),
                 }
             }
+        },
+
+        // A profiled move: the sliders set a target directly, this plans one.
+        // Both the per-joint "go" and the whole-body buttons come through here,
+        // because "every joint to zero" and "one joint to zero" differ only in
+        // how many names are in the request.
+        ("POST", "/api/move") => match parse_move(&request.body) {
+            Err(reason) => Response::refused(&reason),
+            Ok(request) => {
+                let result = match &request.pose {
+                    Some(pose) => robot.move_to_pose(
+                        pose,
+                        RadPerSec(request.max_velocity),
+                        RadPerSec2(request.accel),
+                    ),
+                    None => {
+                        let targets = request
+                            .targets
+                            .iter()
+                            .map(|(name, &value)| (name.clone(), Rad(value)))
+                            .collect();
+                        robot.move_many(
+                            &targets,
+                            RadPerSec(request.max_velocity),
+                            RadPerSec2(request.accel),
+                        )
+                    }
+                };
+                match result {
+                    Ok(()) => Response::json("{\"ok\":true}".into()),
+                    Err(error) => Response::refused(&error.to_string()),
+                }
+            }
+        },
+
+        // Teach mode. Releasing the joints is the point rather than a side
+        // effect: a joint under torque holds its target, so the only travel it
+        // would report is the one the loop asked for.
+        ("POST", "/api/learn/start") => match parse_learn(&request.body) {
+            Err(reason) => Response::refused(&reason),
+            Ok(seconds) => match ctx.learner.start(ctx.robot.clone(), seconds) {
+                Ok(()) => Response::json("{\"ok\":true}".into()),
+                Err(reason) => Response::refused(&reason),
+            },
+        },
+        ("POST", "/api/learn/stop") => {
+            ctx.learner.stop();
+            Response::json("{\"ok\":true}".into())
+        }
+        ("POST", "/api/learn/clear") => {
+            ctx.learner.clear();
+            Response::json("{\"ok\":true}".into())
+        }
+        ("GET", "/api/learn") => Response::json(learn_json(&ctx.learner, robot)),
+
+        // Edited limits go back to the description. Nothing here changes the
+        // running machine: the mapping and the envelope were built when it came
+        // up, and rebuilding them underneath a live joint is not something to
+        // do from a web request.
+        ("POST", "/api/limits") => match parse_limits(&request.body) {
+            Err(reason) => Response::refused(&reason),
+            Ok(edits) => match Config::write_limits(&ctx.path, &edits) {
+                Ok(_) => Response::json(format!(
+                    "{{\"ok\":true,\"written\":{},\"restart_required\":true}}",
+                    quote(&ctx.path.display().to_string())
+                )),
+                Err(error) => Response::refused(&error.0),
+            },
         },
 
         ("POST", "/api/estop") => {
@@ -155,7 +239,7 @@ fn state_json(robot: &Robot) -> String {
               \"min_rad\":{},\"max_rad\":{},\
               \"armed\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
               \"position_rad\":{},\"target_rad\":{},\"torque_nm\":{},\
-              \"voltage_v\":{},\"rate_hz\":{},\"fault_name\":{},\"blocked\":[{}]}}",
+              \"voltage_v\":{},\"rate_hz\":{},\"fault_name\":{},              \"moving_to_rad\":{},\"progress\":{},\"blocked\":[{}]}}",
             quote(&state.name),
             quote(&config.driver),
             quote(&config.bus),
@@ -172,15 +256,58 @@ fn state_json(robot: &Robot) -> String {
             number(state.voltage_v),
             number(Some(state.rate_hz)),
             quote(&state.fault_name),
+            number(state.moving_to_rad),
+            number(Some(state.progress)),
             blocked.join(",")
         ));
     }
 
+    // The poses come from the description, so the panel grows a button when the
+    // machine grows a pose and nothing has to be rebuilt.
+    let poses: Vec<String> = robot.pose_names().iter().map(|name| quote(name)).collect();
+
     format!(
-        "{{\"robot\":{},\"rate_hz\":{},\"connected\":{},\"joints\":[{}]}}",
+        "{{\"robot\":{},\"rate_hz\":{},\"connected\":{},\"poses\":[{}],\"joints\":[{}]}}",
         quote(&robot.config.robot),
         robot.config.rate_hz,
         !states.is_empty(),
+        poses.join(","),
+        joints.join(",")
+    )
+}
+
+/// What teach mode has seen, next to what the description says today.
+fn learn_json(learner: &RangeLearner, robot: &Robot) -> String {
+    let status = learner.status(robot);
+    let number = |value: Option<f64>| match value {
+        Some(value) if value.is_finite() => format!("{value}"),
+        _ => "null".into(),
+    };
+
+    let joints: Vec<String> = status
+        .joints
+        .iter()
+        .map(|joint| {
+            format!(
+                "{{\"name\":{},\"min_rad\":{},\"max_rad\":{},\"current_rad\":{},                  \"span_rad\":{},\"samples\":{},                  \"configured_min_rad\":{},\"configured_max_rad\":{},\"direction\":{}}}",
+                quote(&joint.name),
+                number(joint.min_rad),
+                number(joint.max_rad),
+                number(joint.current_rad),
+                number(joint.span_rad()),
+                joint.samples,
+                joint.configured_min_rad,
+                joint.configured_max_rad,
+                joint.direction,
+            )
+        })
+        .collect();
+
+    format!(
+        "{{\"running\":{},\"elapsed_s\":{:.2},\"remaining_s\":{:.2},\"joints\":[{}]}}",
+        status.running,
+        status.elapsed_s,
+        status.remaining_s,
         joints.join(",")
     )
 }
@@ -196,6 +323,99 @@ mod tests {
         assert!(INDEX.contains("joint-template"), "the markup is missing");
         assert!(APP_JS.contains("/api/state"), "the script is missing");
         assert!(STYLE.contains("btn-estop"), "the styles are missing");
+    }
+
+    /// The controls that move the machine are served from the binary too, and a
+    /// button whose markup, script or style went missing is a panel that looks
+    /// finished and does nothing when pressed.
+    #[test]
+    fn the_move_controls_are_wired_end_to_end() {
+        for id in ["go-zero", "move-velocity", "poses"] {
+            assert!(INDEX.contains(id), "the markup has no {id}");
+            assert!(APP_JS.contains(id), "the script never looks up {id}");
+        }
+        for class in ["joint-go", "joint-zero", "joint-goal"] {
+            assert!(INDEX.contains(class), "the joint template has no {class}");
+            assert!(APP_JS.contains(class), "the script never looks up {class}");
+        }
+        assert!(
+            APP_JS.contains("/api/move"),
+            "nothing in the panel plans a trajectory"
+        );
+        assert!(STYLE.contains(".joint-move"), "the move row is unstyled");
+    }
+
+    /// Teach mode has three moving parts — markup, script and the endpoints —
+    /// and a button that reaches an endpoint nobody serves is a panel that
+    /// releases the machine and then records nothing.
+    #[test]
+    fn teach_mode_is_wired_end_to_end() {
+        for id in [
+            "learn-seconds",
+            "learn-start",
+            "learn-stop",
+            "learn-clear",
+            "teach-results",
+        ] {
+            assert!(INDEX.contains(id), "the markup has no {id}");
+            assert!(APP_JS.contains(id), "the script never looks up {id}");
+        }
+        for class in ["teach-min", "teach-max", "teach-direction"] {
+            assert!(INDEX.contains(class), "the row template has no {class}");
+            assert!(APP_JS.contains(class), "the script never reads {class}");
+        }
+        for route in [
+            "/api/learn/start",
+            "/api/learn/stop",
+            "/api/learn/clear",
+            "/api/learn",
+            "/api/limits",
+        ] {
+            assert!(APP_JS.contains(route), "the script never calls {route}");
+        }
+        assert!(
+            STYLE.contains(".teach-table"),
+            "the results table is unstyled"
+        );
+    }
+
+    /// Releasing a fifteen-degree-of-freedom machine drops it. The panel must
+    /// say so before it happens, not after.
+    #[test]
+    fn releasing_the_machine_is_confirmed_first() {
+        assert!(
+            APP_JS.contains("releaseArmed"),
+            "teach mode must ask twice before it releases every joint"
+        );
+        assert!(
+            APP_JS.contains("goes limp"),
+            "the confirmation has to say what actually happens"
+        );
+        // A native dialog blocks the page, and a panel showing a live machine
+        // must not stop rendering because one is open.
+        assert!(
+            !APP_JS.contains("confirm(") && !APP_JS.contains("alert("),
+            "the panel must not use a blocking browser dialog"
+        );
+    }
+
+    /// Every field the panel reads has to be one the panel sends. A rename on
+    /// this side is a widget that silently renders nothing.
+    #[test]
+    fn the_state_payload_carries_what_the_script_reads() {
+        for field in [
+            "moving_to_rad",
+            "position_rad",
+            "target_rad",
+            "armed",
+            "estop",
+            "poses",
+        ] {
+            assert!(
+                APP_JS.contains(field),
+                "the script does not read {field}, so sending it is dead weight"
+            );
+        }
     }
 
     /// The E-STOP is the one control that must never be hunted for, so it is

@@ -145,3 +145,192 @@ p { margin: 0.25rem 0 0; }
     --muted: #666e7b;
   }
 }
+
+/* Whole-body moves sit above the joints: they are the controls an operator
+   reaches for first, and the ones that move the most metal. */
+.controls-moves {
+  align-items: center;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--line, #2a2f3a);
+  padding-bottom: 0.9rem;
+  margin-bottom: 0.4rem;
+}
+
+.move-speed {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.move-speed input {
+  width: 5rem;
+  padding: 0.35rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--panel, #161a22);
+  color: inherit;
+  font: inherit;
+}
+
+.poses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.btn-move {
+  border-color: #3b6ea5;
+}
+
+/* Per-joint commanding. The number is the destination, the buttons are the
+   two moves worth not having to type. */
+.joint-move {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0.2rem;
+  flex-wrap: wrap;
+}
+
+.joint-goal {
+  width: 6.5rem;
+  padding: 0.3rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--panel, #161a22);
+  color: inherit;
+  font: inherit;
+}
+
+.joint-goal:disabled,
+.btn-small:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.joint-progress {
+  font-size: 0.8rem;
+}
+
+/* A refusal has to be where the operator is already looking. Below sixteen
+   joint cards is off-screen, and a refusal nobody sees reads as a command that
+   worked. */
+/* Fixed, not sticky. Sticky only pins once the page has scrolled past the
+   element, and this panel is tall enough that a refusal from a control at the
+   bottom lands somewhere the operator is not looking. A refusal nobody sees
+   reads as a command that worked. */
+.message:not(:empty) {
+  position: fixed;
+  top: 0.6rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(70rem, calc(100vw - 2rem));
+  z-index: 50;
+  padding: 0.7rem 1rem;
+  border-radius: 8px;
+  border: 1px solid currentColor;
+  background: var(--panel, #161a22);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+}
+
+/* Teach mode. It sits above the joints because it is the step that comes
+   before driving anything, and because it releases the machine — an operator
+   should meet it before they meet a slider. */
+.teach {
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 1rem;
+  background: var(--panel, #161a22);
+}
+
+.teach-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.3rem;
+}
+
+.teach-head h2 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.teach-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.7rem 0 0.2rem;
+}
+
+.teach-controls input {
+  width: 5rem;
+  padding: 0.35rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--bg, #0e1116);
+  color: inherit;
+  font: inherit;
+}
+
+.btn-teach {
+  border-color: #a5793b;
+}
+
+.btn-apply {
+  border-color: #3ba55d;
+  margin-top: 0.7rem;
+}
+
+.teach-results {
+  overflow-x: auto;
+}
+
+.teach-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.8rem;
+  font-size: 0.85rem;
+}
+
+.teach-table th,
+.teach-table td {
+  text-align: left;
+  padding: 0.3rem 0.5rem 0.3rem 0;
+  border-bottom: 1px solid var(--line, #2a2f3a);
+  white-space: nowrap;
+}
+
+.teach-table th {
+  font-weight: 600;
+  opacity: 0.7;
+}
+
+.teach-table input,
+.teach-table select {
+  width: 6rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: 5px;
+  border: 1px solid var(--line, #2a2f3a);
+  background: var(--bg, #0e1116);
+  color: inherit;
+  font: inherit;
+}
+
+.teach-table select {
+  width: 4rem;
+}
+
+/* The release button, once it has been pressed and is waiting for the second
+   press. It has to look like a different button from the one just pressed. */
+.btn-arming {
+  border-color: #c2554a;
+  color: #f0a49b;
+}

@@ -12,6 +12,8 @@
 //! extend it.
 
 use std::collections::BTreeMap;
+
+use drlabs_robot::config::LimitEdit;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -214,9 +216,209 @@ pub fn parse_pose(body: &str) -> Result<BTreeMap<String, f64>, String> {
     Ok(pose)
 }
 
+/// A profiled move: where to go, and the ceilings to get there under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoveRequest {
+    /// Joint names to joint-space radians. Empty means "the pose named below".
+    pub targets: BTreeMap<String, f64>,
+    /// A pose from the description, used when `targets` is empty.
+    pub pose: Option<String>,
+    pub max_velocity: f64,
+    pub accel: f64,
+}
+
+/// Reads a move request.
+///
+/// `{"targets": {"l_sh_p": 0.0}, "velocity": 0.4, "accel": 1.0}` or
+/// `{"pose": "base"}`. Velocity and acceleration are ceilings and may be left
+/// out; the joint's own envelope binds underneath either way.
+pub fn parse_move(body: &str) -> Result<MoveRequest, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Raw {
+        #[serde(default)]
+        targets: BTreeMap<String, f64>,
+        #[serde(default)]
+        pose: Option<String>,
+        #[serde(default)]
+        velocity: Option<f64>,
+        #[serde(default)]
+        accel: Option<f64>,
+    }
+
+    let raw: Raw = serde_json::from_str(body).map_err(|error| error.to_string())?;
+
+    for (name, value) in &raw.targets {
+        if name.is_empty() {
+            return Err("a target has no joint name".into());
+        }
+        if !value.is_finite() {
+            return Err(format!("{name:?} was given a non-finite target"));
+        }
+    }
+    match (&raw.pose, raw.targets.is_empty()) {
+        (None, true) => return Err("the move names neither targets nor a pose".into()),
+        (Some(_), false) => {
+            return Err("the move names both targets and a pose; it can only have one".into())
+        }
+        _ => {}
+    }
+
+    // A ceiling of zero is a move that never arrives, and a negative one is not
+    // a ceiling at all. Both are worth refusing rather than quietly correcting.
+    let ceiling = |value: Option<f64>, default: f64, what: &str| -> Result<f64, String> {
+        match value {
+            None => Ok(default),
+            Some(value) if value.is_finite() && value > 0.0 => Ok(value),
+            Some(value) => Err(format!("{what} of {value} is not a usable ceiling")),
+        }
+    };
+
+    Ok(MoveRequest {
+        targets: raw.targets,
+        pose: raw.pose,
+        max_velocity: ceiling(raw.velocity, DEFAULT_MOVE_VELOCITY, "a velocity")?,
+        accel: ceiling(raw.accel, DEFAULT_MOVE_ACCEL, "an acceleration")?,
+    })
+}
+
+/// Unhurried by default, in joint-space rad/s and rad/s².
+///
+/// A panel move is somebody pressing a button and watching what happens, so the
+/// default is slow enough to watch and to stop. Each joint's own envelope
+/// lowers this further wherever the description says so.
+pub const DEFAULT_MOVE_VELOCITY: f64 = 0.35;
+pub const DEFAULT_MOVE_ACCEL: f64 = 1.0;
+
+/// How long to record travel for, when a run is asked for.
+pub fn parse_learn(body: &str) -> Result<f64, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Raw {
+        seconds: f64,
+    }
+    let raw: Raw = serde_json::from_str(body).map_err(|error| error.to_string())?;
+    if !raw.seconds.is_finite() || raw.seconds <= 0.0 {
+        return Err(format!("{} is not a usable duration", raw.seconds));
+    }
+    if raw.seconds > 600.0 {
+        return Err("a recording longer than ten minutes is almost certainly a typo".into());
+    }
+    Ok(raw.seconds)
+}
+
+/// Edited limits, as the panel sends them back.
+pub fn parse_limits(body: &str) -> Result<BTreeMap<String, LimitEdit>, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawEdit {
+        #[serde(default)]
+        min_rad: Option<f64>,
+        #[serde(default)]
+        max_rad: Option<f64>,
+        #[serde(default)]
+        direction: Option<f64>,
+    }
+
+    let raw: BTreeMap<String, RawEdit> =
+        serde_json::from_str(body).map_err(|error| error.to_string())?;
+    if raw.is_empty() {
+        return Err("no joints were edited".into());
+    }
+
+    let mut out = BTreeMap::new();
+    for (name, edit) in raw {
+        for (what, value) in [
+            ("min_rad", edit.min_rad),
+            ("max_rad", edit.max_rad),
+            ("direction", edit.direction),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() {
+                    return Err(format!("{name:?} was given a non-finite {what}"));
+                }
+            }
+        }
+        out.insert(
+            name,
+            LimitEdit {
+                min_rad: edit.min_rad,
+                max_rad: edit.max_rad,
+                direction: edit.direction,
+            },
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recording_needs_a_duration_that_can_elapse() {
+        assert_eq!(parse_learn(r#"{"seconds": 30}"#).unwrap(), 30.0);
+        assert!(parse_learn(r#"{"seconds": 0}"#).is_err());
+        assert!(parse_learn(r#"{"seconds": -5}"#).is_err());
+        assert!(parse_learn(r#"{"seconds": 100000}"#).is_err());
+        assert!(parse_learn("{}").is_err());
+    }
+
+    /// A limit edit may carry any subset of the three fields; what it may not
+    /// carry is a number that is not one.
+    #[test]
+    fn a_limit_edit_takes_the_fields_it_names_and_no_others() {
+        let edits = parse_limits(r#"{"j1": {"min_rad": -1.0, "max_rad": 2.0}}"#).unwrap();
+        assert_eq!(edits["j1"].min_rad, Some(-1.0));
+        assert_eq!(edits["j1"].max_rad, Some(2.0));
+        assert_eq!(edits["j1"].direction, None, "unnamed fields stay unchanged");
+
+        assert_eq!(
+            parse_limits(r#"{"j1": {"direction": -1}}"#).unwrap()["j1"].direction,
+            Some(-1.0)
+        );
+        assert!(parse_limits("{}").is_err(), "an empty edit is not an edit");
+        assert!(parse_limits(r#"{"j1": {"min_rad": "low"}}"#).is_err());
+        assert!(parse_limits(r#"{"j1": {"min_rad": NaN}}"#).is_err());
+        assert!(
+            parse_limits(r#"{"j1": {"mn_rad": 1.0}}"#).is_err(),
+            "a typo is not a field"
+        );
+    }
+
+    #[test]
+    fn a_move_carries_targets_or_a_pose_but_not_both() {
+        let one = parse_move(r#"{"targets": {"l_sh_p": 0.25}}"#).unwrap();
+        assert_eq!(one.targets["l_sh_p"], 0.25);
+        assert_eq!(one.pose, None);
+        assert_eq!(one.max_velocity, DEFAULT_MOVE_VELOCITY);
+
+        let pose = parse_move(r#"{"pose": "base", "velocity": 0.2}"#).unwrap();
+        assert_eq!(pose.pose.as_deref(), Some("base"));
+        assert_eq!(pose.max_velocity, 0.2);
+
+        assert!(parse_move("{}").is_err(), "neither is not a move");
+        assert!(
+            parse_move(r#"{"pose": "base", "targets": {"j": 0.0}}"#).is_err(),
+            "both is ambiguous"
+        );
+    }
+
+    /// A ceiling of zero would be a move that never arrives, and the panel
+    /// would sit there reporting progress of nought per cent for ever.
+    #[test]
+    fn a_ceiling_that_cannot_move_anything_is_refused() {
+        assert!(parse_move(r#"{"pose": "base", "velocity": 0}"#).is_err());
+        assert!(parse_move(r#"{"pose": "base", "accel": -1}"#).is_err());
+        assert!(parse_move(r#"{"pose": "base", "velocity": 1e400}"#).is_err());
+    }
+
+    #[test]
+    fn a_move_target_that_is_not_a_number_is_refused() {
+        assert!(parse_move(r#"{"targets": {"j": "0.25"}}"#).is_err());
+        assert!(parse_move(r#"{"targets": {"j": NaN}}"#).is_err());
+        assert!(parse_move(r#"{"targets": {"": 1.0}}"#).is_err());
+    }
 
     #[test]
     fn a_pose_reads_as_names_and_numbers() {

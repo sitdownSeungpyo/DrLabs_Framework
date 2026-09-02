@@ -7,26 +7,209 @@ implementation depends on and why.
 
 ## A profile is a control table plus its unit scales
 
-`Profile` in `profile.go` carries both halves of what a model needs: the
+`Profile` in `profile.rs` carries both halves of what a model needs: the
 register addresses, and what the counts in those registers mean. The addresses
-are largely shared across Protocol 2.0 — the scales are not.
+are largely shared across Protocol 2.0 — the scales, the supply range and the
+speed are not, and neither is whether a register exists at all.
 
-| | XL330 | X-series (XM430, XL430, XH430, …) |
-|---|---|---|
-| current | 1 mA per count | 2.69 mA per count |
-| supply | 3.7 – 6.0 V, rated 5 V | 10 – 14.8 V, rated 12 V |
-| no-load speed | 6 rev/s | 4 rev/s |
+Every number below is from the ROBOTIS e-Manual page for that model.
+
+| profile | models | current | supply (rated) | no-load speed |
+|---|---|---|---|---|
+| `x` | XM430, XH430, XM540 | 2.69 mA/count | 10 – 14.8 V (12) | family bound, 4 rev/s |
+| `xl330` | XL330-M077, XL330-M288 | 1 mA/count | 3.7 – 6.0 V (5.0) | 103 rev/min |
+| `mx64` | MX-64 (2.0), model 311 | 3.36 mA/count | 10 – 14.8 V (12) | 63 rev/min |
+| `mx106` | MX-106 (2.0), model 321 | 3.36 mA/count | 10 – 14.8 V (12) | 45 rev/min |
+| `mx28` | MX-28 (2.0), model 30 | **none** | 10 – 14.8 V (12) | 55 rev/min |
+| `xl430` | XL430-W250, 2XL430-W250 | **none** | 6.5 – 12.0 V (11.1) | 57 rev/min |
+| `xc430` | XC430-W150, XC430-W240 | **none** | 6.5 – 14.8 V (12) | 70 rev/min |
 
 Driving one through the other's profile is not a visible failure. The servo
 still moves, and it holds position, and nothing in the logs looks wrong. What
-changes is that every current reading is out by a factor of nearly three, which
-makes a current trip meaningless, and the supply range belongs to a different
-class of motor.
+changes is that every current reading is out by some factor, which makes a
+current trip meaningless, and the supply range belongs to a different class of
+motor.
+
+## Half the family has no current sensor at all
+
+This is the trap the table above exists for, and it is worse than a wrong
+scale. On an MX-28, an XL430, a 2XL430 or an XC430 the register at **address
+126 is Present Load** — a signed value in units of 0.1 % of PWM duty, range
+−1000 to +1000 — and not Present Current. There is no Goal Current at 102
+either, and `Operating Mode(11)` offers only velocity (1), position (3),
+extended position (4) and PWM (16): no current control, no current-based
+position control.
+
+Read through a current-sensing profile, a servo pushing at 25 % duty returns
+250 counts and reports itself as drawing 0.67 A. The number is plausible, it
+tracks load, and it is not a current. So `has_current_sense` on the profile
+gates three things:
+
+- `q_current` and `torque` are reported as `None` rather than as a scaled load
+  percentage. Position, velocity, voltage and temperature still decode; the
+  claim is about one register, not the servo.
+- `Mode::Torque` is refused at `operating_mode_for`, naming the profile, rather
+  than writing mode 0 to a motor that does not have it.
+- The torque command path refuses before writing to a Goal Current register
+  that is not there.
+
+The e-Manual is the authority. When adding a model, check address 126 on its
+page before assuming it matches its neighbours — XL430 and XM430 differ here
+despite sharing almost the whole control table.
+
+## The MX family is Protocol 2.0 only
+
+`known_model` lists MX-28 (2.0) as 30, MX-64 (2.0) as 311 and MX-106 (2.0) as
+321. The Protocol 1.0 models report different numbers and are deliberately
+absent: this build speaks only the packet format in `protocol.rs`, so a
+Protocol 1.0 servo will not answer at all, and listing it here would promise
+otherwise. An MX that pings as unknown is usually one that needs its firmware
+switched to 2.0 in Dynamixel Wizard, not a wiring fault.
+
+Torque is still reported as unmeasured on the MX profiles even though they
+measure current: `torque_constant` is `None`, because the e-Manual gives stall
+torque and stall current rather than a motor constant, and a ratio derived from
+those two is not the constant. Set it explicitly to get torque in newton-metres.
+
+## A chain is cycled as a whole, not a servo at a time
+
+One port, one wire, and one link per joint that each wanted a round trip per
+control period. That works to about eight joints and then stops working, and it
+does not fail in a way that points at itself. Measured on this bench, a
+sixteen-servo chain at 1 Mbaud:
+
+| | before | after |
+|---|---|---|
+| joints that energised, 15 asked for | 0 | 15 |
+| joints that energised, 16 asked for | 0 | 16 |
+| per-joint rate, 8 joints at 10 Hz | 0–5 Hz | 10 Hz |
+| aggregate transactions a second | ~22 | one write + one read a period |
+
+The failure looked like nothing at all: `bringup` reported that the joints had
+not energised and every one of them gave an empty reason, because preflight had
+nothing to complain about — there had simply not been enough cycles for a joint
+to arm. Raising the arming budget twelvefold did not help, which is what ruled
+out a race and pointed at throughput.
+
+`chain.rs` owns the period now. Every goal position goes out in one sync write,
+every present-value block comes back in one sync read, and whichever link finds
+the readings stale performs that transaction for the whole bus while the others
+wait on the mutex and then find the answer already taken. Arming, mode changes,
+the bus watchdog and identification stay per-servo: they are rare, and they are
+not what the period is made of.
+
+Two details cost a bench session each:
+
+- **A sync read's replies arrive together.** The servos answer back to back, so
+  a single `read` very often returns two or three status packets concatenated.
+  Reading one packet into a buffer that starts empty each time returns the first
+  and discards the rest, and the chain then reports that only its first servo
+  answered — which reads as fifteen servos having gone quiet. The reply buffer
+  now carries across the whole transaction and each packet is drained from it.
+- **The port is held across the request and every reply.** Releasing it between
+  them lets another thread's request land in the middle of the reply stream,
+  after which both transactions read each other's answers and both time out.
+
+The load line in `bringup -check` follows the same rule: a CAN bus is charged a
+transaction per joint per cycle, a Dynamixel chain two a period however many
+servos are on it. The same sixteen joints that used to be reported as 160
+transactions a second are 20.
+
+Two things still bound this. The bring-up is reliable to 16 joints at 10 Hz and
+starts losing the arming race at 25; and the per-servo writes that arming needs
+— torque enable, the profile registers, the watchdog — still go one at a time,
+so it is the burst at connect rather than the steady state that sets the
+ceiling.
+
+## What the chain's period costs, and the three things taken off it
+
+The chain made the steady state two transactions a period. But three costs
+still scaled with the servo count, and each undid part of that on the wire.
+계산값(1 Mbaud, 16 servos); 실물 16축 체인은 벤치에 없어 단일 XL330 실측 +
+회선 계산으로 외삽한 값이다.
+
+- **The hardware-error read was a round trip per servo.** `read_telemetry`
+  read register 70 one servo at a time on every non-fast query, which turned
+  the chain's O(1) read back into O(N) — sixteen extra round trips, about
+  17.6 ms, on every full-query period. Faults latch in the servo, so they do
+  not need reading every cycle: off a chain the read now rides only the rare
+  verify cadence (about once a second), and on a chain it travels as one more
+  broadcast — a single one-byte sync read of register 70 for the whole bus,
+  cached between fault periods. Sixteen round trips became one.
+
+- **Return Delay Time was never set.** Register 9 ships from the factory at
+  250 — half a millisecond the servo waits before every status packet — and
+  the code never touched it. On a sync read those pauses fall in series, one
+  per servo, so sixteen servos spend about 8 ms a period waiting for silence.
+  `open` now normalises it: read first, and only if it is wrong disable torque,
+  write the target, and wait out the EEPROM settle — so a servo already
+  normalised costs one read and nothing else, and only its first-ever bring-up
+  is slow. 미검증: the target is 0 (answer immediately); it must be confirmed
+  on the bench that this adapter family does not drop the first reply bytes at
+  0 before the constant is trusted — raise to 2–4 counts if it does.
+
+- **The wide block rode every period.** A chain read all 21 bytes — through
+  voltage and temperature — every period, eleven more per servo than the fast
+  ten-byte block, about 1.8 ms a period on sixteen servos. Voltage and
+  temperature move on thermal timescales, so the chain now rotates: the fast
+  block most periods, the wide block every tenth — the same bargain the
+  session's own full-query cadence makes for a servo off a chain.
+
+Together these take a sixteen-servo period from about 14.5 ms (wide block plus
+factory return delays) toward about 4.6 ms — roughly 69 Hz to something over
+200 Hz, on the wire arithmetic. Confirm on the bench before quoting it.
+
+## One Driver per bus, and why individual writes had to leave the bus
+
+A sixteen-servo UBP arm at 3 Mbaud would not arm above about ten joints: most
+servos e-stopped on `Data range error (0x04)` writing profile velocity (112),
+the rest on `comm_loss`. One servo alone was flawless — the tell that this was
+contention, not a bad value.
+
+The cause was two Drivers per servo over one port. Each `DynamixelLink` built
+its own `Driver`; the chain built another; all wrapped clones of the same
+`SharedPort`. The port mutex serialised transactions correctly, but
+`Driver::needs_flush` is per-instance, so a failure on one Driver never flushed
+the next Driver's read — and only telemetry and the goal position went through
+the chain. Every mode, limit, torque and non-position goal write was an
+*individual* answered transaction on the link's own Driver, sixteen threads
+contending, their status replies read against the wrong request.
+
+Two moves fixed it. First, a link on a chain adopts the chain's Driver
+(`Chain::driver`), so the whole bus shares one `needs_flush`. Second — and this
+is what actually cleared the 0x04 — the hot-path RAM writes were queued into
+`Chain::cycle` the way the goal position already was: torque, profile
+velocity/accel, bus watchdog and the velocity/current goals each become one
+broadcast `sync_write` across every servo, emitted in a fixed phase order
+(torque-off, limits ascending, torque-on, goals) that preserves the arm
+sequence. A broadcast is unanswered, so there is no status reply left to be
+misread. EEPROM writes — operating mode, return delay — stay discrete off the
+cycle: their settle is a sleep between two locked transactions, not inside one,
+so they never freeze the bus for the other joints, and folding them into the
+sync cycle is the one thing that would.
+
+## A long sync read loses its tail
+
+With the writes fixed, the last few joints still dropped out — `comm_loss` on
+the servos past the twelfth, on both the fast and the wide read. A single sync
+read of sixteen servos reliably returned the first twelve replies and timed out
+on the thirteenth; a shorter request answered in full. 확인함 (UBP bench,
+3 Mbaud): asking in chunks of eight (`MAX_SYNC_READ`) — two sync reads instead
+of one — every servo answered, every period. The tail loss on the longer
+stream is a physical-layer limit of the daisy chain, not the protocol; keeping
+each reply stream short works around it while staying O(1) in transactions per
+period for a chain this size.
+
+With all three in place a fifteen-joint UBP arm (the sixteenth, an XL430 wrist,
+sits above its rated 12 V supply and e-stops on over-voltage — an electrical
+issue, not this one) armed and held at 100 Hz with about 95 Hz achieved, and
+swept to roughly 200 Hz before the wire became the ceiling — against a bus that
+would not previously arm the machine at ten.
 
 ## The servo says which one it is, so the profile is never guessed
 
-A Dynamixel answers every ping with its model number. `KnownModels` maps that
-number to the profile that describes it, and `resolveProfile` settles the
+A Dynamixel answers every ping with its model number. `known_model` maps that
+number to the profile that describes it, and `resolve_profile` settles the
 question at open time:
 
 - **Nothing declared, model recognised** — the model's profile is used. A
@@ -51,7 +234,7 @@ sensible band for a 12 V or 24 V bus and an impossible one for a 5 V servo.
 motor's rated supply — a band that excludes it catches no fault, it just trips
 the instant the machine is powered.
 
-That check keys on `Envelope.VoltageRated`, and it does nothing when the field
+That check keys on `Envelope.voltage_rated`, and it does nothing when the field
 is zero. The Dynamixel profiles carried a min and a max but no rated value, so
 the check never fired and an XL330 reporting a perfectly healthy 4.8 V could
 not be armed at all:
@@ -61,7 +244,7 @@ Cannot arm:
   ✗ Bus voltage 4.8 V is below the configured minimum 11.0 V.
 ```
 
-Every profile now declares `VoltageRated`, and a test fails if one does not.
+Every profile now declares `voltage_rated`, and a test fails if one does not.
 
 ## The serial read timeout was the loop rate
 

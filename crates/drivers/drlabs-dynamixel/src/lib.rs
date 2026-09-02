@@ -13,6 +13,7 @@
 //! places to fix the next time the wire turns out to work differently than
 //! anyone thought.
 
+pub mod chain;
 pub mod driver;
 pub mod link;
 pub mod profile;

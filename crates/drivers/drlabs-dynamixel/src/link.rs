@@ -34,6 +34,23 @@ use crate::protocol::MAX_VALID_MOTOR_ID;
 /// register.
 const EEPROM_SETTLE: Duration = Duration::from_millis(200);
 
+/// The Return Delay Time this driver asks every servo to run at, in the
+/// register's own 2 microsecond counts. Zero means "answer immediately".
+///
+/// The register ships from the factory at 250 — half a millisecond of
+/// deliberate silence before every status packet. On a sync read the pauses
+/// add up in series, one per servo, so a sixteen-joint chain pays eight
+/// milliseconds of nothing every period. Modern half-duplex adapters turn
+/// the line around in microseconds and need none of it.
+///
+/// Zero: answer with no deliberate delay. On the sixteen-servo bench the
+/// turnaround-margin worry that a non-zero value guards against was resolved
+/// at the adapter instead — the FTDI latency timer set to 1 ms — so the
+/// register is left at the minimum. Written only when the servo is not
+/// already there (see `normalise_return_delay`), so a chain whose servos are
+/// pre-set to 0 pays nothing here.
+const RETURN_DELAY_COUNTS: u8 = 0;
+
 /// A [`Link`] backed by one Dynamixel servo.
 pub struct DynamixelLink {
     driver: Option<Arc<Driver>>,
@@ -46,6 +63,14 @@ pub struct DynamixelLink {
     /// Whether the caller named a profile or is relying on the servo to
     /// identify itself.
     profile_declared: bool,
+
+    /// The daisy chain this servo shares its port with, when there is one.
+    ///
+    /// With a chain, the goal position and the present-value read leave this
+    /// link and become the chain's single sync write and sync read for the
+    /// whole bus. Everything else — arming, mode changes, the watchdog,
+    /// identification — stays here, because it is rare and per-servo.
+    chain: Option<Arc<crate::chain::Chain>>,
 
     /// What the servo reported on the last ping, and what this build knows the
     /// number to be.
@@ -63,6 +88,16 @@ pub struct DynamixelLink {
     /// and rewriting them at the control rate wastes most of the serial
     /// bandwidth the loop has.
     last_velocity_limit: Option<f64>,
+
+    /// The servo's own Velocity Limit, in register counts, as read at open.
+    ///
+    /// It lives in EEPROM, so it is a property of the servo in front of you
+    /// rather than of its family: two identical MX-64s can hold different
+    /// values because somebody configured them at different times. Asking for
+    /// a profile velocity above it is refused by the servo with a data range
+    /// error, which arrives as a transport failure and stops the joint — for a
+    /// limit the host could have honoured had it bothered to read it.
+    velocity_limit_counts: Option<u32>,
     last_accel_limit: Option<f64>,
     last_watchdog: Option<f64>,
 }
@@ -88,11 +123,13 @@ impl DynamixelLink {
             id,
             profile: profile.unwrap_or(crate::profile::X_SERIES),
             profile_declared: profile.is_some(),
+            chain: None,
             model: None,
             model_name: None,
             current_mode: None,
             torque_enabled: false,
             last_velocity_limit: None,
+            velocity_limit_counts: None,
             last_accel_limit: None,
             last_watchdog: None,
         }
@@ -105,6 +142,43 @@ impl DynamixelLink {
     }
 
     /// Sets the torque constant, so torque can be reported in newton-metres.
+    /// Puts this servo on a shared chain, so that its goal and its readings
+    /// travel with every other servo on the same port.
+    pub fn with_chain(mut self, chain: Arc<crate::chain::Chain>) -> Self {
+        chain.join(
+            self.id,
+            self.profile.addr_present_current,
+            self.telemetry_length(),
+            self.fast_telemetry_length(),
+            self.profile.addr_hardware_error,
+        );
+        // Adopt the chain's Driver, discarding the one `new` built. One Driver
+        // per bus means one `needs_flush`: a failed transaction anywhere on
+        // the bus flushes before the next one anywhere on the bus, which is
+        // what stops one servo's late reply from being read as another's.
+        self.driver = Some(chain.driver());
+        self.chain = Some(chain);
+        self
+    }
+
+    /// The wide present-value block this profile reads: present current
+    /// through present temperature, which are contiguous on every Protocol
+    /// 2.0 family.
+    ///
+    /// A chain rotates between this and the fast block on the wide cadence,
+    /// the same bargain a servo off a chain gets from the session's own
+    /// full-query cadence: eleven fewer bytes per servo most periods, and
+    /// voltage and temperature — thermal-timescale values — every tenth.
+    fn telemetry_length(&self) -> u16 {
+        self.profile.addr_present_temperature + 1 - self.profile.addr_present_current
+    }
+
+    /// The fast block: present current (2), velocity (4) and position (4),
+    /// contiguous from present current.
+    fn fast_telemetry_length(&self) -> u16 {
+        self.profile.addr_present_position + 4 - self.profile.addr_present_current
+    }
+
     pub fn with_torque_constant(mut self, nm_per_amp: f64) -> Self {
         self.profile.torque_constant = Some(nm_per_amp);
         self
@@ -176,9 +250,54 @@ impl DynamixelLink {
             return Ok(());
         }
         let address = self.profile.addr_torque_enable;
-        self.driver()?
-            .write_u8(self.id, address, u8::from(enabled))?;
+        // On a chain, arming/disarming rides the cycle's torque phase with
+        // every other joint's — one broadcast, not a write per joint. Off a
+        // chain it goes straight out. Note the EEPROM torque-off inside
+        // `ensure_mode`/`normalise_return_delay` does NOT come through here;
+        // it must complete before its mode write, so it stays a direct write.
+        if let Some(chain) = &self.chain {
+            chain.queue_torque(self.id, address, enabled);
+        } else {
+            self.driver()?.write_u8(self.id, address, u8::from(enabled))?;
+        }
         self.torque_enabled = enabled;
+        Ok(())
+    }
+
+    /// Normalises the Return Delay Time to `RETURN_DELAY_COUNTS`.
+    ///
+    /// Read first, write only when wrong: the register is EEPROM, so a servo
+    /// that is already normalised costs one read here and nothing else, and
+    /// only its first-ever bring-up pays the torque-off write and the settling
+    /// time after it — the same bargain `ensure_mode` makes.
+    ///
+    /// A failed read is skipped rather than fatal, like the operating-mode
+    /// read below it: a servo this driver cannot ask is a servo it should not
+    /// write EEPROM on. A failed write is fatal, like the watchdog clear —
+    /// a register write refused at open time is a servo in a state this
+    /// driver does not understand.
+    fn normalise_return_delay(&mut self, driver: &Arc<crate::driver::Driver>) -> Result<()> {
+        if self.profile.addr_return_delay == 0 {
+            return Ok(());
+        }
+        let current = match driver.read(self.id, self.profile.addr_return_delay, 1) {
+            Ok(data) if data.len() == 1 => data[0],
+            _ => return Ok(()),
+        };
+        if current == RETURN_DELAY_COUNTS {
+            return Ok(());
+        }
+        // EEPROM writes are refused while torque is enabled, and a previous
+        // session may have left it on. Written straight through the driver
+        // rather than `set_torque`, which trusts its own cache and this early
+        // in `open` has nothing in it.
+        driver
+            .write_u8(self.id, self.profile.addr_torque_enable, 0)
+            .map_err(|error| Error::Refused(format!("disabling torque for EEPROM: {error}")))?;
+        driver
+            .write_u8(self.id, self.profile.addr_return_delay, RETURN_DELAY_COUNTS)
+            .map_err(|error| Error::Refused(format!("normalising the return delay: {error}")))?;
+        std::thread::sleep(EEPROM_SETTLE);
         Ok(())
     }
 
@@ -192,7 +311,12 @@ impl DynamixelLink {
         if self.current_mode == Some(mode) {
             return Ok(());
         }
-        self.set_torque(false)?;
+        // Torque off is the EEPROM precondition and must land before the mode
+        // write in the same breath — a queued torque-off deferred to a later
+        // cycle would not. So write both directly here, not through the chain.
+        let torque_addr = self.profile.addr_torque_enable;
+        self.driver()?.write_u8(self.id, torque_addr, 0)?;
+        self.torque_enabled = false;
         let address = self.profile.addr_operating_mode;
         self.driver()?.write_u8(self.id, address, mode)?;
         std::thread::sleep(EEPROM_SETTLE);
@@ -211,9 +335,22 @@ impl DynamixelLink {
             let limit = limit.value();
             if command.full || self.last_velocity_limit != Some(limit) {
                 let counts = (limit * 60.0 / self.profile.velocity_rpm_per_count).round();
+                let mut counts = counts.max(0.0) as u32;
+                // The servo refuses anything above its own Velocity Limit, and
+                // refuses it as a data range error — which reaches the session
+                // as a transport failure and stops the joint. Clamping here
+                // means a host limit set higher than the hardware allows makes
+                // the axis slower, which is what the operator meant, instead of
+                // making it stop.
+                if let Some(ceiling) = self.velocity_limit_counts {
+                    counts = counts.min(ceiling);
+                }
                 let address = self.profile.addr_profile_velocity;
-                self.driver()?
-                    .write_u32(self.id, address, counts.max(0.0) as u32)?;
+                if let Some(chain) = &self.chain {
+                    chain.queue_limit(self.id, address, counts.to_le_bytes().to_vec());
+                } else {
+                    self.driver()?.write_u32(self.id, address, counts)?;
+                }
                 self.last_velocity_limit = Some(limit);
             }
         }
@@ -224,8 +361,12 @@ impl DynamixelLink {
                 // rev/s² to rev/min², then into the register's own step.
                 let counts = (limit * 3600.0 / self.profile.accel_rev_per_min2_per_count).round();
                 let address = self.profile.addr_profile_accel;
-                self.driver()?
-                    .write_u32(self.id, address, counts.max(0.0) as u32)?;
+                let counts = counts.max(0.0) as u32;
+                if let Some(chain) = &self.chain {
+                    chain.queue_limit(self.id, address, counts.to_le_bytes().to_vec());
+                } else {
+                    self.driver()?.write_u32(self.id, address, counts)?;
+                }
                 self.last_accel_limit = Some(limit);
             }
         }
@@ -235,7 +376,11 @@ impl DynamixelLink {
                 if command.full || self.last_watchdog != Some(timeout) {
                     let counts = watchdog_counts(timeout, &self.profile);
                     let address = self.profile.addr_bus_watchdog;
-                    self.driver()?.write_u8(self.id, address, counts)?;
+                    if let Some(chain) = &self.chain {
+                        chain.queue_limit(self.id, address, vec![counts]);
+                    } else {
+                        self.driver()?.write_u8(self.id, address, counts)?;
+                    }
                     self.last_watchdog = Some(timeout);
                 }
             }
@@ -251,6 +396,17 @@ impl DynamixelLink {
             // would quietly break that contract past ±0.5 rev.
             Mode::Position => OP_MODE_EXTENDED_POSITION,
             Mode::Velocity | Mode::Hold => OP_MODE_VELOCITY,
+            // Current control mode does not exist on a servo with no current
+            // sensor — an MX-28 or an XL430 offers velocity, position,
+            // extended position and PWM and nothing else. Writing mode 0 to
+            // one is a rejected register write at best, so refuse here and
+            // name the motor rather than let it fail as a bus error.
+            Mode::Torque if !self.profile.has_current_sense => {
+                return Err(Error::Config(format!(
+                    "servo id {} is driven through the {:?} profile, which has no current                      sensor and no Goal Current register; this family supports position,                      velocity and PWM control only",
+                    self.id, self.profile.name
+                )))
+            }
             Mode::Torque => OP_MODE_CURRENT,
             other => {
                 return Err(Error::UnsupportedMode {
@@ -263,6 +419,15 @@ impl DynamixelLink {
 
     /// Writes whatever this command changes.
     fn apply_command(&mut self, command: &Command) -> Result<()> {
+        // A target the chain is still holding belongs to the mode that set it.
+        // Leaving it in place would put a stopped servo's last goal back on the
+        // wire on the next sync write.
+        if let Some(chain) = &self.chain {
+            if !matches!(command.mode, Mode::Position) {
+                chain.clear_goal(self.id);
+            }
+        }
+
         match command.mode {
             // Torque off is the Dynamixel equivalent of releasing the bridge.
             Mode::Stop => return self.set_torque(false),
@@ -286,22 +451,49 @@ impl DynamixelLink {
             Mode::Position => {
                 if let Some(position) = command.position.get() {
                     let counts = (position.value() * self.profile.counts_per_rev).round() as i32;
-                    driver.write_u32(self.id, self.profile.addr_goal_position, counts as u32)?;
+                    match &self.chain {
+                        // The chain carries it out with everyone else's, one
+                        // packet for the bus instead of one per joint.
+                        Some(chain) => {
+                            chain.set_goal(self.id, self.profile.addr_goal_position, counts)
+                        }
+                        None => driver.write_u32(
+                            self.id,
+                            self.profile.addr_goal_position,
+                            counts as u32,
+                        )?,
+                    }
                 }
             }
             Mode::Velocity => {
                 if let Some(velocity) = command.velocity.get() {
                     let counts = (velocity.value() * 60.0 / self.profile.velocity_rpm_per_count)
                         .round() as i32;
-                    driver.write_u32(self.id, self.profile.addr_goal_velocity, counts as u32)?;
+                    let address = self.profile.addr_goal_velocity;
+                    if let Some(chain) = &self.chain {
+                        chain.queue_goal(self.id, address, (counts as u32).to_le_bytes().to_vec());
+                    } else {
+                        driver.write_u32(self.id, address, counts as u32)?;
+                    }
                 }
             }
             Mode::Hold => {
                 // There is no zero-velocity mode; commanding zero velocity in
                 // velocity mode is the closest equivalent and behaves the same.
-                driver.write_u32(self.id, self.profile.addr_goal_velocity, 0)?;
+                let address = self.profile.addr_goal_velocity;
+                if let Some(chain) = &self.chain {
+                    chain.queue_goal(self.id, address, 0u32.to_le_bytes().to_vec());
+                } else {
+                    driver.write_u32(self.id, address, 0)?;
+                }
             }
             Mode::Torque => {
+                if !self.profile.has_current_sense {
+                    return Err(Error::Config(format!(
+                        "servo id {} has no Goal Current register ({:?} profile)",
+                        self.id, self.profile.name
+                    )));
+                }
                 if let Some(torque) = command.feedforward_torque.get() {
                     let constant = self.profile.torque_constant.ok_or_else(|| {
                         Error::Config(
@@ -311,7 +503,12 @@ impl DynamixelLink {
                     })?;
                     let amps = torque.value() / constant;
                     let counts = (amps / self.profile.current_amps_per_count).round() as i16;
-                    driver.write_u16(self.id, self.profile.addr_goal_current, counts as u16)?;
+                    let address = self.profile.addr_goal_current;
+                    if let Some(chain) = &self.chain {
+                        chain.queue_goal(self.id, address, (counts as u16).to_le_bytes().to_vec());
+                    } else {
+                        driver.write_u16(self.id, address, counts as u16)?;
+                    }
                 }
             }
             _ => {}
@@ -327,20 +524,30 @@ impl DynamixelLink {
     /// on a serial bus is the difference between a 200 Hz loop and a 40 Hz one.
     fn read_telemetry(&self, profile: QueryProfile) -> Result<Option<Telemetry>> {
         // Present current (2), velocity (4), position (4) = 10 bytes from 126.
-        let length = if profile == QueryProfile::Fast {
+        let length = if profile == QueryProfile::Fast && self.chain.is_none() {
             10
         } else {
             // …through present temperature at 146 = 21 bytes.
-            self.profile.addr_present_temperature + 1 - self.profile.addr_present_current
+            self.telemetry_length()
         };
 
         let driver = self.driver()?;
-        let data = match driver.read(self.id, self.profile.addr_present_current, length) {
-            Ok(data) => data,
-            // A single missed reply is a dropped cycle, not a broken link: the
-            // loop counts it and carries on, and only a run of them is fatal.
-            Err(Error::Timeout(_)) => return Ok(None),
-            Err(error) => return Err(error),
+        let data = match &self.chain {
+            // On a chain the reading was taken for the whole bus at once, and
+            // this link takes its share. Nothing goes on the wire here unless
+            // this is the link that found the readings stale.
+            Some(chain) => match chain.refresh(self.id)? {
+                Some(data) => data,
+                None => return Ok(None),
+            },
+            None => match driver.read(self.id, self.profile.addr_present_current, length) {
+                Ok(data) => data,
+                // A single missed reply is a dropped cycle, not a broken link:
+                // the loop counts it and carries on, and only a run of them is
+                // fatal.
+                Err(Error::Timeout(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            },
         };
         if data.len() < 10 {
             return Ok(None);
@@ -348,21 +555,26 @@ impl DynamixelLink {
 
         let mut telemetry = Telemetry::default();
 
-        let current =
-            i16::from_le_bytes([data[0], data[1]]) as f64 * self.profile.current_amps_per_count;
+        // The first two bytes are Present Current on a family that has the
+        // sensor and Present Load — a signed 0.1 % of PWM duty — on one that
+        // does not. The second is not a current by any scaling, so it is
+        // reported as nothing at all rather than as a number in amperes that
+        // an operator would have no reason to distrust.
+        let current = self.profile.has_current_sense.then(|| {
+            i16::from_le_bytes([data[0], data[1]]) as f64 * self.profile.current_amps_per_count
+        });
         let velocity = i32::from_le_bytes([data[2], data[3], data[4], data[5]]) as f64
             * self.profile.velocity_rpm_per_count
             / 60.0;
         let position = i32::from_le_bytes([data[6], data[7], data[8], data[9]]) as f64
             / self.profile.counts_per_rev;
 
-        telemetry.q_current = Some(Amps(current));
+        telemetry.q_current = current.map(Amps);
         telemetry.velocity = Some(RevPerSec(velocity));
         telemetry.position = Some(Rev(position));
-        telemetry.torque = self
-            .profile
-            .torque_constant
-            .map(|constant| Nm(current * constant));
+        telemetry.torque = current
+            .zip(self.profile.torque_constant)
+            .map(|(current, constant)| Nm(current * constant));
 
         // The motor has no mode register in the moteus sense; report whether
         // the bridge is driving, which is what the safety layer actually asks.
@@ -374,11 +586,14 @@ impl DynamixelLink {
         telemetry.mode = Some(mode);
         telemetry.mode_name = name.into();
 
-        if length > 10 && data.len() >= length as usize {
-            let voltage_offset =
-                (self.profile.addr_present_voltage - self.profile.addr_present_current) as usize;
-            let temp_offset = (self.profile.addr_present_temperature
-                - self.profile.addr_present_current) as usize;
+        // Judged by what actually came back, not by what was asked for: a
+        // chain rotates between the fast and the wide block, so this link may
+        // be handed either length on any given period.
+        let voltage_offset =
+            (self.profile.addr_present_voltage - self.profile.addr_present_current) as usize;
+        let temp_offset = (self.profile.addr_present_temperature
+            - self.profile.addr_present_current) as usize;
+        if data.len() > temp_offset {
             let voltage = u16::from_le_bytes([data[voltage_offset], data[voltage_offset + 1]])
                 as f64
                 * self.profile.voltage_volts_per_count;
@@ -390,12 +605,31 @@ impl DynamixelLink {
             telemetry.board_temperature = Some(temperature);
         }
 
-        if profile != QueryProfile::Fast {
-            if let Ok(status) = driver.read(self.id, self.profile.addr_hardware_error, 1) {
-                if status.len() == 1 {
-                    telemetry.fault = Some(decode_hardware_error(status[0]));
+        match &self.chain {
+            // The chain read every servo's hardware-error register in one
+            // broadcast, on its own cadence; this link takes its share from
+            // the cache. Nothing goes on the wire here — the per-servo read
+            // this replaces cost a round trip per joint on every wide query,
+            // which turned the chain's two transactions back into O(N).
+            Some(chain) => {
+                if let Some(bits) = chain.fault(self.id) {
+                    telemetry.fault = Some(decode_hardware_error(bits));
                 }
             }
+            // Off a chain the register costs a round trip of its own, so it
+            // rides the rare verify cadence rather than every full query. The
+            // price is discovery: a fault surfaces within about a second
+            // instead of a tenth of one. A hard fault has already made the
+            // servo cut its own torque by then, and the wide block keeps
+            // carrying voltage and temperature every full query regardless.
+            None if profile == QueryProfile::Verify => {
+                if let Ok(status) = driver.read(self.id, self.profile.addr_hardware_error, 1) {
+                    if status.len() == 1 {
+                        telemetry.fault = Some(decode_hardware_error(status[0]));
+                    }
+                }
+            }
+            None => {}
         }
 
         Ok(Some(telemetry))
@@ -466,6 +700,35 @@ impl Link for DynamixelLink {
             .map_err(|error| Error::Refused(format!("clearing the bus watchdog: {error}")))?;
         self.last_watchdog = None;
 
+        self.normalise_return_delay(&driver)?;
+
+        // Learn the mode the servo is already in, rather than assuming it needs
+        // changing.
+        //
+        // Operating mode lives in EEPROM, so setting it costs a write and the
+        // settling time after it, and until this ran every joint paid both on
+        // its first command whether or not the mode was already right. On one
+        // servo that is 200 ms nobody notices; on a sixteen-joint chain it is
+        // sixteen of them inside the window the machine has to arm in, and it
+        // writes EEPROM on every bring-up for no change.
+        if let Ok(data) = driver.read(self.id, self.profile.addr_operating_mode, 1) {
+            if data.len() == 1 {
+                self.current_mode = Some(data[0]);
+            }
+        }
+
+        // And the ceiling it will accept on the velocity registers.
+        if self.profile.addr_velocity_limit != 0 {
+            if let Ok(data) = driver.read(self.id, self.profile.addr_velocity_limit, 4) {
+                if data.len() == 4 {
+                    let counts = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if counts > 0 {
+                        self.velocity_limit_counts = Some(counts);
+                    }
+                }
+            }
+        }
+
         // Leave the motor free until the caller arms it, matching every other
         // driver: connecting is not a reason for a machine to become rigid.
         self.set_torque(false)?;
@@ -473,6 +736,9 @@ impl Link for DynamixelLink {
     }
 
     fn close(&mut self) -> Result<()> {
+        if let Some(chain) = &self.chain {
+            chain.leave(self.id);
+        }
         if self.driver.is_some() {
             let _ = self.set_torque(false);
             self.driver = None;
@@ -544,7 +810,15 @@ impl Link for DynamixelLink {
             voltage_min: Some(Volts(self.profile.voltage_min)),
             voltage_max: Some(Volts(self.profile.voltage_max)),
             voltage_rated: Some(Volts(self.profile.voltage_rated)),
-            velocity_max: Some(RevPerSec(self.profile.max_velocity_rev_per_sec)),
+            // The servo's own limit when it told us one, the family's
+            // documented no-load speed otherwise.
+            velocity_max: Some(RevPerSec(match self.velocity_limit_counts {
+                Some(counts) => {
+                    (counts as f64 * self.profile.velocity_rpm_per_count / 60.0)
+                        .min(self.profile.max_velocity_rev_per_sec)
+                }
+                None => self.profile.max_velocity_rev_per_sec,
+            })),
             peak_current: None,
         })
     }
@@ -558,7 +832,207 @@ impl Link for DynamixelLink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{XL330, X_SERIES};
+    use crate::profile::{MX28, MX64, XL330, XL430, X_SERIES};
+    use std::sync::Mutex;
+
+    /// A servo that answers one queued reply, so that a decode can be tested
+    /// without a bus. Same shape as the one in `driver`'s tests.
+    #[derive(Clone, Default)]
+    struct FakeServo {
+        replies: Arc<Mutex<Vec<Vec<u8>>>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl FakeServo {
+        fn reply_with(&self, id: u8, params: &[u8]) {
+            let mut packet = vec![0xFF, 0xFF, 0xFD, 0x00, id];
+            let length = 1 + 1 + params.len() + 2;
+            packet.push((length & 0xFF) as u8);
+            packet.push(((length >> 8) & 0xFF) as u8);
+            packet.push(0x55);
+            packet.push(0);
+            packet.extend_from_slice(params);
+            let crc = crate::protocol::update_crc(0, &packet);
+            packet.extend_from_slice(&crc.to_le_bytes());
+            self.replies.lock().unwrap().push(packet);
+        }
+    }
+
+    impl drlabs_transport::serial::SerialPort for FakeServo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut replies = self.replies.lock().unwrap();
+            if replies.is_empty() {
+                return Ok(0);
+            }
+            let reply = replies.remove(0);
+            let n = reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&reply[..n]);
+            Ok(n)
+        }
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+    }
+
+    /// The present-value block as a servo returns it for a fast query:
+    /// current-or-load, velocity, position.
+    fn present_block(raw: i16, velocity: i32, position: i32) -> Vec<u8> {
+        let mut data = raw.to_le_bytes().to_vec();
+        data.extend_from_slice(&velocity.to_le_bytes());
+        data.extend_from_slice(&position.to_le_bytes());
+        data
+    }
+
+    fn link_on(servo: &FakeServo, profile: Profile) -> DynamixelLink {
+        DynamixelLink::new(SharedPort::new(Box::new(servo.clone())), 1, Some(profile))
+    }
+
+    /// A wide block decodes voltage and temperature; the decode is judged by
+    /// the bytes that came back, not the length that was asked for, because a
+    /// chain hands this link either block.
+    #[test]
+    fn a_wide_block_decodes_voltage_and_temperature() {
+        let servo = FakeServo::default();
+        let mut block = present_block(100, 0, 2048); // 10 bytes
+        block.extend_from_slice(&[0; 8]); // through the realtime tick etc.
+        block.extend_from_slice(&120u16.to_le_bytes()); // voltage at offset 18
+        block.push(37); // temperature at offset 20
+        servo.reply_with(1, &block);
+        let link = link_on(&servo, XL330);
+
+        let telemetry = link
+            .read_telemetry(QueryProfile::Full)
+            .expect("the servo answered")
+            .expect("a reply decodes");
+
+        assert_eq!(telemetry.voltage, Some(Volts(12.0)));
+        assert_eq!(telemetry.motor_temperature, Some(Celsius(37.0)));
+    }
+
+    /// A servo already at the target return delay is read and left alone:
+    /// no torque write, no EEPROM write, no settling time.
+    #[test]
+    fn a_normalised_return_delay_is_not_rewritten() {
+        let servo = FakeServo::default();
+        servo.reply_with(1, &[RETURN_DELAY_COUNTS]);
+        let mut link = link_on(&servo, XL330);
+        let driver = link.driver().unwrap().clone();
+
+        link.normalise_return_delay(&driver).expect("read answered");
+
+        let written = servo.written.lock().unwrap().clone();
+        // Pinned: exactly one read of register 9 went out...
+        let read_rdt = [0x02, 9, 0, 1, 0];
+        assert!(
+            written.windows(read_rdt.len()).any(|w| w == read_rdt),
+            "no read of the return delay register: {written:02X?}"
+        );
+        // ...and no write instruction at all.
+        assert!(
+            !written.windows(2).any(|w| w[0] == 0x03),
+            "something was written to a normalised servo: {written:02X?}"
+        );
+    }
+
+    /// A factory-fresh servo gets torque disabled and register 9 written to
+    /// the target, in that order.
+    #[test]
+    fn a_factory_return_delay_is_normalised() {
+        let servo = FakeServo::default();
+        servo.reply_with(1, &[250]); // the factory default: 500 us
+        servo.reply_with(1, &[]); // status for the torque-off write
+        servo.reply_with(1, &[]); // status for the return-delay write
+        let mut link = link_on(&servo, XL330);
+        let driver = link.driver().unwrap().clone();
+
+        link.normalise_return_delay(&driver).expect("writes answered");
+
+        let written = servo.written.lock().unwrap().clone();
+        // Pinned: a torque-enable write of zero, then a register 9 write of
+        // the target, as instruction+address+value byte runs.
+        let torque_off = [0x03, 64, 0, 0];
+        let write_rdt = [0x03, 9, 0, RETURN_DELAY_COUNTS];
+        let torque_at = written
+            .windows(torque_off.len())
+            .position(|w| w == torque_off)
+            .expect("torque was not disabled before the EEPROM write");
+        let rdt_at = written
+            .windows(write_rdt.len())
+            .position(|w| w == write_rdt)
+            .expect("the return delay was not written");
+        assert!(
+            torque_at < rdt_at,
+            "the EEPROM write went out before torque was disabled"
+        );
+    }
+
+    /// The defect this flag exists to prevent. An MX-28 answers a read of 126
+    /// with Present Load — 0.1 % of PWM duty — and the old code multiplied it
+    /// by a current unit and reported the product as amperes. 250 counts is
+    /// 25 % duty; through the X-series scale it becomes a confident 0.67 A.
+    #[test]
+    fn a_servo_without_a_current_sensor_reports_no_current() {
+        let servo = FakeServo::default();
+        servo.reply_with(1, &present_block(250, 0, 2048));
+        let link = link_on(&servo, MX28);
+
+        let telemetry = link
+            .read_telemetry(QueryProfile::Fast)
+            .expect("the servo answered")
+            .expect("a reply decodes");
+
+        assert_eq!(telemetry.q_current, None, "Present Load is not a current");
+        assert_eq!(telemetry.torque, None, "and no torque follows from it");
+
+        // The rest of the block still decodes: this is a narrower claim about
+        // one register, not a refusal to read the servo.
+        assert_eq!(telemetry.position, Some(Rev(0.5)));
+        assert_eq!(telemetry.velocity, Some(RevPerSec(0.0)));
+    }
+
+    /// The same bytes from a motor that does have the sensor, scaled by the
+    /// MX's own 3.36 mA unit rather than the X-series 2.69 mA.
+    #[test]
+    fn a_servo_with_one_reports_it_in_the_familys_own_unit() {
+        let servo = FakeServo::default();
+        servo.reply_with(1, &present_block(250, 0, 2048));
+        let link = link_on(&servo, MX64);
+
+        let telemetry = link
+            .read_telemetry(QueryProfile::Fast)
+            .expect("the servo answered")
+            .expect("a reply decodes");
+
+        let current = telemetry.q_current.expect("an MX-64 measures current");
+        assert!((current.value() - 0.84).abs() < 1e-6, "got {current:?}");
+    }
+
+    /// Current control mode does not exist on these motors, and neither does
+    /// the register the command would be written to. Refusing by name beats
+    /// failing later as a rejected register write.
+    #[test]
+    fn torque_control_is_refused_on_a_servo_without_a_current_register() {
+        for profile in [MX28, XL430] {
+            let servo = FakeServo::default();
+            let link = link_on(&servo, profile);
+            let error = link
+                .operating_mode_for(Mode::Torque)
+                .expect_err("torque control is not available");
+            assert!(
+                format!("{error}").contains("no current"),
+                "{profile:?} gave {error}"
+            );
+        }
+
+        // And is available where the hardware has it.
+        assert_eq!(
+            link_on(&FakeServo::default(), MX64)
+                .operating_mode_for(Mode::Torque)
+                .unwrap(),
+            OP_MODE_CURRENT
+        );
+    }
 
     fn link(profile: Option<Profile>) -> DynamixelLink {
         struct Silent;

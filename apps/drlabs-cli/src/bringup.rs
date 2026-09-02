@@ -46,12 +46,28 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
 
     robot.bring_up().map_err(|error| error.to_string())?;
 
+    // Bringing a machine up is switching it on, not telling it what to do.
+    //
+    // Unless this run was asked for a sweep or a flood, every joint goes quiet
+    // once it is energised: torque on, holding the position it was already in,
+    // and no further target from here. Whatever drives the robot afterwards —
+    // the panel, a program — is then the only thing that decides where it
+    // goes, and `bringup` cannot be the reason a joint moved.
+    if sweep <= 0.0 && !flood {
+        robot
+            .hold_where_they_are()
+            .map_err(|error| error.to_string())?;
+    }
+
     // Let the loops run long enough to have a rate worth reporting; the
     // measurement is over a window, and there is no window yet.
     std::thread::sleep(Duration::from_millis(500));
     print_state(&robot);
 
     println!("\nrobot {name:?} live · {joint_count} joints · {rate} Hz");
+    if sweep <= 0.0 && !flood {
+        println!("  energised and holding · no position commands are being sent");
+    }
     if seconds > 0.0 {
         println!("  holding for {seconds:.0} s");
     } else {
@@ -217,10 +233,11 @@ fn print_plan(config: &Config) {
         );
     }
 
-    // The load line is the one worth reading: every joint on a bus costs a
-    // transaction per cycle, so what matters is joints × rate. A number the
-    // adapter cannot carry is better seen here than diagnosed later through a
-    // machine that will not keep time.
+    // The load line is the one worth reading. A CAN joint costs a transaction
+    // per cycle, so a CAN bus carries joints × rate; a Dynamixel chain is
+    // cycled as a whole and costs two a period however many servos are on it.
+    // A number the adapter cannot carry is better seen here than diagnosed
+    // later through a machine that will not keep time.
     for (bus, total) in &load {
         if *total > 400 {
             println!(

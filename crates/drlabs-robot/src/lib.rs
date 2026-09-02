@@ -17,10 +17,12 @@
 
 pub mod config;
 pub mod joint;
+pub mod learn;
 pub mod robot;
 pub mod units;
 
 pub use config::{BusConfig, Config, JointConfig, JointLimits};
 pub use joint::Mapping;
+pub use learn::{LearnStatus, Learned, RangeLearner};
 pub use robot::{Joint, JointState, Robot};
 pub use units::JointUnits;

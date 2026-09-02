@@ -79,6 +79,14 @@ pub struct Robot {
     /// Opened buses, in the order they were opened, so they can be closed in
     /// reverse once every joint has let go.
     buses: Vec<(String, Bus)>,
+
+    /// One daisy chain per Dynamixel bus.
+    ///
+    /// Every servo on a port shares a period: one sync write for the goals and
+    /// one sync read for the readings, rather than a round trip per joint. On a
+    /// sixteen-servo chain that is the difference between a machine that comes
+    /// up and one where the ninth joint onwards never energises.
+    chains: Vec<(String, Arc<drlabs_dynamixel::chain::Chain>)>,
 }
 
 impl Robot {
@@ -89,6 +97,7 @@ impl Robot {
             config,
             joints: Vec::new(),
             buses: Vec::new(),
+            chains: Vec::new(),
         })
     }
 
@@ -123,7 +132,7 @@ impl Robot {
             let rate = self.config.rate_for_bus(&config.bus);
 
             let link = self
-                .link_for(&config)
+                .link_for(&config, rate)
                 .map_err(|error| Error::Config(format!("joint {:?}: {error}", config.name)))?;
 
             let session = Session::new(Options {
@@ -150,7 +159,15 @@ impl Robot {
             });
         }
 
-        self.wait_until_armed(Duration::from_secs(5))
+        // Arming is not instant and it is not free of the bus. Every joint has
+        // to see at least one telemetry cycle before its preflight can pass,
+        // and on a shared chain those cycles are taken in turn — so the window
+        // has to grow with the machine. Five seconds is right for a single axis
+        // and quietly wrong for sixteen, where it produced a bring-up that
+        // failed with no joint able to say why: nothing was blocking, there had
+        // simply not been time.
+        let budget = Duration::from_millis(5_000 + 500 * self.config.joints.len() as u64);
+        self.wait_until_armed(budget)
     }
 
     /// Waits for every joint to energise, and says which ones did not.
@@ -162,8 +179,16 @@ impl Robot {
                 .iter()
                 .filter(|joint| !joint.session.status().armed)
                 .map(|joint| {
-                    let preflight = joint.session.preflight();
-                    format!("{} ({})", joint.name, preflight.blocking.join(" "))
+                    // A latched e-stop keeps a joint unarmed with nothing in
+                    // its preflight to show for it; surface it, or a bring-up
+                    // that fails this way says every joint's reason is empty.
+                    let status = joint.session.status();
+                    if let Some(estop) = status.estop {
+                        format!("{} [estop {}: {}]", joint.name, estop.code, estop.detail)
+                    } else {
+                        let preflight = joint.session.preflight();
+                        format!("{} ({})", joint.name, preflight.blocking.join(" "))
+                    }
                 })
                 .collect();
 
@@ -182,7 +207,11 @@ impl Robot {
 
     /// Builds the link for one joint, opening its bus if this is the first
     /// joint on it.
-    fn link_for(&mut self, config: &JointConfig) -> std::result::Result<Box<dyn Link>, String> {
+    fn link_for(
+        &mut self,
+        config: &JointConfig,
+        rate_hz: u32,
+    ) -> std::result::Result<Box<dyn Link>, String> {
         let bus = self
             .config
             .bus(&config.bus)
@@ -225,9 +254,11 @@ impl Robot {
                     None => None,
                 };
                 let baud = if bus.baud == 0 { 1_000_000 } else { bus.baud };
+                let chain = self.chain_for(&bus, rate_hz);
                 Ok(Box::new(
                     DynamixelLink::new(port, config.id as u8, profile)
-                        .with_port_name(&bus.port, baud),
+                        .with_port_name(&bus.port, baud)
+                        .with_chain(chain),
                 ))
             }
             // A simulated joint needs no bus at all, which is what lets a
@@ -279,6 +310,32 @@ impl Robot {
         Ok(shared)
     }
 
+    /// The chain every Dynamixel on this bus shares, made on first use.
+    ///
+    /// The period is the bus's own control period: a link asking for a reading
+    /// more often than that gets the one already taken, which is what keeps N
+    /// joints from turning one period into N transactions.
+    fn chain_for(
+        &mut self,
+        config: &BusConfig,
+        rate_hz: u32,
+    ) -> Arc<drlabs_dynamixel::chain::Chain> {
+        if let Some((_, chain)) = self.chains.iter().find(|(name, _)| name == &config.name) {
+            return chain.clone();
+        }
+        let port = match self.buses.iter().find(|(name, _)| name == &config.name) {
+            Some((_, Bus::Serial(shared))) => shared.clone(),
+            _ => unreachable!("the serial port is opened before the chain is asked for"),
+        };
+        let rate = rate_hz.max(1);
+        let chain = Arc::new(drlabs_dynamixel::chain::Chain::new(
+            Arc::new(drlabs_dynamixel::driver::Driver::new(port)),
+            std::time::Duration::from_micros(1_000_000 / rate as u64),
+        ));
+        self.chains.push((config.name.clone(), chain.clone()));
+        chain
+    }
+
     fn serial_port(&mut self, config: &BusConfig) -> std::result::Result<SharedPort, String> {
         if let Some((_, bus)) = self.buses.iter().find(|(name, _)| name == &config.name) {
             return match bus {
@@ -322,6 +379,8 @@ impl Robot {
             joint.session.shutdown();
         }
         self.joints.clear();
+        // The chains hold a driver over the port, so they go before it does.
+        self.chains.clear();
         while self.buses.pop().is_some() {}
     }
 
@@ -428,6 +487,164 @@ impl Robot {
         )
     }
 
+    /// A host-profiled move on several joints, started together.
+    ///
+    /// The difference from [`Robot::set_positions`] is the shape of the move,
+    /// not the destination. A pose applied as a setpoint is a step: every joint
+    /// is told where to be and each one gets there as fast as its own limits
+    /// allow, so a machine crossing a large angle lurches and the joints arrive
+    /// at different times. A trajectory is planned — each joint accelerates,
+    /// runs and decelerates under a profile — which is what a whole-body move
+    /// to a named pose has to be.
+    ///
+    /// Every joint is checked before any of them starts, so a pose that one
+    /// joint cannot take does not leave the machine half moved.
+    ///
+    /// `max_velocity` and `accel` are ceilings, not speeds: each joint is
+    /// additionally held to its own envelope underneath.
+    pub fn move_many(
+        &self,
+        targets: &BTreeMap<String, Rad>,
+        max_velocity: RadPerSec,
+        accel: RadPerSec2,
+    ) -> Result<()> {
+        for name in targets.keys() {
+            self.joint(name)?;
+        }
+        let ordered: Vec<&Joint> = self
+            .joints
+            .iter()
+            .filter(|joint| targets.contains_key(&joint.name))
+            .collect();
+
+        for joint in &ordered {
+            joint
+                .session
+                .can_command(ControlMode::Position)
+                .map_err(|error| {
+                    Error::Refused(format!(
+                        "joint {:?}: {error} (the move was not started)",
+                        joint.name
+                    ))
+                })?;
+        }
+
+        let mut failed = Vec::new();
+        for joint in ordered {
+            let target = targets[&joint.name];
+            if let Err(error) = joint.session.start_trajectory(
+                joint.mapping.motor_position(target),
+                joint.mapping.motor_velocity(max_velocity).abs(),
+                joint.mapping.motor_accel(accel).abs(),
+            ) {
+                failed.push(format!("{}: {error}", joint.name));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Refused(failed.join(", ")))
+        }
+    }
+
+    /// Moves to a pose the description names, under a profile.
+    pub fn move_to_pose(
+        &self,
+        pose: &str,
+        max_velocity: RadPerSec,
+        accel: RadPerSec2,
+    ) -> Result<()> {
+        let targets = self
+            .config
+            .pose(pose)
+            .ok_or_else(|| Error::Config(format!("no pose named {pose:?}")))?
+            .iter()
+            .map(|(name, &radians)| (name.clone(), Rad(radians)))
+            .collect();
+        self.move_many(&targets, max_velocity, accel)
+    }
+
+    /// The poses this robot's description carries.
+    pub fn pose_names(&self) -> Vec<&str> {
+        self.config.pose_names()
+    }
+
+    /// Energises every joint where it already is, and commands nothing further.
+    ///
+    /// This is what a bring-up is for: the machine becomes rigid in the shape
+    /// it is already in, and whatever drives it afterwards — a panel, a
+    /// program — is the only thing that moves it. Arming already adopts the
+    /// measured position as the target, so nothing travels; this only stops the
+    /// loop from being the thing that decides where the joints should be.
+    ///
+    /// The one register write is the goal position the servo is already at.
+    /// Leaving it out would be worse rather than purer: torque would come on
+    /// against whatever goal the *previous* session left behind, and the joint
+    /// would set off for it.
+    pub fn hold_where_they_are(&self) -> Result<()> {
+        // Arming raises a flag; it is the control loop's next pass that acts on
+        // it — enabling torque and writing the goal the arm adopted. Switching
+        // to Query before that pass has run would stop the loop from ever
+        // getting there, and the machine would come up limp while reporting
+        // itself armed. So wait for the controller to say it is driving.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let waiting: Vec<&str> = self
+                .joints
+                .iter()
+                .filter(|joint| {
+                    let status = joint.session.status();
+                    status.armed && status.telemetry.mode.unwrap_or(0) == 0
+                })
+                .map(|joint| joint.name.as_str())
+                .collect();
+            if waiting.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Refused(format!(
+                    "these joints armed but never reported driving: {}",
+                    waiting.join(", ")
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut failed = Vec::new();
+        for joint in &self.joints {
+            if let Err(error) = joint.session.set_mode(ControlMode::Query) {
+                failed.push(format!("{}: {error}", joint.name));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Refused(failed.join(", ")))
+        }
+    }
+
+    /// Releases every joint and keeps it released.
+    ///
+    /// Disarming on its own does not do this. A robot's joints arm themselves —
+    /// there is nobody standing at an axis to press a button — so a joint told
+    /// to stop is driving again on the next cycle. For anything that needs the
+    /// machine limp in the operator's hands, automatic arming has to be turned
+    /// off first and the release made to stick.
+    pub fn release_all(&self) {
+        for joint in &self.joints {
+            joint.session.set_auto_arm(false);
+            joint.session.disarm("released for hand movement");
+        }
+    }
+
+    /// Lets the joints arm themselves again. They adopt the position they are
+    /// in, so whatever the machine was moved to is where it becomes rigid.
+    pub fn allow_arming(&self) {
+        for joint in &self.joints {
+            joint.session.set_auto_arm(true);
+        }
+    }
+
     pub fn hold(&self, name: &str) -> Result<()> {
         self.joint(name)?.session.set_mode(ControlMode::Hold)
     }
@@ -488,10 +705,20 @@ impl Robot {
                     armed: status.armed,
                     mode: status.mode,
                     estop: status.estop.is_some(),
+                    // The message names the class of failure and the detail
+                    // says which one it actually was. "Transport error" alone
+                    // sends an operator to read the source; "Transport error:
+                    // read: timed out" does not.
                     estop_reason: status
                         .estop
                         .as_ref()
-                        .map(|estop| estop.message.clone())
+                        .map(|estop| {
+                            if estop.detail.is_empty() {
+                                estop.message.clone()
+                            } else {
+                                format!("{}: {}", estop.message, estop.detail)
+                            }
+                        })
                         .unwrap_or_default(),
 
                     position_rad: telemetry
@@ -589,6 +816,7 @@ mod tests {
             rate_hz: 0,
             buses: Vec::new(),
             joints: Vec::new(),
+            poses: Default::default(),
         };
         assert!(Robot::new(config).is_err());
     }

@@ -23,6 +23,16 @@ pub struct Config {
     pub buses: Vec<BusConfig>,
 
     pub joints: Vec<JointConfig>,
+
+    /// Named poses, in joint space: `{ "base": { "l_sh_p": 0.26, … } }`.
+    ///
+    /// A pose belongs in the description rather than in a panel, for the same
+    /// reason the envelope does: it is a fact about this machine, and the
+    /// binary that drives it should not have to be rebuilt to change where
+    /// "base" is. A pose may name a subset of the joints; the ones it leaves
+    /// out are not commanded.
+    #[serde(default)]
+    pub poses: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
 }
 
 /// One physical link, shared by the joints on it.
@@ -80,12 +90,144 @@ pub struct JointLimits {
     pub max_velocity_rad_s: f64,
     #[serde(default)]
     pub max_accel_rad_s2: f64,
+
+    /// The supply band this joint should be judged against, in volts.
+    ///
+    /// Leave these out and the motor's own documented range is used — the
+    /// driver knows what it is connected to, and its datasheet is the authority
+    /// on what counts as a sagging supply. Set them to hold a joint to a
+    /// tighter band than its datasheet allows: a 12 V servo on a bench supply
+    /// that must never be allowed below 11.5 V, say. Both have to be given
+    /// together, because half a band is not one.
+    #[serde(default)]
+    pub bus_voltage_min: Option<f64>,
+    #[serde(default)]
+    pub bus_voltage_max: Option<f64>,
 }
 
 /// Why a description was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct ConfigError(pub String);
+
+/// One joint's limits and sense, as an operator edited them.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LimitEdit {
+    pub min_rad: Option<f64>,
+    pub max_rad: Option<f64>,
+    /// +1 or -1. Changing it flips the joint's sense, so the travel measured
+    /// under the old one no longer describes the same places.
+    pub direction: Option<f64>,
+}
+
+impl Config {
+    /// Applies edited limits and writes the description back.
+    ///
+    /// The file is the machine's definition, so this is deliberately strict:
+    /// the edits are applied to a copy, the copy is validated exactly as a
+    /// freshly loaded description would be, and only then does anything reach
+    /// the disk. A narrowed limit that no longer contains a named pose is
+    /// refused here rather than discovered on the next bring-up.
+    ///
+    /// The previous file is kept alongside as `<name>.bak`. It is usually
+    /// hand-written, and the first thing anybody does with a learned range is
+    /// decide they preferred the old one.
+    pub fn write_limits(
+        path: &std::path::Path,
+        edits: &std::collections::BTreeMap<String, LimitEdit>,
+    ) -> Result<Self, ConfigError> {
+        let mut config = Self::load(path)?;
+
+        for (name, edit) in edits {
+            let joint = config
+                .joints
+                .iter_mut()
+                .find(|joint| &joint.name == name)
+                .ok_or_else(|| ConfigError(format!("no joint named {name:?}")))?;
+
+            if let Some(value) = edit.min_rad {
+                joint.limits.min_rad = value;
+            }
+            if let Some(value) = edit.max_rad {
+                joint.limits.max_rad = value;
+            }
+            if let Some(value) = edit.direction {
+                if value != 1.0 && value != -1.0 {
+                    return Err(ConfigError(format!(
+                        "joint {name:?}: direction {value} must be 1 or -1"
+                    )));
+                }
+                joint.direction = value;
+            }
+        }
+
+        config.validate()?;
+
+        let text = serde_json::to_string_pretty(&config)
+            .map_err(|error| ConfigError(format!("cannot render the description: {error}")))?;
+
+        // Prove the rendered file loads before replacing anything with it.
+        Self::parse(&text).map_err(|error| {
+            ConfigError(format!(
+                "the edited description would not load: {}",
+                error.0
+            ))
+        })?;
+
+        if path.exists() {
+            let backup = path.with_extension("json.bak");
+            std::fs::copy(path, &backup).map_err(|error| {
+                ConfigError(format!("cannot back up to {}: {error}", backup.display()))
+            })?;
+        }
+        std::fs::write(path, text.as_bytes())
+            .map_err(|error| ConfigError(format!("cannot write {}: {error}", path.display())))?;
+
+        Ok(config)
+    }
+}
+
+/// Checks the driver-specific options a joint carries.
+///
+/// These name things inside a driver — a Dynamixel control-table profile, a
+/// Robstride model — and until this ran, a typo in one of them was found by
+/// powering the robot: the description validated, the plan printed, and the
+/// bring-up failed on the first joint it tried to open. A name that does not
+/// resolve is a description that will not come up, which is precisely what
+/// `-check` exists to say.
+fn check_driver_options(where_: &str, joint: &JointConfig) -> Result<(), ConfigError> {
+    match joint.driver.as_str() {
+        "dynamixel" => {
+            if let Some(name) = joint.options.get("profile") {
+                if drlabs_dynamixel::profile::profile_named(name).is_none() {
+                    return Err(ConfigError(format!(
+                        "{where_}: unknown dynamixel profile {name:?} (known: {})",
+                        drlabs_dynamixel::profile::PROFILE_NAMES.join(", ")
+                    )));
+                }
+            }
+        }
+        "robstride" => {
+            // The driver refuses an undeclared model outright, because the
+            // scaling differs by up to a factor of twenty across the family.
+            match joint.options.get("model") {
+                None => {
+                    return Err(ConfigError(format!(
+                        "{where_}: robstride needs a model option; the scaling differs by up                          to a factor of twenty across the family"
+                    )))
+                }
+                Some(name) if drlabs_robstride::lookup_model(name).is_none() => {
+                    return Err(ConfigError(format!(
+                        "{where_}: unknown robstride model {name:?}"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 pub const DEFAULT_RATE_HZ: u32 = 200;
 pub const MIN_RATE_HZ: u32 = 10;
@@ -229,9 +371,80 @@ impl Config {
             if limits.max_velocity_rad_s <= 0.0 {
                 return Err(ConfigError(format!("{where_} has no max_velocity_rad_s")));
             }
+
+            match (limits.bus_voltage_min, limits.bus_voltage_max) {
+                (None, None) => {}
+                (Some(min), Some(max)) => {
+                    if !min.is_finite() || !max.is_finite() || min <= 0.0 {
+                        return Err(ConfigError(format!(
+                            "{where_} has a non-numeric bus voltage band"
+                        )));
+                    }
+                    if max <= min {
+                        return Err(ConfigError(format!(
+                            "{where_} has an empty bus voltage band [{min}, {max}]"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError(format!(
+                        "{where_} gives only half a bus voltage band; set both                          bus_voltage_min and bus_voltage_max, or neither"
+                    )))
+                }
+            }
+
+            check_driver_options(&where_, joint)?;
         }
 
+        self.check_poses()?;
         Ok(())
+    }
+
+    /// Checks that every pose names joints that exist and angles they can
+    /// reach.
+    ///
+    /// A pose that asks for a joint outside its envelope is not a pose: the
+    /// target is clamped on the way through, so the machine would go to a
+    /// different shape from the one written down and nothing would say so.
+    fn check_poses(&self) -> Result<(), ConfigError> {
+        for (pose, targets) in &self.poses {
+            if targets.is_empty() {
+                return Err(ConfigError(format!("pose {pose:?} commands no joints")));
+            }
+            for (name, &radians) in targets {
+                let joint = self
+                    .joints
+                    .iter()
+                    .find(|joint| &joint.name == name)
+                    .ok_or_else(|| {
+                        ConfigError(format!(
+                            "pose {pose:?} names joint {name:?}, which does not exist"
+                        ))
+                    })?;
+                if !radians.is_finite() {
+                    return Err(ConfigError(format!(
+                        "pose {pose:?} gives joint {name:?} a non-numeric angle"
+                    )));
+                }
+                if radians < joint.limits.min_rad || radians > joint.limits.max_rad {
+                    return Err(ConfigError(format!(
+                        "pose {pose:?} puts joint {name:?} at {radians} rad, outside its travel [{}, {}]; it would be clamped on the way through and the machine would not take the shape the pose describes",
+                        joint.limits.min_rad, joint.limits.max_rad
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A named pose, in joint-space radians.
+    pub fn pose(&self, name: &str) -> Option<&std::collections::BTreeMap<String, f64>> {
+        self.poses.get(name)
+    }
+
+    /// The poses this description carries, in a stable order.
+    pub fn pose_names(&self) -> Vec<&str> {
+        self.poses.keys().map(String::as_str).collect()
     }
 
     pub fn bus(&self, name: &str) -> Option<&BusConfig> {
@@ -264,11 +477,30 @@ impl Config {
     /// already 400.
     pub fn bus_load(&self) -> Vec<(String, u32)> {
         let mut load: Vec<(String, u32)> = Vec::new();
+        let mut chained: Vec<&str> = Vec::new();
+
         for joint in &self.joints {
             let rate = self.rate_for_bus(&joint.bus);
+
+            // Dynamixels on one port are cycled together: a sync write for
+            // every goal and a sync read for every reading, two transactions a
+            // period whatever the joint count. Counting them one apiece was
+            // right when each link went to the wire on its own, and reporting
+            // it that way now overstates a sixteen-joint chain by eightfold.
+            let cost = if joint.driver == "dynamixel" {
+                if chained.contains(&joint.bus.as_str()) {
+                    0
+                } else {
+                    chained.push(&joint.bus);
+                    2 * rate
+                }
+            } else {
+                rate
+            };
+
             match load.iter_mut().find(|(name, _)| name == &joint.bus) {
-                Some((_, total)) => *total += rate,
-                None => load.push((joint.bus.clone(), rate)),
+                Some((_, total)) => *total += cost,
+                None => load.push((joint.bus.clone(), cost)),
             }
         }
         load.sort_by(|a, b| a.0.cmp(&b.0));
@@ -336,20 +568,232 @@ mod tests {
     }
 
     /// The number that decides whether a machine works.
+    /// A profile name that does not resolve is a description that will not
+    /// come up, and `-check` is the place to say so — not the first joint of
+    /// a bring-up with the machine powered.
     #[test]
-    fn the_bus_load_is_the_sum_of_what_is_on_it() {
+    fn a_profile_name_that_does_not_resolve_is_refused() {
+        let text = r#"{
+            "robot": "t", "rate_hz": 100,
+            "buses": [{ "name": "dxl0", "transport": "serial", "port": "COM3" }],
+            "joints": [{
+                "name": "j1", "bus": "dxl0", "driver": "dynamixel", "id": 1,
+                "options": { "profile": "mx-64" },
+                "gear_ratio": 1.0, "direction": 1,
+                "limits": { "min_rad": -1, "max_rad": 1,
+                            "max_torque_nm": 1, "max_velocity_rad_s": 1 }
+            }]
+        }"#;
+        let error = Config::parse(text).expect_err("the profile does not exist");
+        assert!(error.0.contains("unknown dynamixel profile"), "{}", error.0);
+        assert!(error.0.contains("mx64"), "the message lists the real names");
+
+        // And the corrected name loads.
+        let ok = text.replace("mx-64", "mx64");
+        assert!(Config::parse(&ok).is_ok());
+    }
+
+    /// A Robstride with no model is refused for the same reason the driver
+    /// refuses it: the scaling differs by up to a factor of twenty.
+    #[test]
+    fn a_robstride_without_a_model_is_refused_before_anything_opens() {
+        let text = r#"{
+            "robot": "t", "rate_hz": 100,
+            "buses": [{ "name": "can0", "transport": "fdcanusb", "port": "COM5" }],
+            "joints": [{
+                "name": "j1", "bus": "can0", "driver": "robstride", "id": 1,
+                "gear_ratio": 1.0, "direction": 1,
+                "limits": { "min_rad": -1, "max_rad": 1,
+                            "max_torque_nm": 1, "max_velocity_rad_s": 1 }
+            }]
+        }"#;
+        let error = Config::parse(text).expect_err("no model was named");
+        assert!(error.0.contains("model"), "{}", error.0);
+    }
+
+    /// A CAN bus carries a transaction per joint per cycle. A Dynamixel chain
+    /// carries two a period — the sync write and the sync read — however many
+    /// servos are on it, which is the whole reason a sixteen-joint chain can
+    /// keep time at all.
+    #[test]
+    fn a_can_bus_is_charged_per_joint_and_a_chain_is_charged_once() {
         let mut config = Config::parse(SHOULDER_PAIR).unwrap();
         assert_eq!(
             config.bus_load(),
-            vec![("can0".into(), 200), ("dxl0".into(), 100)]
+            vec![("can0".into(), 200), ("dxl0".into(), 200)],
+            "one moteus at 200 Hz, and one chain at 100 Hz costing a write and a read"
         );
 
-        // A second joint on the serial bus doubles what it is asked for.
+        // A second servo on the same chain rides the transactions already
+        // being sent, and costs nothing more.
         let mut second = config.joints[1].clone();
         second.name = "l_sh_r".into();
         second.id = 2;
         config.joints.push(second);
         assert_eq!(config.bus_load()[1], ("dxl0".into(), 200));
+
+        // A second joint on the CAN bus does cost another transaction.
+        let mut third = config.joints[0].clone();
+        third.name = "r_sh_r".into();
+        third.id = 2;
+        config.joints.push(third);
+        assert_eq!(config.bus_load()[0], ("can0".into(), 400));
+    }
+
+    /// A pose is part of the description, and a description that validates has
+    /// to mean the pose will be taken — not clamped into something else.
+    #[test]
+    fn a_pose_outside_a_joints_travel_is_refused() {
+        let with_pose = |value: &str| {
+            SHOULDER_PAIR.replace(
+                "\"joints\":",
+                &format!("\"poses\": {{ \"base\": {{ \"r_sh_p\": {value} }} }}, \"joints\":"),
+            )
+        };
+
+        let ok = Config::parse(&with_pose("0.5")).expect("0.5 rad is inside the travel");
+        assert_eq!(ok.pose("base").unwrap()["r_sh_p"], 0.5);
+        assert_eq!(ok.pose_names(), vec!["base"]);
+
+        let error = Config::parse(&with_pose("2.5")).expect_err("2.5 rad is outside it");
+        assert!(error.0.contains("outside its travel"), "{}", error.0);
+        assert!(error.0.contains("r_sh_p"), "{}", error.0);
+    }
+
+    /// A pose naming a joint that is not on the machine is a rename nobody
+    /// finished, and it would silently move fewer joints than it says.
+    #[test]
+    fn a_pose_naming_an_unknown_joint_is_refused() {
+        let text = SHOULDER_PAIR.replace(
+            "\"joints\":",
+            "\"poses\": { \"base\": { \"l_elbow\": 0.0 } }, \"joints\":",
+        );
+        let error = Config::parse(&text).expect_err("there is no l_elbow");
+        assert!(error.0.contains("l_elbow"), "{}", error.0);
+        assert!(error.0.contains("does not exist"), "{}", error.0);
+    }
+
+    /// A description with no poses is the ordinary case and must stay legal.
+    #[test]
+    fn a_description_without_poses_is_fine() {
+        let config = Config::parse(SHOULDER_PAIR).unwrap();
+        assert!(config.pose_names().is_empty());
+        assert!(config.pose("base").is_none());
+    }
+
+    /// The whole point of writing back: the edit lands, the rest of the file
+    /// survives, and what is on disk still loads.
+    #[test]
+    fn edited_limits_are_written_and_the_description_still_loads() {
+        let dir = std::env::temp_dir().join("drlabs-write-limits");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("robot.json");
+        std::fs::write(&path, SHOULDER_PAIR).unwrap();
+
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert(
+            "r_sh_p".to_string(),
+            LimitEdit {
+                min_rad: Some(-0.8),
+                max_rad: Some(1.1),
+                direction: Some(-1.0),
+            },
+        );
+
+        let written = Config::write_limits(&path, &edits).expect("the edit is valid");
+        assert_eq!(written.joints[0].limits.min_rad, -0.8);
+        assert_eq!(written.joints[0].limits.max_rad, 1.1);
+        assert_eq!(written.joints[0].direction, -1.0);
+
+        // What is on disk is what comes back.
+        let reloaded = Config::load(&path).expect("the written file loads");
+        assert_eq!(reloaded, written);
+
+        // The joint nobody edited is untouched.
+        assert_eq!(reloaded.joints[1].name, written.joints[1].name);
+        assert_eq!(
+            reloaded.joints[1].limits.max_rad,
+            Config::parse(SHOULDER_PAIR).unwrap().joints[1]
+                .limits
+                .max_rad
+        );
+
+        // And the file it replaced is still there.
+        assert!(path.with_extension("json.bak").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit that would not load must not reach the disk. The description is
+    /// the machine's definition, and a half-written one is a robot that will
+    /// not come up.
+    #[test]
+    fn an_edit_that_would_not_validate_leaves_the_file_alone() {
+        let dir = std::env::temp_dir().join("drlabs-write-limits-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("robot.json");
+        std::fs::write(&path, SHOULDER_PAIR).unwrap();
+
+        let mut edits = std::collections::BTreeMap::new();
+        // An empty travel range: max is not above min.
+        edits.insert(
+            "r_sh_p".to_string(),
+            LimitEdit {
+                min_rad: Some(0.5),
+                max_rad: Some(0.5),
+                direction: None,
+            },
+        );
+        let error = Config::write_limits(&path, &edits).expect_err("an empty range is not a range");
+        assert!(error.0.contains("empty travel range"), "{}", error.0);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SHOULDER_PAIR,
+            "the file must be exactly as it was"
+        );
+
+        // A direction that is neither sense is refused too.
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert(
+            "r_sh_p".to_string(),
+            LimitEdit {
+                min_rad: None,
+                max_rad: None,
+                direction: Some(0.0),
+            },
+        );
+        assert!(Config::write_limits(&path, &edits).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SHOULDER_PAIR);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A limit narrowed past a named pose is caught before it is written, not
+    /// on the next bring-up.
+    #[test]
+    fn a_limit_that_strands_a_pose_is_refused() {
+        let dir = std::env::temp_dir().join("drlabs-write-limits-pose");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("robot.json");
+        let with_pose = SHOULDER_PAIR.replace(
+            "\"joints\":",
+            "\"poses\": { \"base\": { \"r_sh_p\": 1.0 } }, \"joints\":",
+        );
+        std::fs::write(&path, &with_pose).unwrap();
+
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert(
+            "r_sh_p".to_string(),
+            LimitEdit {
+                min_rad: Some(-0.2),
+                max_rad: Some(0.2),
+                direction: None,
+            },
+        );
+        let error = Config::write_limits(&path, &edits).expect_err("base sits at 1.0 rad");
+        assert!(error.0.contains("outside its travel"), "{}", error.0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), with_pose);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A typo in a limit is a machine running with a limit nobody set. Silence

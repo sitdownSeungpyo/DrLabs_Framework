@@ -9,7 +9,7 @@
 //! same axis is legitimately `0.477 rev` and `3.000 rad` at the same instant,
 //! so a number without its space is not a fact.
 
-use drlabs_core::units::{Nm, Rad, RadPerSec, RadPerSec2, Rev, RevPerSec, RevPerSec2};
+use drlabs_core::units::{Nm, Rad, RadPerSec, RadPerSec2, Rev, RevPerSec, RevPerSec2, Volts};
 use drlabs_safety::Config as SafetyConfig;
 
 use crate::config::{JointConfig, JointLimits};
@@ -105,6 +105,15 @@ impl Mapping {
             .abs();
         if limits.max_accel_rad_s2 > 0.0 {
             config.accel_limit = self.motor_accel(RadPerSec2(limits.max_accel_rad_s2)).abs();
+        }
+
+        // A declared band is the operator's, and the driver's datasheet does not
+        // override it. Saying nothing leaves the default in place for the link
+        // to replace with what the motor is actually rated for.
+        if let (Some(min), Some(max)) = (limits.bus_voltage_min, limits.bus_voltage_max) {
+            config.bus_voltage_min = Volts(min);
+            config.bus_voltage_max = Volts(max);
+            config.voltage_band_declared = true;
         }
 
         // A robot's joints are commanded by a program, not by a browser, so the
@@ -211,6 +220,8 @@ mod tests {
             offset_rad: 0.0,
         };
         let limits = JointLimits {
+            bus_voltage_min: None,
+            bus_voltage_max: None,
             min_rad: -1.0,
             max_rad: 2.0,
             max_torque_nm: 1.0,
@@ -235,6 +246,8 @@ mod tests {
     fn the_declared_limits_become_the_motor_space_envelope() {
         let mapping = reduced();
         let limits = JointLimits {
+            bus_voltage_min: None,
+            bus_voltage_max: None,
             min_rad: -0.5,
             max_rad: 0.5,
             max_torque_nm: 19.0,
@@ -255,6 +268,8 @@ mod tests {
     #[test]
     fn a_joint_has_no_operator_deadman() {
         let limits = JointLimits {
+            bus_voltage_min: None,
+            bus_voltage_max: None,
             min_rad: -1.0,
             max_rad: 1.0,
             max_torque_nm: 1.0,

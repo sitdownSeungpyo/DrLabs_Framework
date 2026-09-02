@@ -31,6 +31,15 @@ pub struct Config {
     // --- electrical trips -------------------------------------------------
     pub bus_voltage_min: Volts,
     pub bus_voltage_max: Volts,
+
+    /// Whether the voltage band above was chosen for this machine, or is just
+    /// the default nobody picked.
+    ///
+    /// It decides who wins against the motor's own datasheet. A band somebody
+    /// set is a deliberate margin and stands; a default is not a fact about
+    /// any particular motor, and deferring to it means a 12 V servo protected
+    /// by a number that came from a struct initialiser.
+    pub voltage_band_declared: bool,
     pub current_trip: Amps,
     /// Seconds the current must stay over the limit.
     pub current_trip_time: f64,
@@ -94,6 +103,7 @@ impl Default for Config {
 
             bus_voltage_min: Volts(11.0),
             bus_voltage_max: Volts(42.0),
+            voltage_band_declared: false,
             current_trip: Amps(12.0),
             current_trip_time: 0.40,
 
@@ -217,11 +227,28 @@ impl Config {
             }
             _ => return Vec::new(),
         };
+        let before = (self.bus_voltage_min, self.bus_voltage_max);
+
+        // Nobody chose the band, so the datasheet is the better authority.
+        if !self.voltage_band_declared {
+            if before == (min, max) {
+                return Vec::new();
+            }
+            self.bus_voltage_min = min;
+            self.bus_voltage_max = max;
+            return vec![format!(
+                "bus voltage band taken from the hardware's rated range [{}, {}] V, replacing the default [{}, {}] V",
+                min.value(),
+                max.value(),
+                before.0.value(),
+                before.1.value(),
+            )];
+        }
+
         if rated >= self.bus_voltage_min && rated <= self.bus_voltage_max {
             return Vec::new();
         }
 
-        let before = (self.bus_voltage_min, self.bus_voltage_max);
         self.bus_voltage_min = min;
         self.bus_voltage_max = max;
 
@@ -390,11 +417,13 @@ mod tests {
         );
     }
 
-    /// The defect this fixed on the bench: a healthy XL330 reporting 4.8 V
+    /// With nothing declared, the motor's own rated range becomes the band.
+    ///
+    /// The XL330 case this started with: a healthy servo reporting 4.8 V
     /// against a band inherited from a 12 V bus could not be armed at all.
     #[test]
-    fn a_band_that_excludes_the_rated_supply_is_widened() {
-        let mut config = Config::default(); // 11..42 V
+    fn an_undeclared_band_is_taken_from_the_hardware() {
+        let mut config = Config::default(); // 11..42 V, nobody's choice
         let envelope = Envelope {
             voltage_min: Some(Volts(3.7)),
             voltage_max: Some(Volts(6.0)),
@@ -406,29 +435,73 @@ mod tests {
         assert_eq!(config.bus_voltage_min, Volts(3.7));
         assert_eq!(config.bus_voltage_max, Volts(6.0));
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("5 V rated supply"), "{}", notes[0]);
+        assert!(notes[0].contains("rated range"), "{}", notes[0]);
     }
 
-    /// And a band that already contains it is left exactly as declared,
-    /// margins and all. This is the one place the layer relaxes a limit, so it
-    /// has to stay narrow.
+    /// The MX-64 case, and the reason this rule changed. Its rated 12 V sits
+    /// inside the default 11..42 V band, so the old rule left the default in
+    /// place and tripped the motor at 10.9 V — a voltage its own e-Manual
+    /// permits, the datasheet range being 10.0 to 14.8 V.
     #[test]
-    fn a_band_that_contains_the_rated_supply_is_untouched() {
+    fn a_twelve_volt_motor_is_judged_by_its_datasheet_not_the_default() {
+        let mut config = Config::default();
+        let envelope = Envelope {
+            voltage_min: Some(Volts(10.0)),
+            voltage_max: Some(Volts(14.8)),
+            voltage_rated: Some(Volts(12.0)),
+            ..Default::default()
+        };
+
+        let notes = config.fit_voltage_to(&envelope);
+        assert_eq!(config.bus_voltage_min, Volts(10.0), "10.9 V must not trip");
+        assert_eq!(config.bus_voltage_max, Volts(14.8));
+        assert_eq!(notes.len(), 1, "the change is reported: {notes:?}");
+    }
+
+    /// A band the description declared is a deliberate margin and stands, even
+    /// though it is tighter than the datasheet allows.
+    #[test]
+    fn a_declared_band_is_left_exactly_as_declared() {
         let mut config = Config {
-            bus_voltage_min: Volts(20.0),
-            bus_voltage_max: Volts(30.0),
+            bus_voltage_min: Volts(11.5),
+            bus_voltage_max: Volts(13.0),
+            voltage_band_declared: true,
             ..Default::default()
         };
         let envelope = Envelope {
             voltage_min: Some(Volts(10.0)),
-            voltage_max: Some(Volts(44.0)),
-            voltage_rated: Some(Volts(24.0)),
+            voltage_max: Some(Volts(14.8)),
+            voltage_rated: Some(Volts(12.0)),
             ..Default::default()
         };
 
         assert!(config.fit_voltage_to(&envelope).is_empty());
-        assert_eq!(config.bus_voltage_min, Volts(20.0), "the margin survives");
-        assert_eq!(config.bus_voltage_max, Volts(30.0));
+        assert_eq!(config.bus_voltage_min, Volts(11.5), "the margin survives");
+        assert_eq!(config.bus_voltage_max, Volts(13.0));
+    }
+
+    /// Except when it excludes the rated supply outright: such a band protects
+    /// nothing and only makes the machine unarmable, so it is widened even
+    /// though somebody chose it.
+    #[test]
+    fn a_declared_band_that_excludes_the_rated_supply_is_still_widened() {
+        let mut config = Config {
+            bus_voltage_min: Volts(20.0),
+            bus_voltage_max: Volts(30.0),
+            voltage_band_declared: true,
+            ..Default::default()
+        };
+        let envelope = Envelope {
+            voltage_min: Some(Volts(3.7)),
+            voltage_max: Some(Volts(6.0)),
+            voltage_rated: Some(Volts(5.0)),
+            ..Default::default()
+        };
+
+        let notes = config.fit_voltage_to(&envelope);
+        assert_eq!(config.bus_voltage_min, Volts(3.7));
+        assert_eq!(config.bus_voltage_max, Volts(6.0));
+        assert!(notes[0].contains("5 V rated supply"), "{}", notes[0]);
     }
 
     /// A driver that does not know its own rated supply cannot ask for this.

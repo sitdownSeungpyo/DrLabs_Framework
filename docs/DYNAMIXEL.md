@@ -320,3 +320,44 @@ open and identify, profile resolution in all three cases above, position
 control, velocity control, the fast/full telemetry split, 885 cycles/s with no
 failures, and `bringup` from a robot description with the host envelope
 clamping a 99 rad request to the joint's 5.5 rad limit.
+
+## 미해결: sync write goal 이 큰 변화를 서보에 반영하지 못한다 (2026-09-03)
+
+15축 UBP(`configs/ubp.json`, COM7 3Mbaud, id 11 XL430 은 12.3V over-voltage 로 제외한
+15축)를 base 포즈로 trajectory 이동(panel `POST /api/move {"pose":"base"}` →
+`Robot::move_to_pose` → `start_trajectory`)하면 arming·trajectory 는 정상인데 서보가
+목표까지 가지 않는다. 층별로 좁힌 결과, 원인은 **session 도 trajectory 도 아니고**
+sync write goal 이 서보에 반영되지 않는 실물 동작 하나로 좁혀졌으나 그 이유는 미확정.
+
+확인한 사실(모두 벤치 실측):
+
+- **session / trajectory / setpoint 는 전부 정상.** setpoint → `command.position` →
+  goal counts 가 한 필드(`state.setpoint.position`)에서 나오고, trajectory 가
+  progress 0→1 로 정상 진행하며, chain 이 write 하려는 goal counts = setpoint
+  (확인함: write=2219 = base target 0.262 rad). 이 경로 전체를 전수 확인했다.
+- **문제는 서보에 안 먹히는 것.** chain 의 sync write(0x83, broadcast)로 goal 2219 를
+  보내도 서보 Goal Position(116)은 2050(현재)에 머문다 — write 직후 같은 Driver 로
+  reg 116 을 read 해 확인(`wrote=2219 servo_reg116=2050`). 진행 중의 작은 변화(2053)는
+  반영되나 큰 변화(2219)는 안 된다.
+- **개별 write(0x03)로 바꾸면** 값은 서보에 반영되나, 15축에서는 그 status 응답이
+  chain 의 sync read 응답 스트림과 섞여 0x04 data-range-error 경합 → link_error e-stop.
+- **run(단일 서보, 개별 write)은 큰 goal 도 움직인다** (0.499→0.616 rev 확인) — 경합이
+  없어서. 서보·드라이버·개별 write 자체는 정상.
+- **Drive Mode(reg 10) = 0**: 전원 재투입 후 DYNAMIXEL Wizard 로 전 서보 확인,
+  velocity-based 이며 Time-based Profile 아님. Time-based 리셋 가설은 **기각**.
+- 주의: 디버깅 중 서보 Status Return Level(reg 68, RAM)을 1로 바꿨다가 전원 재투입으로
+  복원함. 다음에 무응답이면 이 값(2 여야)부터 의심.
+
+다음 단계(우선순위):
+
+1. Wizard 에서 Goal Position 을 **큰 값으로 직접 write** 했을 때 서보가 움직이는지 —
+   움직이면 sync write broadcast 패킷 문제(15서보 79바이트 params 의 파싱/정렬/CRC),
+   안 움직이면 서보 Profile Configuration/Drive Mode 이외의 설정 문제.
+2. 같은 goal 값에 대해 sync write(0x83) 패킷과 개별 write(0x03) 패킷을 byte 로 비교.
+3. 유력한 수정 방향: goal 을 chain 의 단일 스레드가 **순차 개별 write(응답 받음)**로
+   방출 — sync read 와 안 섞이므로 경합 없이 개별 write 의 이점(반영됨)을 얻는다.
+   이번에 시도했을 때 e-stop 이 났으나, 그때는 별개로 setpoint 가 아직 target 이 아닌
+   시점이었을 가능성이 있어(진행 중 값과 완료 값이 섞임) 재검증이 필요하다.
+
+이번 세션에 완성·커밋된 것(별개, 정상 동작): 제어 주기 hot-path 최적화, 그리고
+단일 I/O 아키텍처로 15축 100Hz arming 달성. base **이동**만 위 이유로 미완이다.

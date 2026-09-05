@@ -199,7 +199,7 @@ class Eight(Act):
 class Wave(Act):
     """One arm raised forward, forearm folded up, waving with elbow yaw."""
 
-    def __init__(self, args, side, base, gripper, head, head_hold=False):
+    def __init__(self, args, side, base, gripper, head, head_hold=False, start_pose=None):
         self.name = f"wave-{side}"
         self.args = args
         self.side = side
@@ -208,31 +208,55 @@ class Wave(Act):
         # With head_hold the head is somebody else's (the face overlay keeps
         # it on the person being greeted), so the nod is left out.
         self.head = {} if head_hold else head
-        self.ramp = args.wave_ramp
-        self.duration = 2 * args.wave_ramp + args.wave_hold
+        # Where the arms are when the wave begins. From the playlist that is
+        # base; for a greeting it is whatever the interrupted act had just
+        # sent, so the arm rises from there instead of going home first.
+        self.start = dict(base)
+        if start_pose:
+            self.start.update({n: v for n, v in start_pose.items() if n in self.start})
+        arm = dc.ARMS[self.side]
+        self.raised = {arm["sh_p"]: args.wave_sh_p, arm["sh_r"]: args.wave_sh_r, arm["elb_p"]: args.wave_elb_p}
+        # The rise takes as long as the biggest joint change needs at
+        # --wave-rise-velocity, within [1.5 s, --wave-ramp].
+        travel = max([abs(v - self.start[n]) for n, v in self.raised.items()]
+                     + [abs(self.start[n] - base[n]) for n in self.start])
+        self.ramp = min(args.wave_ramp, max(1.5, travel / args.wave_rise_velocity)) if start_pose else args.wave_ramp
+        self.exit_ramp = args.wave_ramp
+        self.duration = self.ramp + args.wave_hold + self.exit_ramp
+
+    def phases(self, t):
+        """(rise 0..1, fall 0..1): rise runs over the entry ramp, fall over
+        the exit ramp; both smooth."""
+        rise = dc.smoothstep(t / self.ramp) if self.ramp > 0 else 1.0
+        fall_start = self.duration - self.exit_ramp
+        fall = dc.smoothstep((t - fall_start) / self.exit_ramp) if t > fall_start and self.exit_ramp > 0 else 0.0
+        return rise, fall
 
     def blend(self, t):
         """0 at rest, 1 in the raised pose, smooth both ways."""
-        if t < self.ramp:
-            return dc.smoothstep(t / self.ramp)
-        if t > self.duration - self.ramp:
-            return 1.0 - dc.smoothstep((t - (self.duration - self.ramp)) / self.ramp)
-        return 1.0
+        rise, fall = self.phases(t)
+        return rise * (1.0 - fall)
 
     def targets(self, t):
         args = self.args
-        s = self.blend(t)
-        out = dict(self.base)
+        rise, fall = self.phases(t)
+        s = rise * (1.0 - fall)
         arm = dc.ARMS[self.side]
-        pose = {"sh_p": args.wave_sh_p, "sh_r": args.wave_sh_r, "elb_p": args.wave_elb_p}
-        for key, raised in pose.items():
-            name = arm[key]
-            out[name] = self.base[name] + s * (raised - self.base[name])
+        out = {}
+        for name in self.start:
+            if name in self.raised:
+                # start → raised on the way up, raised → base on the way down.
+                up = self.start[name] + rise * (self.raised[name] - self.start[name])
+                out[name] = up + fall * (self.base[name] - up)
+            else:
+                # Everything else settles from wherever it was to base during the rise.
+                out[name] = self.start[name] + rise * (self.base[name] - self.start[name])
         # The wave itself: elbow yaw about zero, scaled by the blend so it
         # starts and ends at rest with the ramp.
         tw = t - self.ramp
         if arm["elb_y"] in out:
-            out[arm["elb_y"]] = s * args.wave_amp * math.sin(2 * math.pi * args.wave_hz * tw)
+            out[arm["elb_y"]] = (self.start[arm["elb_y"]] * (1.0 - rise)
+                                 + s * args.wave_amp * math.sin(2 * math.pi * args.wave_hz * tw))
         # One gripper fold in the middle of the hold, ramps inside the 0.5 rad/s
         # gripper ceiling.
         name = arm["gripper"]
@@ -603,9 +627,21 @@ class HeadOverlay:
         self.base_pitch = base.get(self.pitch_joint, 0.0)
         self.yaw_range = self._inset(limits[self.yaw_joint])
         self.pitch_range = self._inset(limits[self.pitch_joint])
-        self.yaw = self.base_yaw
-        self.pitch = self.base_pitch
+        import face_tracker
+        self.controller = face_tracker.HeadController(
+            args.head_yaw_sign, args.head_pitch_sign, self.base_yaw, self.base_pitch,
+            self.yaw_range, self.pitch_range, latency=args.head_latency, gain=args.head_gain,
+            tau=args.head_tau, max_vel=args.head_max_vel, max_acc=args.head_max_acc,
+            search_amplitude=args.search_amplitude, search_period=args.search_period)
         self.candidate = None
+
+    @property
+    def yaw(self):
+        return self.controller.pos[0]
+
+    @property
+    def pitch(self):
+        return self.controller.pos[1]
 
     @staticmethod
     def _inset(lim):
@@ -617,23 +653,20 @@ class HeadOverlay:
         been re-armed wherever they were)."""
         try:
             joints = panel.joints()
-            if joints[self.yaw_joint]["position_rad"] is not None:
-                self.yaw = joints[self.yaw_joint]["position_rad"]
-            if joints[self.pitch_joint]["position_rad"] is not None:
-                self.pitch = joints[self.pitch_joint]["position_rad"]
+            yaw = joints[self.yaw_joint]["position_rad"]
+            pitch = joints[self.pitch_joint]["position_rad"]
+            self.controller.reset(self.yaw if yaw is None else yaw,
+                                  self.pitch if pitch is None else pitch)
         except (Interrupted, KeyError):
             pass
 
     def __call__(self, targets):
-        args = self.args
-        self.yaw, self.pitch, self.candidate = self.tracker.head_step(
-            self.yaw, self.pitch, args.head_yaw_sign, args.head_pitch_sign,
-            self.base_yaw, self.base_pitch, self.yaw_range, self.pitch_range,
-            gain=args.head_gain, search_amplitude=args.search_amplitude,
-            search_period=args.search_period)
+        obs = self.tracker.observation()
+        self.candidate = None if obs is None else self.tracker.candidate()
+        yaw, pitch = self.controller.update(time.monotonic(), obs)
         out = dict(targets)
-        out[self.yaw_joint] = self.yaw
-        out[self.pitch_joint] = self.pitch
+        out[self.yaw_joint] = yaw
+        out[self.pitch_joint] = pitch
         return out
 
     def side_of_person(self):
@@ -650,7 +683,7 @@ class HeadOverlay:
         snap = self.tracker.snapshot()
         return {"faces": len(snap["tracks"]), "fps": snap["fps"], "error": snap["error"],
                 "candidate": self.candidate, "tracks": snap["tracks"],
-                "head": {"yaw": round(self.yaw, 3), "pitch": round(self.pitch, 3)}}
+                "head": self.controller.summary()}
 
 
 def calibrate_head(panel, tracker, args, base):
@@ -715,8 +748,12 @@ def calibrate_head(panel, tracker, args, base):
 
 # ---------------------------------------------------------------- the runner
 
-def approach(panel, targets, args, label, overlay=None):
+def approach(panel, targets, args, label, overlay=None, cut=None):
     """A profiled move to `targets`, and a wait until it has arrived.
+
+    With `cut`, the wait also asks every 100 ms whether the move should be
+    abandoned (someone to greet); the Cut then carries where the joints
+    actually are, so the greeting can start from there.
 
     Arrival is: no trajectory still running (`moving_to_rad` is null once the
     profile is spent) and every joint within --settle-tol of its target.
@@ -744,6 +781,16 @@ def approach(panel, targets, args, label, overlay=None):
         stopped = stopped_joints(joints, names)
         if stopped:
             raise Interrupted(f"{label}: e-stop on " + ", ".join(stopped))
+        if cut is not None:
+            try:
+                cut()
+            except Cut as why:
+                # Stop the profile where it is: a step to the present position.
+                here = {n: joints[n]["position_rad"] for n in names if joints[n]["position_rad"] is not None}
+                panel.pose(here)
+                why.targets = here
+                why.at = time.monotonic()
+                raise
         moving = [n for n in names if joints[n]["moving_to_rad"] is not None]
         errors = {n: abs(joints[n]["position_rad"] - joints[n]["target_rad"])
                   for n in names if joints[n]["position_rad"] is not None}
@@ -779,7 +826,13 @@ def stream(panel, act, args, label, overlay=None, cut=None, status=None):
             raise Interrupted(f"{label} t={t:.1f}s: pose refused: {r['error']}"
                               + ("; e-stop on " + ", ".join(stopped) if stopped else ""))
         if cut is not None:
-            cut()
+            try:
+                cut()
+            except Cut as why:
+                # Whoever handles the cut starts from exactly what was just sent.
+                why.targets = dict(targets)
+                why.at = time.monotonic()
+                raise
         if i % int(args.rate) == 0:
             joints = panel.joints()
             stopped = stopped_joints(joints, names)
@@ -847,21 +900,41 @@ def run_show(args, cast, playlist, base, limits, supervisor, faces=None):
         if faces is not None:
             faces.resync(panel)
 
-    def greet(track):
-        """Head stays on the person (the overlay keeps it there); the nearer
-        arm waves. Then that person is done with, and the show resumes."""
+    def greet(track, start_pose, cut_at):
+        """Right now, from wherever the arms are: the head stays on the
+        person (the overlay keeps it there), the nearer arm rises from its
+        current pose and waves, and the wave ends at base. Then that person
+        is done with."""
         nonlocal greetings
         side = faces.side_of_person()
         greetings += 1
+        wave = Wave(args, side, base, cast.gripper, cast.head, head_hold=True, start_pose=start_pose)
         note("greet", f"#{greetings}: face #{track['id']} at {track['distance_m'] or 0:.2f} m looked for "
-                      f"{track['looking_for']:.1f} s; waving with the {'left' if side == 'l' else 'right'} arm")
-        wave = Wave(args, side, base, cast.gripper, cast.head, head_hold=True)
+                      f"{track['looking_for']:.1f} s; waving with the {'left' if side == 'l' else 'right'} arm "
+                      f"(reaction {time.monotonic() - cut_at:.2f} s, rise {wave.ramp:.1f} s)")
         label = f"[cycle {cycle} greet {wave.name}]"
-        approach(panel, wave.targets(0.0), args, label, overlay=faces)
         status(wave, greeting=track["id"])
         stream(panel, wave, args, label, overlay=faces, status={"greeting": track["id"]})
         faces.tracker.mark_greeted(track["id"])
         note("greet", f"done; face #{track['id']} is greeted, searching for someone else")
+
+    def greet_then_linger(first):
+        """A greeting, then a moment at base watching for the next person;
+        anyone already looking gets greeted straight away, from base."""
+        pending = first
+        while pending is not None:
+            greet(pending.track, pending.targets, pending.at)
+            pending = None
+            linger = Rest(args, base, {})
+            linger.name = "linger"
+            linger.duration = args.greet_linger
+            try:
+                status(linger)
+                stream(panel, linger, args, f"[cycle {cycle} linger]", overlay=faces, cut=cut)
+            except Cut as again:
+                if again.reason == "quit":
+                    raise Quit()
+                pending = again
 
     while True:
         cycle += 1
@@ -872,15 +945,14 @@ def run_show(args, cast, playlist, base, limits, supervisor, faces=None):
             while True:
                 try:
                     status(act)
-                    approach(panel, act.targets(0.0), args, label, overlay=faces)
+                    approach(panel, act.targets(0.0), args, label, overlay=faces, cut=cut)
                     stream(panel, act, args, label, overlay=faces, cut=cut)
                     break
                 except Cut as cut_reason:
                     if cut_reason.reason == "quit":
                         raise Quit()
                     try:
-                        back_to_base(f"[cycle {cycle} greet approach]")
-                        greet(cut_reason.track)
+                        greet_then_linger(cut_reason)
                     except Interrupted as error:
                         recover(str(error))
                         back_to_base("[base]")
@@ -957,9 +1029,18 @@ def main():
                     help="+1 when a positive pan joint turns the camera toward the image's right (see --calibrate-head)")
     ap.add_argument("--head-pitch-sign", type=float, default=-1.0, choices=[1.0, -1.0],
                     help="+1 when a positive tilt joint turns the camera toward the image's bottom")
-    ap.add_argument("--head-gain", type=float, default=0.6, help="fraction of the face's bearing applied per tick")
+    ap.add_argument("--head-latency", type=float, default=0.35,
+                    help="seconds from a head command to its appearance in a detection (camera + panel loop + servo)")
+    ap.add_argument("--head-gain", type=float, default=0.7, help="fraction of a frame's bearing applied to the target")
+    ap.add_argument("--head-tau", type=float, default=0.2, help="target low-pass time constant, s")
+    ap.add_argument("--head-max-vel", type=float, default=0.5, help="head command velocity ceiling, rad/s")
+    ap.add_argument("--head-max-acc", type=float, default=2.0, help="head command acceleration ceiling, rad/s^2")
     ap.add_argument("--search-amplitude", type=float, default=0.5, help="rad either side of base while searching")
-    ap.add_argument("--search-period", type=float, default=8.0, help="seconds per search sweep")
+    ap.add_argument("--search-period", type=float, default=10.0, help="seconds per search sweep")
+    ap.add_argument("--greet-linger", type=float, default=1.5,
+                    help="seconds at base after a greeting, watching for the next person")
+    ap.add_argument("--wave-rise-velocity", type=float, default=0.4,
+                    help="rad/s used to size the rise when a greeting starts from a moving pose")
     ap.add_argument("--look-seconds", type=float, default=3.0, help="how long a face must look before a greeting")
     ap.add_argument("--look-yaw-deg", type=float, default=20.0)
     ap.add_argument("--look-pitch-deg", type=float, default=20.0)

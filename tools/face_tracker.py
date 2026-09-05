@@ -24,10 +24,12 @@ What it produces, for the show:
 - A candidate. The nearest live track that has not been greeted (by depth
   at the nose; by box size when depth is missing). The head follows the
   candidate; when none exists the head searches.
-- A head step. `head_step(yaw, pitch)` returns the next head joint values:
-  a proportional step toward the candidate, or the search sweep. The joint
-  signs are not known here — the show passes `yaw_sign` / `pitch_sign` from
-  its calibration.
+- An observation. `observation()` is the candidate's bearing from the
+  optical axis and the time of the frame it was seen in; `HeadController`
+  turns those into head joint commands (latency-compensated, rate-limited —
+  see its docstring). The joint signs are not known here — the show passes
+  `yaw_sign` / `pitch_sign` from its calibration. `--simulate` exercises the
+  controller against a model of the lag without a camera.
 
 Head pose comes from the landmarker's facial transformation matrix. The face
 forward axis is the third column of its rotation; yaw and pitch are the
@@ -36,6 +38,7 @@ the viewer, not a datasheet — see `pose_angles`.
 """
 
 import argparse
+import collections
 import math
 import os
 import threading
@@ -169,13 +172,14 @@ def pose_angles(matrix):
 # ---------------------------------------------------------------- tracks
 
 class Track:
-    __slots__ = ("id", "bbox", "centre", "size", "distance_m", "yaw", "pitch",
+    __slots__ = ("id", "bbox", "centre", "smooth_centre", "size", "distance_m", "yaw", "pitch",
                  "first_seen", "last_seen", "looking_since", "look_lost_at", "greeted", "hits")
 
     def __init__(self, tid, t):
         self.id = tid
         self.bbox = (0, 0, 0, 0)
         self.centre = (0.0, 0.0)
+        self.smooth_centre = None
         self.size = 0.0
         self.distance_m = None
         self.yaw = 0.0
@@ -357,6 +361,12 @@ class FaceTracker:
     def _observe(self, track, det, t):
         track.bbox = det["bbox"]
         track.centre = det["centre"]
+        # A few frames of averaging on the centre the head is aimed at; the
+        # landmark box wobbles by a few pixels frame to frame.
+        if track.smooth_centre is None:
+            track.smooth_centre = det["centre"]
+        else:
+            track.smooth_centre = tuple(0.6 * s + 0.4 * c for s, c in zip(track.smooth_centre, det["centre"]))
         track.size = det["size"]
         if det["distance_m"] is not None:
             track.distance_m = det["distance_m"]
@@ -390,14 +400,28 @@ class FaceTracker:
     # -- queries (all take the lock; cheap)
 
     def candidate(self):
+        """The nearest un-greeted face — but the one being followed keeps
+        its place unless it has been gone 0.7 s or somebody is clearly
+        (20 %) closer, so the head does not flick between two people."""
         with self.lock:
+            t = time.monotonic()
             live = [tr for tr in self.tracks.values() if not tr.greeted and tr.hits >= 3]
             if not live:
+                self.current_id = None
                 return None
-            with_depth = [tr for tr in live if tr.distance_m is not None]
-            pick = min(with_depth, key=lambda tr: tr.distance_m) if with_depth \
-                else max(live, key=lambda tr: tr.size)
-            return pick.as_dict(time.monotonic())
+
+            def distance(tr):
+                return tr.distance_m if tr.distance_m is not None else 10.0 / max(tr.size, 1.0) * 100
+
+            nearest = min(live, key=distance)
+            current = self.tracks.get(getattr(self, "current_id", None))
+            if (current is not None and not current.greeted and t - current.last_seen < 0.7
+                    and distance(nearest) > 0.8 * distance(current)):
+                pick = current
+            else:
+                pick = nearest
+            self.current_id = pick.id
+            return pick.as_dict(t)
 
     def greet_ready(self):
         c = self.candidate()
@@ -422,32 +446,20 @@ class FaceTracker:
 
     # -- the head
 
-    def head_step(self, yaw, pitch, yaw_sign, pitch_sign, base_yaw, base_pitch,
-                  yaw_range, pitch_range, gain=0.6, deadband_deg=1.5, max_step=0.04,
-                  search_amplitude=0.5, search_period=8.0, t=None):
-        """Next (head_y, head_p) from the current ones.
-
-        Toward the candidate when there is one: the face's bearing from the
-        optical axis is exactly the joint error, since the camera is on the
-        head. Otherwise a slow sweep across the room, pitch at base.
-        """
-        t = time.monotonic() if t is None else t
+    def observation(self):
+        """The candidate as the head controller wants it: the bearing of its
+        (smoothed) centre from the optical axis and the time of the frame it
+        was seen in. None when there is nobody to follow."""
         cand = self.candidate()
-        if cand is not None and self.camera.fx:
-            bx, by = self.camera.bearing(*cand["centre"])
-            dead = math.radians(deadband_deg)
-            dy = 0.0 if abs(bx) < dead else yaw_sign * gain * bx
-            dp = 0.0 if abs(by) < dead else pitch_sign * gain * by
-            target_yaw, target_pitch = yaw + dy, pitch + dp
-        else:
-            phase = (t % search_period) / search_period
-            tri = 4 * abs(phase - 0.5) - 1          # -1..1 triangle
-            target_yaw, target_pitch = base_yaw + search_amplitude * tri, base_pitch
-        step_y = max(-max_step, min(max_step, target_yaw - yaw))
-        step_p = max(-max_step, min(max_step, target_pitch - pitch))
-        new_yaw = min(yaw_range[1], max(yaw_range[0], yaw + step_y))
-        new_pitch = min(pitch_range[1], max(pitch_range[0], pitch + step_p))
-        return new_yaw, new_pitch, cand
+        if cand is None or not self.camera.fx:
+            return None
+        with self.lock:
+            track = self.tracks.get(cand["id"])
+            if track is None:
+                return None
+            centre, seen = track.smooth_centre, track.last_seen
+        return {"id": cand["id"], "frame_t": seen, "bearing": self.camera.bearing(*centre)}
+
 
     # -- pictures
 
@@ -499,6 +511,183 @@ class FaceTracker:
 
 # ---------------------------------------------------------------- viewer
 
+
+class HeadController:
+    """Turns face bearings into head joint commands that a servo can follow
+    without hunting.
+
+    The first version added a fraction of the bearing to the command on every
+    tick. With ~200 ms between a head movement and its appearance in a
+    detection (exposure, detection, the panel's 10 Hz loop, the servo), the
+    head had been corrected several more times before the first correction
+    showed — it overshot, then swung back, on every face. This one:
+
+    - forms an *absolute* target once per new frame: the command that was in
+      force when the frame was taken (from a short history, `latency` back)
+      plus the bearing seen in that frame. One frame, one correction.
+    - ignores bearings inside a deadband, so a still face is a still head.
+    - low-passes the target (`tau`) and moves the command toward it under a
+      velocity and an acceleration ceiling, with the stopping-distance rule
+      so it does not overshoot the target.
+    - when the face is lost, holds for `hold_seconds`, then sweeps the room
+      on a sine that starts from where the head is.
+
+    Pure arithmetic on the numbers it is given: `--simulate` runs it against
+    a model of the camera lag and the servo.
+    """
+
+    def __init__(self, yaw_sign, pitch_sign, base_yaw, base_pitch, yaw_range, pitch_range,
+                 latency=0.35, gain=0.7, tau=0.2, max_vel=0.5, max_acc=2.0, deadband_deg=1.5,
+                 hold_seconds=1.5, search_amplitude=0.5, search_period=10.0):
+        self.yaw_sign, self.pitch_sign = yaw_sign, pitch_sign
+        self.base = (base_yaw, base_pitch)
+        self.ranges = (yaw_range, pitch_range)
+        self.latency, self.tau = latency, tau
+        # Less than the whole bearing per frame: the latency is only known
+        # roughly, and the remainder is picked up by the next frame.
+        self.gain = gain
+        self.max_vel, self.max_acc = max_vel, max_acc
+        self.deadband = math.radians(deadband_deg)
+        self.hold_seconds = hold_seconds
+        self.search_amplitude, self.search_period = search_amplitude, search_period
+        self.pos = [base_yaw, base_pitch]      # the command, as sent
+        self.vel = [0.0, 0.0]
+        self.target = [base_yaw, base_pitch]   # smoothed
+        self.raw = [base_yaw, base_pitch]      # last absolute target
+        self.history = collections.deque()     # (t, yaw, pitch) commands
+        self.last_frame_t = -1.0
+        self.last_seen_t = None
+        self.search_start = None
+        self.search_phase = 0.0
+        self.t_prev = None
+        self.mode = "search"
+        self.following = None
+
+    def reset(self, yaw, pitch):
+        """Adopt where the head actually is (after a restart)."""
+        self.pos = [yaw, pitch]
+        self.vel = [0.0, 0.0]
+        self.target = [yaw, pitch]
+        self.raw = [yaw, pitch]
+        self.history.clear()
+
+    def command_at(self, t):
+        """The command that was in force at time t."""
+        best = None
+        for entry in self.history:
+            if entry[0] <= t:
+                best = entry
+            else:
+                break
+        if best is None:
+            best = self.history[0] if self.history else (t, self.pos[0], self.pos[1])
+        return best[1], best[2]
+
+    def update(self, t, observation):
+        """One tick. Returns (yaw, pitch) to send."""
+        dt = 0.05 if self.t_prev is None else min(0.1, max(0.005, t - self.t_prev))
+        self.t_prev = t
+
+        if observation is not None and observation["frame_t"] > self.last_frame_t:
+            self.last_frame_t = observation["frame_t"]
+            self.last_seen_t = t
+            self.following = observation["id"]
+            y0, p0 = self.command_at(observation["frame_t"] - self.latency)
+            bx, by = observation["bearing"]
+            if abs(bx) >= self.deadband:
+                self.raw[0] = y0 + self.yaw_sign * self.gain * bx
+            if abs(by) >= self.deadband:
+                self.raw[1] = p0 + self.pitch_sign * self.gain * by
+            self.mode = "track"
+            self.search_start = None
+        elif self.last_seen_t is not None and t - self.last_seen_t < self.hold_seconds:
+            self.mode = "hold"
+        else:
+            if self.search_start is None:
+                # Start the sweep from where the head is, not from base.
+                self.search_start = t
+                ratio = (self.pos[0] - self.base[0]) / self.search_amplitude if self.search_amplitude else 0.0
+                self.search_phase = math.asin(max(-1.0, min(1.0, ratio)))
+                self.following = None
+            phase = self.search_phase + 2 * math.pi * (t - self.search_start) / self.search_period
+            self.raw[0] = self.base[0] + self.search_amplitude * math.sin(phase)
+            self.raw[1] = self.base[1]
+            self.mode = "search"
+
+        alpha = 1.0 - math.exp(-dt / self.tau) if self.tau > 0 else 1.0
+        for i in range(2):
+            lo, hi = self.ranges[i]
+            self.raw[i] = min(hi, max(lo, self.raw[i]))
+            self.target[i] += (self.raw[i] - self.target[i]) * alpha
+            err = self.target[i] - self.pos[i]
+            # Fast enough to get there, slow enough to stop there.
+            v_want = math.copysign(min(self.max_vel, math.sqrt(2 * self.max_acc * abs(err))), err)
+            dv = max(-self.max_acc * dt, min(self.max_acc * dt, v_want - self.vel[i]))
+            self.vel[i] += dv
+            self.pos[i] += self.vel[i] * dt
+            if self.pos[i] < lo or self.pos[i] > hi:
+                self.pos[i] = min(hi, max(lo, self.pos[i]))
+                self.vel[i] = 0.0
+        self.history.append((t, self.pos[0], self.pos[1]))
+        while self.history and t - self.history[0][0] > 2.0:
+            self.history.popleft()
+        return self.pos[0], self.pos[1]
+
+    def summary(self):
+        return {"yaw": round(self.pos[0], 3), "pitch": round(self.pos[1], 3),
+                "target_yaw": round(self.target[0], 3), "target_pitch": round(self.target[1], 3),
+                "mode": self.mode, "following": self.following}
+
+
+def simulate(latency_true=0.2, noise_rad=0.005, servo_tau=0.08, seconds=6.0, **kw):
+    """The controller against a model of the loop it lives in: a face at a
+    fixed bearing, a servo that follows the command with a lag through a
+    10 Hz sample-and-hold, and a 30 fps camera whose frames show the head
+    as it was `latency_true` ago. Returns (overshoot fraction, settle time,
+    peak-to-peak command jitter once settled)."""
+    import random
+    face_yaw = 0.5                       # rad, where the face really is
+    ctl = HeadController(1.0, 1.0, 0.0, 0.0, (-2.0, 2.0), (-2.0, 2.0), **kw)
+    head_true = 0.0
+    held = 0.0                           # the panel's 10 Hz sample of the command
+    history = []                         # (t, head_true)
+    step = 0.005
+    t = 0.0
+    next_tick = 0.0
+    next_frame = 0.0
+    next_hold = 0.0
+    obs = None
+    cmd = 0.0
+    peak = 0.0
+    settled_at = None
+    tail = []
+    while t < seconds:
+        if t >= next_hold:
+            held = cmd
+            next_hold += 0.1
+        head_true += (held - head_true) * (1 - math.exp(-step / servo_tau))
+        history.append((t, head_true))
+        if t >= next_frame:
+            t_seen = t - latency_true
+            seen = next((h for tt, h in reversed(history) if tt <= t_seen), 0.0)
+            bearing = face_yaw - seen + random.gauss(0, noise_rad)
+            obs = {"id": 1, "frame_t": t, "bearing": (bearing, 0.0)}
+            next_frame += 1 / 30
+        if t >= next_tick:
+            cmd, _ = ctl.update(t, obs)
+            next_tick += 0.05
+        peak = max(peak, head_true)
+        if settled_at is None and abs(head_true - face_yaw) < math.radians(2):
+            settled_at = t
+        elif settled_at is not None and abs(head_true - face_yaw) >= math.radians(2):
+            settled_at = None
+        if t > seconds - 2.0:
+            tail.append(cmd)
+        t += step
+    overshoot = max(0.0, peak - face_yaw) / face_yaw
+    jitter = (max(tail) - min(tail)) if tail else 0.0
+    return overshoot, settled_at, jitter
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -511,7 +700,21 @@ def main():
     ap.add_argument("--regreet-after", type=float, default=10.0)
     ap.add_argument("--greet-when-ready", action="store_true",
                     help="viewer only: mark the candidate greeted when its look timer completes")
+    ap.add_argument("--simulate", action="store_true",
+                    help="no camera: run the head controller against a model of the lag and the servo")
     args = ap.parse_args()
+    if args.simulate:
+        worst = 0
+        for lag in (0.1, 0.2, 0.3):
+            overshoot, settled, jitter = simulate(latency_true=lag)
+            # 0.5 rad at 0.5 rad/s with the acceleration ramps is ~1.3 s on its
+            # own; the low-pass adds a little. Sweep of 2026-09-05 (docs/SHOW.md).
+            ok = overshoot < 0.10 and settled is not None and settled < 2.5 and jitter < math.radians(0.5)
+            worst += 0 if ok else 1
+            print(f"lag {lag:.1f} s: overshoot {overshoot*100:4.1f} %  settled "
+                  f"{'never' if settled is None else f'{settled:.2f} s'}  jitter {math.degrees(jitter):.2f} deg  "
+                  f"{'ok' if ok else 'FAIL'}")
+        raise SystemExit(worst)
     if args.download_model:
         download_model(args.model)
         if not args.view:

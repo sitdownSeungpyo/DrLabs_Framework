@@ -74,6 +74,28 @@ class Interrupted(Exception):
     """The machine, or the panel, stopped taking the show's commands."""
 
 
+class Cut(Exception):
+    """An act was cut short on purpose: someone is to be greeted, or the
+    monitor asked the show to finish. `.reason` says which; `.track` is the
+    face for a greeting."""
+
+    def __init__(self, reason, track=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.track = track
+
+
+# The show's own view of the machine, for the page and the log. None until
+# main() builds one; every writer checks.
+MONITOR = None
+
+
+def note(kind, text):
+    log(f"{kind}: {text}" if kind not in ("act",) else text)
+    if MONITOR is not None:
+        MONITOR.event(kind, text)
+
+
 # ---------------------------------------------------------------- panel
 
 class Client(dc.Panel):
@@ -174,13 +196,15 @@ class Eight(Act):
 class Wave(Act):
     """One arm raised forward, forearm folded up, waving with elbow yaw."""
 
-    def __init__(self, args, side, base, gripper, head):
+    def __init__(self, args, side, base, gripper, head, head_hold=False):
         self.name = f"wave-{side}"
         self.args = args
         self.side = side
         self.base = base
         self.gripper = gripper
-        self.head = head
+        # With head_hold the head is somebody else's (the face overlay keeps
+        # it on the person being greeted), so the nod is left out.
+        self.head = {} if head_hold else head
         self.ramp = args.wave_ramp
         self.duration = 2 * args.wave_ramp + args.wave_hold
 
@@ -478,12 +502,13 @@ class Supervisor:
     def recover(self, reason):
         """Keeps trying until the machine is armed again. Returns the number
         of attempts it took."""
-        log(f"RECOVERY: {reason}")
+        note("estop", reason)
         attempt = 0
         while True:
             attempt += 1
             delay = min(60.0, 5.0 * 2 ** (attempt - 1))
-            log(f"recovery attempt {attempt}: waiting {delay:.0f} s")
+            note("recovery", f"attempt {attempt}: waiting {delay:.0f} s, then "
+                             + ("restarting the panel" if self.owns_panel else "POST /api/reset"))
             time.sleep(delay)
             try:
                 if self.owns_panel:
@@ -491,17 +516,152 @@ class Supervisor:
                     self.launch()
                 else:
                     self.reset_existing()
-                log(f"recovered after {attempt} attempt(s)")
+                note("recovery", f"recovered after {attempt} attempt(s)")
                 return attempt
             except Interrupted as error:
-                log(f"recovery attempt {attempt} failed: {error}")
+                note("recovery", f"attempt {attempt} failed: {error}")
                 if self.owns_panel:
                     self.stop_panel(release=False)
 
 
+# ---------------------------------------------------------------- the face
+
+class HeadOverlay:
+    """The head, when a camera is on it: follows the face tracker's candidate
+    or sweeps the room. Called on every setpoint; keeps its own idea of where
+    the head is, since the tracker's step is relative.
+
+    Joint signs come from --head-yaw-sign / --head-pitch-sign, which
+    `calibrate_head` measures; with the wrong sign the head runs away from
+    the face and pins at a limit, which is obvious within a second.
+    """
+
+    def __init__(self, tracker, args, base, limits):
+        self.tracker = tracker
+        self.args = args
+        # Which joint pans and which tilts is measured, not assumed: on this
+        # robot the joint called head_p pans and head_y tilts (2026-09-05,
+        # --calibrate-head), whatever the names say.
+        self.yaw_joint = args.head_yaw_joint
+        self.pitch_joint = args.head_pitch_joint
+        self.head_joints = (self.yaw_joint, self.pitch_joint)
+        self.base_yaw = base.get(self.yaw_joint, 0.0)
+        self.base_pitch = base.get(self.pitch_joint, 0.0)
+        self.yaw_range = self._inset(limits[self.yaw_joint])
+        self.pitch_range = self._inset(limits[self.pitch_joint])
+        self.yaw = self.base_yaw
+        self.pitch = self.base_pitch
+        self.candidate = None
+
+    @staticmethod
+    def _inset(lim):
+        lo, hi = lim["min_rad"], lim["max_rad"]
+        return (lo + 0.05 * (hi - lo), hi - 0.05 * (hi - lo))
+
+    def resync(self, panel):
+        """Adopt the head's actual position (after a restart the servos have
+        been re-armed wherever they were)."""
+        try:
+            joints = panel.joints()
+            if joints[self.yaw_joint]["position_rad"] is not None:
+                self.yaw = joints[self.yaw_joint]["position_rad"]
+            if joints[self.pitch_joint]["position_rad"] is not None:
+                self.pitch = joints[self.pitch_joint]["position_rad"]
+        except (Interrupted, KeyError):
+            pass
+
+    def __call__(self, targets):
+        args = self.args
+        self.yaw, self.pitch, self.candidate = self.tracker.head_step(
+            self.yaw, self.pitch, args.head_yaw_sign, args.head_pitch_sign,
+            self.base_yaw, self.base_pitch, self.yaw_range, self.pitch_range,
+            gain=args.head_gain, search_amplitude=args.search_amplitude,
+            search_period=args.search_period)
+        out = dict(targets)
+        out[self.yaw_joint] = self.yaw
+        out[self.pitch_joint] = self.pitch
+        return out
+
+    def side_of_person(self):
+        """Which arm is nearer the person the head is turned to. With the
+        calibrated sign, a positive turn is toward the robot's right."""
+        turn = (self.yaw - self.base_yaw) * self.args.head_yaw_sign
+        if abs(turn) < 0.1:
+            # Straight ahead: take turns.
+            self.alternate = "l" if getattr(self, "alternate", "l") == "r" else "r"
+            return self.alternate
+        return "r" if turn > 0 else "l"
+
+    def summary(self):
+        snap = self.tracker.snapshot()
+        return {"faces": len(snap["tracks"]), "fps": snap["fps"], "error": snap["error"],
+                "candidate": self.candidate, "tracks": snap["tracks"],
+                "head": {"yaw": round(self.yaw, 3), "pitch": round(self.pitch, 3)}}
+
+
+def calibrate_head(panel, tracker, args, base):
+    """Measures the head joints' signs from the picture: turn the head a
+    little, see which way the scene slides.
+
+    A camera panning right slides the scene left. `head_step` adds
+    yaw_sign * bearing, where a face on the image's right has a positive
+    bearing and needs the camera to pan right — so yaw_sign is +1 when a
+    positive head_y slides the scene left (dx < 0). Likewise a camera
+    tilting up slides the scene down; a face above centre has a negative
+    bearing (image y is down) and needs a tilt up — so pitch_sign is -1 when
+    a positive head_p slides the scene down (dy > 0).
+    """
+    import cv2
+    import numpy as np
+
+    def gray():
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with tracker.lock:
+                frame = None if tracker.frame is None else tracker.frame.copy()
+            if frame is not None:
+                return np.float32(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            time.sleep(0.1)
+        raise SystemExit("no camera frame for the calibration")
+
+    def shift(joint, delta, rest):
+        approach(panel, {joint: rest}, args, f"[calibrate {joint} rest]")
+        time.sleep(0.5)
+        before = gray()
+        approach(panel, {joint: rest + delta}, args, f"[calibrate {joint} +{delta}]")
+        time.sleep(0.5)
+        after = gray()
+        (dx, dy), response = cv2.phaseCorrelate(before, after)
+        approach(panel, {joint: rest}, args, f"[calibrate {joint} back]")
+        return dx, dy, response
+
+    # Each joint is turned in turn; the one that slides the scene sideways is
+    # the pan joint, whatever it is called. (Measured here 2026-09-05: the
+    # joint named head_p pans and head_y tilts.)
+    results = {}
+    for joint in ("head_y", "head_p"):
+        dx, dy, resp = shift(joint, args.calibrate_delta, base.get(joint, 0.0))
+        results[joint] = (dx, dy, resp)
+        log(f"{joint} +{args.calibrate_delta} rad: scene shift dx={dx:+.1f} dy={dy:+.1f} px (response {resp:.2f})")
+    weak = [j for j, (_, _, r) in results.items() if r < 0.05]
+    if weak:
+        log(f"WARNING: weak phase-correlation response on {weak}; point the camera at a "
+            f"textured, static scene and run again")
+    yaw_joint = max(results, key=lambda j: abs(results[j][0]) - abs(results[j][1]))
+    pitch_joint = "head_p" if yaw_joint == "head_y" else "head_y"
+    dx = results[yaw_joint][0]
+    dy = results[pitch_joint][1]
+    yaw_sign = 1.0 if dx < 0 else -1.0
+    pitch_sign = -1.0 if dy > 0 else 1.0
+    log(f"{yaw_joint} pans (dx {dx:+.1f} px), {pitch_joint} tilts (dy {dy:+.1f} px)")
+    print(f"\n    --head-yaw-joint {yaw_joint} --head-yaw-sign {yaw_sign:+.0f} "
+          f"--head-pitch-joint {pitch_joint} --head-pitch-sign {pitch_sign:+.0f}\n")
+    return yaw_joint, yaw_sign, pitch_joint, pitch_sign
+
+
 # ---------------------------------------------------------------- the runner
 
-def approach(panel, targets, args, label):
+def approach(panel, targets, args, label, overlay=None):
     """A profiled move to `targets`, and a wait until it has arrived.
 
     Arrival is: no trajectory still running (`moving_to_rad` is null once the
@@ -511,6 +671,10 @@ def approach(panel, targets, args, label):
     cycle and the wait returned before the arm had moved (measured: 0.76 rad
     behind at the first setpoint of the act).
     """
+    if overlay is not None:
+        # The head is the overlay's: it is left out of the profiled move and
+        # keeps following (or searching) while the arms travel.
+        targets = {n: v for n, v in targets.items() if n not in overlay.head_joints}
     r = panel.move(targets, args.approach_velocity, args.approach_velocity * 2)
     if "error" in r:
         raise Interrupted(f"{label}: move refused: {r['error']}")
@@ -518,6 +682,10 @@ def approach(panel, targets, args, label):
     deadline = time.time() + args.settle_timeout
     worst = ("?", 0.0)
     while time.time() < deadline:
+        if overlay is not None:
+            r = panel.pose(overlay({}))
+            if "error" in r:
+                raise Interrupted(f"{label}: head pose refused: {r['error']}")
         joints = panel.joints()
         stopped = stopped_joints(joints, names)
         if stopped:
@@ -533,8 +701,13 @@ def approach(panel, targets, args, label):
                       f"(worst {worst[0]} off by {worst[1]:.3f} rad, tolerance {args.settle_tol})")
 
 
-def stream(panel, act, args, label):
-    """Streams the act's setpoints at --rate until its duration is up."""
+def stream(panel, act, args, label, overlay=None, cut=None, status=None):
+    """Streams the act's setpoints at --rate until its duration is up.
+
+    `overlay(targets)` may rewrite a setpoint before it goes out (the head
+    following a face); `cut()` is asked every tick and may raise Cut to end
+    the act early on purpose; `status` is extra fields for the monitor page.
+    """
     dt = 1.0 / args.rate
     steps = int(act.duration * args.rate)
     names = list(act.targets(0.0))
@@ -542,12 +715,17 @@ def stream(panel, act, args, label):
     t0 = time.perf_counter()
     for i in range(steps + 1):
         t = min(act.duration, i * dt)
-        r = panel.pose(act.targets(t))
+        targets = act.targets(t)
+        if overlay is not None:
+            targets = overlay(targets)
+        r = panel.pose(targets)
         if "error" in r:
             joints = panel.joints()
             stopped = stopped_joints(joints, names)
             raise Interrupted(f"{label} t={t:.1f}s: pose refused: {r['error']}"
                               + ("; e-stop on " + ", ".join(stopped) if stopped else ""))
+        if cut is not None:
+            cut()
         if i % int(args.rate) == 0:
             joints = panel.joints()
             stopped = stopped_joints(joints, names)
@@ -558,43 +736,110 @@ def stream(panel, act, args, label):
             volts = [joints[n]["voltage_v"] for n in arm_names if joints[n]["voltage_v"] and joints[n]["voltage_v"] > 8]
             log(f"{label} t={t:5.1f}s  arm err {err:.3f} rad  V min {min(volts):.1f}" if volts
                 else f"{label} t={t:5.1f}s  arm err {err:.3f} rad")
+            if MONITOR is not None:
+                MONITOR.set_status(t=round(t, 1), **(status or {}))
         next_at = t0 + (i + 1) * dt
         sleep = next_at - time.perf_counter()
         if sleep > 0:
             time.sleep(sleep)
 
 
-def run_show(args, cast, playlist, base, limits, supervisor):
+class Quit(Exception):
+    """The monitor page asked the show to finish."""
+
+
+def run_show(args, cast, playlist, base, limits, supervisor, faces=None):
+    """The playlist, forever. `faces` is the HeadOverlay in --face mode: it
+    rewrites the head in every setpoint and turns a 3 s look into a greeting
+    that cuts into the current act."""
     panel = supervisor.panel
     cycle = 0
     events = 0
+    greetings = 0
+
+    def cut():
+        if MONITOR is not None and MONITOR.quit_requested:
+            raise Cut("quit")
+        if faces is not None:
+            ready = faces.tracker.greet_ready()
+            if ready is not None:
+                raise Cut("greet", ready)
+
+    def status(act, **more):
+        if MONITOR is not None:
+            fields = {"cycle": cycle, "act": act.name, "recoveries": events,
+                      "greetings": greetings, "recovering": False}
+            if faces is not None:
+                fields["tracker"] = faces.summary()
+            fields.update(more)
+            MONITOR.set_status(**fields)
+
+    def back_to_base(label):
+        while True:
+            try:
+                approach(panel, base, args, label, overlay=faces)
+                return
+            except Interrupted as again:
+                recover(str(again))
+
+    def recover(reason):
+        nonlocal events
+        events += 1
+        if args.max_recoveries and events > args.max_recoveries:
+            raise SystemExit(f"giving up after {events - 1} recoveries: {reason}")
+        if MONITOR is not None:
+            MONITOR.set_status(recovering=True, recoveries=events)
+        supervisor.recover(reason)
+        if faces is not None:
+            faces.resync(panel)
+
+    def greet(track):
+        """Head stays on the person (the overlay keeps it there); the nearer
+        arm waves. Then that person is done with, and the show resumes."""
+        nonlocal greetings
+        side = faces.side_of_person()
+        greetings += 1
+        note("greet", f"#{greetings}: face #{track['id']} at {track['distance_m'] or 0:.2f} m looked for "
+                      f"{track['looking_for']:.1f} s; waving with the {'left' if side == 'l' else 'right'} arm")
+        wave = Wave(args, side, base, cast.gripper, cast.head, head_hold=True)
+        label = f"[cycle {cycle} greet {wave.name}]"
+        approach(panel, wave.targets(0.0), args, label, overlay=faces)
+        status(wave, greeting=track["id"])
+        stream(panel, wave, args, label, overlay=faces, status={"greeting": track["id"]})
+        faces.tracker.mark_greeted(track["id"])
+        note("greet", f"done; face #{track['id']} is greeted, searching for someone else")
+
     while True:
         cycle += 1
         for name, repeats in playlist:
             act = cast.make(name, repeats)
             label = f"[cycle {cycle} {act.name}]"
+            note("act", f"{label} starting ({act.duration:.0f} s)")
             while True:
                 try:
-                    approach(panel, act.targets(0.0), args, label)
-                    stream(panel, act, args, label)
+                    status(act)
+                    approach(panel, act.targets(0.0), args, label, overlay=faces)
+                    stream(panel, act, args, label, overlay=faces, cut=cut)
                     break
+                except Cut as cut_reason:
+                    if cut_reason.reason == "quit":
+                        raise Quit()
+                    try:
+                        back_to_base(f"[cycle {cycle} greet approach]")
+                        greet(cut_reason.track)
+                    except Interrupted as error:
+                        recover(str(error))
+                        back_to_base("[base]")
+                    log(f"{label} restarting after the greeting")
                 except Interrupted as error:
-                    events += 1
-                    if args.max_recoveries and events > args.max_recoveries:
-                        raise SystemExit(f"giving up after {events - 1} recoveries: {error}")
-                    supervisor.recover(str(error))
+                    recover(str(error))
                     # Back to base under a profile before the act starts over:
                     # after a servo reboot the arms hang wherever gravity left them.
-                    while True:
-                        try:
-                            approach(panel, base, args, "[base]")
-                            break
-                        except Interrupted as again:
-                            supervisor.recover(str(again))
+                    back_to_base("[base]")
                     log(f"{label} restarting after recovery #{events}")
         if args.once:
             log("one cycle done; returning to base")
-            approach(panel, base, args, "[base]")
+            approach(panel, base, args, "[base]", overlay=faces)
             return
 
 
@@ -645,6 +890,32 @@ def main():
     ap.add_argument("--reset-timeout", type=float, default=15.0)
     ap.add_argument("--max-recoveries", type=int, default=0, help="0 = never give up")
     ap.add_argument("--dry-run", action="store_true")
+    # face
+    ap.add_argument("--face", action="store_true",
+                    help="track faces with the head camera and greet whoever looks for --look-seconds "
+                         "(needs pyrealsense2, opencv, mediapipe: run under imitation_upper's .venv)")
+    ap.add_argument("--face-model", default=None, help="face_landmarker.task (default tools/models/)")
+    ap.add_argument("--head-yaw-joint", default="head_p",
+                    help="the joint that pans the camera (measured with --calibrate-head; on this "
+                         "robot it is the one named head_p)")
+    ap.add_argument("--head-pitch-joint", default="head_y", help="the joint that tilts the camera")
+    ap.add_argument("--head-yaw-sign", type=float, default=-1.0, choices=[1.0, -1.0],
+                    help="+1 when a positive pan joint turns the camera toward the image's right (see --calibrate-head)")
+    ap.add_argument("--head-pitch-sign", type=float, default=-1.0, choices=[1.0, -1.0],
+                    help="+1 when a positive tilt joint turns the camera toward the image's bottom")
+    ap.add_argument("--head-gain", type=float, default=0.6, help="fraction of the face's bearing applied per tick")
+    ap.add_argument("--search-amplitude", type=float, default=0.5, help="rad either side of base while searching")
+    ap.add_argument("--search-period", type=float, default=8.0, help="seconds per search sweep")
+    ap.add_argument("--look-seconds", type=float, default=3.0, help="how long a face must look before a greeting")
+    ap.add_argument("--look-yaw-deg", type=float, default=20.0)
+    ap.add_argument("--look-pitch-deg", type=float, default=20.0)
+    ap.add_argument("--regreet-after", type=float, default=10.0,
+                    help="seconds out of view after which a greeted person counts as somebody new")
+    ap.add_argument("--calibrate-head", action="store_true",
+                    help="measure the head joint signs from the camera picture, print them, exit")
+    ap.add_argument("--calibrate-delta", type=float, default=0.15, help="rad to turn for the calibration")
+    # monitor
+    ap.add_argument("--monitor-addr", default="127.0.0.1:8086", help="the monitoring page; 'off' disables it")
     args = ap.parse_args()
 
     if any(s not in "lr" for s in args.wave_arms) or not args.wave_arms:
@@ -678,7 +949,48 @@ def main():
     if args.dry_run:
         return
 
+    global MONITOR
+    if args.monitor_addr.lower() != "off":
+        import show_monitor
+        host, _, port = args.monitor_addr.rpartition(":")
+        MONITOR = show_monitor.Monitor(args.panel, (host or "127.0.0.1", int(port)))
+        log(f"monitor page on {MONITOR.start()}")
+
+    tracker = None
+    faces = None
+    if args.face or args.calibrate_head:
+        try:
+            import face_tracker
+        except ImportError as error:
+            raise SystemExit(f"--face needs pyrealsense2, opencv and mediapipe ({error}); run under "
+                             f"C:\\pj_depthcam_teleop\\imitation_upper\\.venv\\Scripts\\python.exe")
+        tracker = face_tracker.FaceTracker(
+            model=args.face_model or face_tracker.DEFAULT_MODEL,
+            look_seconds=args.look_seconds, look_yaw_deg=args.look_yaw_deg,
+            look_pitch_deg=args.look_pitch_deg, regreet_after=args.regreet_after)
+        tracker.start()
+        log("face tracker started")
+        if MONITOR is not None:
+            MONITOR.camera = tracker.jpeg
+        if args.face:
+            faces = HeadOverlay(tracker, args, base, limits)
+
     supervisor = Supervisor(args)
+
+    def finish(why):
+        """base pose, release, panel down — or just hold if the panel is not ours."""
+        if supervisor.owns_panel:
+            note("quit", f"{why}; returning to base, then releasing the machine")
+            try:
+                approach(supervisor.panel, base, args, "[base]")
+            except (Interrupted, KeyboardInterrupt) as error:
+                log(f"base return skipped: {error}")
+            supervisor.stop_panel(release=True)
+            log("panel stopped")
+        else:
+            note("quit", f"{why}; holding the last setpoint "
+                         "(the panel's base button, or POST /api/move {\"pose\":\"base\"}, returns it)")
+
     try:
         if supervisor.owns_panel:
             try:
@@ -691,21 +1003,23 @@ def main():
                 supervisor.wait_ready(5.0)
             except Interrupted as error:
                 raise SystemExit(f"no armed panel at {args.panel}: {error}")
-        run_show(args, cast, playlist, base, limits, supervisor)
+        if faces is not None:
+            faces.resync(supervisor.panel)
+        if args.calibrate_head:
+            calibrate_head(supervisor.panel, tracker, args, base)
+            finish("calibration done")
+            return
+        run_show(args, cast, playlist, base, limits, supervisor, faces)
     except KeyboardInterrupt:
         print()
-        if supervisor.owns_panel:
-            log("stopped by user; returning to base, then releasing the machine")
-            try:
-                approach(supervisor.panel, base, args, "[base]")
-            except (Interrupted, KeyboardInterrupt) as error:
-                log(f"base return skipped: {error}")
-            supervisor.stop_panel(release=True)
-            log("panel stopped")
-        else:
-            log("stopped by user; holding the last setpoint "
-                "(the panel's base button, or POST /api/move {\"pose\":\"base\"}, returns it)")
+        finish("stopped by user")
         return
+    except Quit:
+        finish("quit from the monitor page")
+        return
+    finally:
+        if tracker is not None:
+            tracker.stop()
     if supervisor.owns_panel:
         supervisor.stop_panel(release=True)
 

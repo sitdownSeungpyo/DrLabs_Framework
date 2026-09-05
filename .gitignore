@@ -33,3 +33,6 @@ __pycache__/
 
 # Rust build output.
 /target/
+
+# Downloaded vision models (tools/face_tracker.py --download-model)
+tools/models/

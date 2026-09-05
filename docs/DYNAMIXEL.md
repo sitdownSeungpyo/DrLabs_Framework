@@ -147,6 +147,8 @@ still scaled with the servo count, and each undid part of that on the wire.
   is slow. 미검증: the target is 0 (answer immediately); it must be confirmed
   on the bench that this adapter family does not drop the first reply bytes at
   0 before the constant is trusted — raise to 2–4 counts if it does.
+  (2026-09-04 확정: 0 은 3 Mbaud 15축에서 응답 헤더를 깨뜨린다. 지금 값은 10(20 µs).
+  아래 "15축 sync read 꼬리 유실" 섹션.)
 
 - **The wide block rode every period.** A chain read all 21 bytes — through
   voltage and temperature — every period, eleven more per servo than the fast
@@ -321,43 +323,216 @@ control, velocity control, the fast/full telemetry split, 885 cycles/s with no
 failures, and `bringup` from a robot description with the host envelope
 clamping a 99 rad request to the joint's 5.5 rad limit.
 
-## 미해결: sync write goal 이 큰 변화를 서보에 반영하지 못한다 (2026-09-03)
+## 해결: "sync write goal 이 서보에 반영되지 않는다" 는 latch 된 bus watchdog 이었다 (2026-09-04)
 
-15축 UBP(`configs/ubp.json`, COM7 3Mbaud, id 11 XL430 은 12.3V over-voltage 로 제외한
-15축)를 base 포즈로 trajectory 이동(panel `POST /api/move {"pose":"base"}` →
-`Robot::move_to_pose` → `start_trajectory`)하면 arming·trajectory 는 정상인데 서보가
-목표까지 가지 않는다. 층별로 좁힌 결과, 원인은 **session 도 trajectory 도 아니고**
-sync write goal 이 서보에 반영되지 않는 실물 동작 하나로 좁혀졌으나 그 이유는 미확정.
+2026-09-03 에 미해결로 남긴 증상 — 15축 UBP 를 base 포즈로 이동시키면 chain 의 sync
+write(0x83) 로 보낸 goal 을 서보가 무시하고 Goal Position(116) 이 현재 위치에 머문다,
+개별 write(0x03) 로 바꾸면 0x04 data-range-error 가 난다 — 는 패킷 문제가 아니라
+**bus watchdog(98) 이 latch 된 서보의 정상 동작**이다. 벤치(COM7 3 Mbaud, MX-64 id 1)
+에서 `examples/dxl_diag.rs` 로 층별 실측:
 
-확인한 사실(모두 벤치 실측):
+- 토크 on 상태에서 goal = present+100 을 개별 write, 1축 sync write, 16축 sync write
+  로 각각 보내면 **셋 다** 116 에 반영되고 서보가 움직인다. sync write 패킷은 정상.
+- watchdog 을 20(400 ms) 으로 켠 뒤 100 ms 마다 sync read / sync write / 개별 read
+  만 보내면 어느 쪽이든 watchdog 이 리셋되어 20 에 머문다. **아무것도 보내지 않으면**
+  2 s 뒤 98 = 255(latch) 가 되고, 그 상태에서 sync write goal(present+50) 은 116 에
+  반영되지 않고 present 값이 남으며, 같은 값을 개별 write 하면 `Data range error
+  (0x04)` 로 거부된다. XL330 은 같은 상태를 0x07 로 답했다(위 섹션) — 코드는 모델마다
+  다르고 의미는 같다.
+- 토크 off 인 서보는 116 이 present 를 따라가므로 goal 반영 여부를 판정할 수 없다.
+  진단은 토크 on 에서 해야 한다.
 
-- **session / trajectory / setpoint 는 전부 정상.** setpoint → `command.position` →
-  goal counts 가 한 필드(`state.setpoint.position`)에서 나오고, trajectory 가
-  progress 0→1 로 정상 진행하며, chain 이 write 하려는 goal counts = setpoint
-  (확인함: write=2219 = base target 0.262 rad). 이 경로 전체를 전수 확인했다.
-- **문제는 서보에 안 먹히는 것.** chain 의 sync write(0x83, broadcast)로 goal 2219 를
-  보내도 서보 Goal Position(116)은 2050(현재)에 머문다 — write 직후 같은 Driver 로
-  reg 116 을 read 해 확인(`wrote=2219 servo_reg116=2050`). 진행 중의 작은 변화(2053)는
-  반영되나 큰 변화(2219)는 안 된다.
-- **개별 write(0x03)로 바꾸면** 값은 서보에 반영되나, 15축에서는 그 status 응답이
-  chain 의 sync read 응답 스트림과 섞여 0x04 data-range-error 경합 → link_error e-stop.
-- **run(단일 서보, 개별 write)은 큰 goal 도 움직인다** (0.499→0.616 rev 확인) — 경합이
-  없어서. 서보·드라이버·개별 write 자체는 정상.
-- **Drive Mode(reg 10) = 0**: 전원 재투입 후 DYNAMIXEL Wizard 로 전 서보 확인,
-  velocity-based 이며 Time-based Profile 아님. Time-based 리셋 가설은 **기각**.
-- 주의: 디버깅 중 서보 Status Return Level(reg 68, RAM)을 1로 바꿨다가 전원 재투입으로
-  복원함. 다음에 무응답이면 이 값(2 여야)부터 의심.
+즉 지난 세션의 "큰 변화만 안 된다" 는 latch 된 뒤 present 가 조금씩 흐르는 것을 goal
+반영으로 오독한 것이고, latch 는 디버깅 중 어느 시점(개별 write 실험, 프로세스 정지)에
+생긴 뒤 세션이 이어지는 동안 아무도 알아채지 못한 것이다. sync write 는 응답이 없어
+거부를 들을 수 없고, 코드에 98 을 읽는 곳이 `open` 의 clear 외에 없었다.
 
-다음 단계(우선순위):
+고친 것:
 
-1. Wizard 에서 Goal Position 을 **큰 값으로 직접 write** 했을 때 서보가 움직이는지 —
-   움직이면 sync write broadcast 패킷 문제(15서보 79바이트 params 의 파싱/정렬/CRC),
-   안 움직이면 서보 Profile Configuration/Drive Mode 이외의 설정 문제.
-2. 같은 goal 값에 대해 sync write(0x83) 패킷과 개별 write(0x03) 패킷을 byte 로 비교.
-3. 유력한 수정 방향: goal 을 chain 의 단일 스레드가 **순차 개별 write(응답 받음)**로
-   방출 — sync read 와 안 섞이므로 경합 없이 개별 write 의 이점(반영됨)을 얻는다.
-   이번에 시도했을 때 e-stop 이 났으나, 그때는 별개로 setpoint 가 아직 target 이 아닌
-   시점이었을 가능성이 있어(진행 중 값과 완료 값이 섞임) 재검증이 필요하다.
+- **chain 이 fault 주기(1 s)마다 98 을 sync read** 한다(`Chain::set_watchdog_addr`,
+  `Chain::watchdog`). 링크는 `read_telemetry` 앞에서 0xFF 를 보면 98 에 0 을 쓰고
+  `last_watchdog` 을 지운 뒤 `Error::Refused` 로 원인을 적어 돌려준다 — 세션은
+  `link_error` e-stop 으로 "the bus watchdog fired and latched" 를 표시하고, 재arm 시
+  timeout 을 다시 쓴다. 조용히 안 움직이는 서보가 원인이 적힌 정지가 된다.
+- **`close` 가 토크 off 를 driver 로 직접 쓴다.** 전에는 `chain.leave` 뒤에
+  `set_torque(false)` 를 불러 chain 큐에(이미 빠진 멤버라 no-op) 넣었고, 루프가 이미
+  멈춘 뒤라 어차피 방출될 사이클도 없었다. 실측: bringup 종료 후 16축 전부 torque=1.
+  수정 후 0.
+- `DRLABS_DXL_TRACE=1` 로 chain 이 주기 2배 이상의 공백과 latch 된 id 를 stderr 에
+  적는다.
 
-이번 세션에 완성·커밋된 것(별개, 정상 동작): 제어 주기 hot-path 최적화, 그리고
-단일 I/O 아키텍처로 15축 100Hz arming 달성. base **이동**만 위 이유로 미완이다.
+확인(2026-09-04, 15축 `ubp.json` 에서 id 11 제외, 10 Hz): panel `POST /api/move
+{"pose":"base","velocity":0.5,"accel":1.0}` → 14 관절 progress 1, 목표 ±0.03 rad 이내
+도달. r_sh_p(id 2) 만 이동 중 버스 전압 9.9 V < MX-64 프로필 하한 10.0 V 로 81% 에서
+e-stop — 공급이 부하에서 처진다. 전원/배선 또는 관절별 `bus_voltage_min` 의 문제이지
+드라이버가 아니다. 같은 실행에서 watchdog latch 도, 주기 공백도 추적에 찍히지 않았다.
+
+주의: `bringup -sweep f` 의 중심은 현재 위치가 아니라 **각 관절 범위의 중앙**이다.
+`-sweep 0.05` 도 먼저 범위 중앙까지 이동한 뒤 ±2.5 % 를 왕복하므로, 작은 값이라고
+작게 움직이지 않는다.
+
+## 15축 sync read 꼬리 유실 — 1바이트 broadcast 와 Return Delay 0 (2026-09-04)
+
+같은 날, base 포즈를 유지하던 중 id 6·7·8(r_sh_y, l_elb_p, r_elb_p) 이 "5 사이클 연속
+무응답" 으로 e-stop 해 힘이 빠졌다(sweep 중에도 7·8 이 같은 식으로). 청크 8 의 fast/wide
+읽기는 단독 400 사이클 무손실이라 그 자체는 아니었다. `examples/dxl_diag.rs`
+`syncstress` / `raw` 로 실측(COM7 3 Mbaud, 15축, Return Delay 0):
+
+| sync read | 결과 |
+|---|---|
+| 8축 × 10 바이트, 토크 on 400 사이클 | 손실 0 |
+| 8축 × 21 바이트(wide) | 손실 0 |
+| 9축 × 21 바이트 | 손실 0 |
+| 12·13축 × 10 바이트 | 12번째 응답부터 유실, 사이클의 69 % |
+| 15축 × 10 바이트 | id 13~16 유실 68 % |
+| **15축 × 1 바이트** (chain 의 fault 읽기가 이것) | id 3 이후 거의 전부 유실, 사이클 93 % 가 100 ms timeout |
+
+원시 덤프를 보면 응답마다 앞에 잡음 바이트 `00` 이 붙고(회선 turnaround), RDT 0 에서는
+헤더 첫 바이트가 깨진 응답(`FD FF FD 00 03 …`) 이 여섯 중 둘, 그 뒤 차례를 기다리던
+서보들은 아예 응답하지 않는다. RDT 를 10(20 µs) 으로 바꾸면 헤더 손상은 사라지고 15축
+1바이트 읽기가 15개 전부 돌아오는 경우가 생기지만, 여전히 절반쯤은 12번째 응답(id 13,
+XL330) 부터 블록으로 빠진다 — 위치 기준이며 바이트·시간 기준이 아니다. 원인은 서보
+펌웨어 쪽으로 추정만 하고 확정하지 않았다. 청크 8 이하로는 어떤 길이에서도 유실이 없다.
+
+세션에서 e-stop 이 된 경로: chain 의 fault 읽기(reg 70)와 새로 넣은 watchdog 읽기(reg 98)
+는 15축을 **한 패킷**으로 물었고, 그 응답이 잘리면 100 ms timeout 을 두 번 — 100 ms 주기
+한가운데 200 ms 정지가 1 초마다. 게다가 `sync_read` 가 `for _ in ids` 로 응답 개수를
+셌기 때문에, 잘린 broadcast 에 늦게 답한 다른 id 의 응답이 다음 읽기의 슬롯을 소모해 그
+청크의 꼬리(6·7·8)가 "무응답" 이 됐다.
+
+고친 것: (1) fault·watchdog 읽기도 `MAX_SYNC_READ` 로 청크 분할, (2) `sync_read` 는 요청한
+id 가 다 답하거나 timeout 까지 수집하고 목록 밖 응답은 슬롯을 소모하지 않음, (3)
+`RETURN_DELAY_COUNTS` 0 → 10(20 µs, EEPROM 이라 open 때 다르면만 씀). 확인: panel 로 base
+포즈 유지 3 분 soak, 15관절 armed 유지, 목표 오차 ≤ 0.032 rad, e-stop 0, 주기 공백 0.
+
+## 청크 꼬리 유실로 인한 comm_loss e-stop, 그리고 Alert 비트 (2026-09-05)
+
+원 그리기 데모(`tools/demo_circle.py --shared`, panel 10 Hz, 15축 COM7 3 Mbaud)를 20분쯤
+돌리던 중 00:12:23 에 id 5·6·7·8(l_sh_y, r_sh_y, l_elb_p, r_elb_p — 첫 sync read 청크
+id 1~8 의 꼬리 4개이자 그 청크의 MX-28 전부)이 "5사이클 연속 무응답" 으로 e-stop, 토크가
+끊겨 팔꿈치가 떨어졌다(-1.5 → +0.07 rad). 자세는 원 꼭대기(sh_p ≈ -0.06, 팔꿈치 -1.5 rad,
+부하 최대). 직전까지 panel 폴러(4 Hz)는 GET 지연 ≤ 27 ms, 루프 10.00 Hz, 팔 오차 ≤ 0.2 rad
+였고 e-stop 직후에도 그대로였다 — 호스트 쪽 지연이 아니다. 그 전 "한 번씩 멈칫" 하던
+구간(데모 로그에서 팔·그리퍼·머리 오차가 같이 0.5 rad 까지 올랐다 복귀, 6~13 s)은 같은
+유실이 5사이클 미만으로 끝난 것으로 추정한다(증명 안 됨).
+
+panel 을 내리고 바로 `dxl_diag dump 5,6,7,8,1,9`: **hwerr(70) = 0, wdog(98) = 0** 전부.
+Hardware Error Status 는 재부팅 전까지 남으므로, 응답이 Alert 비트 때문에 거부된 것이
+아니라 실제로 **응답이 오지 않았다**(또는 서보가 재부팅됐다 — 구분 못 함). 청크 8 은
+2026-09-04 벤치에서 400 사이클 무손실이었지만, 부하가 걸린 채로는 꼬리 4개가 0.5 s 이상
+빠질 수 있다는 뜻이다. 원인(EMI·전원·서보 펌웨어)은 모름. 다음 단서는
+`DRLABS_DXL_TRACE=1` 로 띄운 panel 의 `[dxl-chain]` 줄과 로직 애널라이저다.
+
+그래도 코드에서 잘못돼 있던 것 하나를 이 김에 고쳤다. Protocol 2.0 상태 패킷의 error
+필드는 bit 7 이 **Alert**(하드웨어 오류 레지스터가 0 이 아닌 동안 모든 응답에 세팅), bit
+0~6 이 명령 오류다. `sync_read` 는 `error == 0` 인 응답만 받았으므로 입력전압·과부하 같은
+하드웨어 오류가 뜬 서보는 **멀쩡히 응답해도 무응답**이 됐고, 그 상태를 알려줄 reg 70
+읽기도 같은 경로라 화면에는 영원히 "No fault" 가 남았을 것이다. 지금은:
+
+- `sync_read_alerts` 가 Alert 만 선 응답을 답으로 받고 그 id 를 따로 돌려준다. 명령 오류
+  비트가 선 응답은 여전히 버린다. `exchange`(단일 트랜잭션)도 같은 규칙.
+- chain 이 멤버마다 `alert` 를 기억하고, link 는 reg 70 이 아직 안 읽혔어도 "Hardware
+  alert" 를 fault 로 올린다(hard). 다음 fault 케이던스에 실제 비트로 바뀐다.
+- `sync_read` 의 수집 루프에 건너뛴 패킷 상한(`MAX_SKIPPED_REPLIES` × 요청 수)을 뒀다.
+  늦은 응답·거부 응답은 슬롯을 채우지 않으면서 timeout 을 새로 잡았기 때문에, 그런
+  패킷이 이어지면 한 번의 sync read 가 100 ms 를 한참 넘길 수 있었다.
+
+확인: `cargo test -p drlabs-dynamixel` 67개 통과(Alert 수용·거부·상한·단일 exchange 4개
+추가). 실기는 새 바이너리로 panel 재기동 후 원 3회전 e-stop 0, trace 줄 0, base 복귀 오차
+0.09 rad. 이어서 무한 반복 soak(아래 참조).
+
+데모 쪽: 사용자가 원이 너무 앞에 그려진다고 해서 `--shared-cx/--shared-cz` 기본을
+0.38/0.38 → 0.28/0.28 로 당겼다. 손-어깨 거리가 같으면 팔꿈치 범위가 같으므로 앞뒤·상하를
+함께 당겨야 팔꿈치 한계(-1.617) 안에 남는다(sh_p -0.49 .. +0.09, elb_p -1.50 .. -0.49).
+sh_p 는 음수가 앞이다(2026-09-04 실기 확인, 이전 가정의 반대).
+
+## 청크 꼬리 유실 방지 — 응답 예산 20 ms 와 놓친 서보 개별 재읽기 (2026-09-05)
+
+앞 절의 유실이 "발작" 으로 보이는 경로를 코드에서 끊었다. 유실 자체(EMI·전원·펌웨어)는
+아직 원인을 모르지만, 유실 한 번이 버스 정지와 comm_loss e-stop 으로 번지는 두 고리는
+코드였다.
+
+1. **한 청크에 무응답 id 가 하나라도 있으면 그 청크가 100 ms 통째로 멈췄다.** sync read
+   의 응답 하나하나가 `Driver::timeout`(트랜잭션 타임아웃 100 ms) 을 기다렸기 때문이다.
+   16축 두 청크에 각각 하나씩 빠지면 블록 읽기만 200 ms, fault 케이던스에 걸리면 그
+   위에 400 ms — 그 사이 goal 이 안 나가고, 재개되면 서보가 밀린 목표를 프로파일 속도
+   1.5 rad/s 로 한 번에 따라잡는다. 이제 sync read 의 응답 대기와 아래 복구 읽기는
+   `Driver::reply_timeout`(기본 `DEFAULT_REPLY_TIMEOUT` = 20 ms) 을 쓴다. 8개 응답이
+   3 Mbaud 에서 1 ms 남짓에 도착하므로 20 ms 늦은 응답은 오지 않는 응답이다. 단일
+   트랜잭션(EEPROM 쓰기 등) 은 100 ms 그대로다.
+2. **놓친 id 를 다시 묻지 않았다.** sync read 에서 서보는 앞 서보의 응답을 보고 차례로
+   답하므로 하나가 빠지면 뒤가 전부 침묵한다(청크 8 에서 id 5~8 이 함께 빠진 이유로
+   추정). 이제 `Chain::recover_silent` 가 블록 읽기 직후 답 없는 서보를 `read_quick`
+   (개별 READ, reply_timeout 예산, Alert 비트 수용) 으로 한 번 더 묻고, 답하면 그
+   사이클은 정상 응답으로 친다. 연속 `RECOVERY_GIVE_UP`(5) 사이클 침묵한 서보는
+   broadcast 에 다시 답할 때까지 개별 읽기를 건너뛴다 — 죽은 서보 하나가 매 주기
+   다른 관절의 시간을 먹지 않게.
+
+트레이스(`DRLABS_DXL_TRACE=1`) 에 줄이 하나 늘었다. broadcast 에 침묵한 id 가 있을 때만:
+
+```
+[dxl-chain] silent on the broadcast [5, 6, 7, 8]: recovered [5, 6, 7, 8], lost [], given up [] (3.2 ms for the read phase)
+```
+
+`recovered` 가 채워지면 유실은 있었지만 관절은 사이클을 놓치지 않은 것이고, `lost` 가
+같은 id 로 반복되면 그 서보(또는 그 앞의 케이블) 를 봐야 한다.
+
+확인: `cargo test -p drlabs-dynamixel` 71개 통과(응답 예산·복구·포기·재개 4개 추가).
+**실기 미검증** — 다음 soak 에서 볼 것은 (a) `silent on the broadcast` 줄의 빈도와
+`recovered`/`lost` 비율, (b) comm_loss e-stop 0, (c) 데모 로그의 팔 오차 스파이크 소멸.
+20 ms 예산이 이 호스트의 USB 지연에 비해 짧으면 `recovered` 없이 `lost` 만 찍히다
+다음 사이클에 정상으로 돌아오는 패턴이 보일 것이고, 그때는 `reply_timeout` 을 올린다.
+
+### 실기 soak (2026-09-05, 새 바이너리, ubp15.json 10 Hz, `demo_circle.py --shared` 무한)
+
+13분 10초 동안 broadcast 침묵 20회, **전부 개별 재읽기로 복구**, lost 0, comm_loss 0, 팔
+오차 ≤ 0.18 rad. 침묵 패턴은 청크 꼬리(5~8, 3~6)와 청크 전체(1~8) 둘 다 있었고, 읽기
+단계 소요는 24~35 ms(예산 20 ms + 개별 읽기 1~2 ms × n). 즉 꼬리 유실 → 정지 → e-stop
+고리는 끊겼다.
+
+t = 790 s 에 **다른 종류의 고장**: 15축 전부가 broadcast 에도 개별 읽기에도 4사이클 연속
+(사이클당 365 ms, 약 1.5 s) 침묵 → 15축 모두 comm_loss e-stop → 데모는 `/api/pose` 409 로
+종료(트레이스백; HTTPError 를 안 잡던 데모 결함, 같이 고침). 패널을 내리고 `dxl_diag dump`
+전 id ERR, pyserial 로 직접 ping 해도 모든 id 가 0x00 한 바이트만 돌려줌(회선 무송신 시
+잡음 없음). COM7(FTDI FT232H) 은 Windows 에서 정상. 직전 텔레메트리에서 우측 서보 전압
+11.3~11.4 V, 좌측 12.4~12.5 V(하한 11.0 V 근처). 지난 9-05 00:12 e-stop 도 12분대였다.
+버스가 통째로 죽고 돌아오지 않는 것은 코드가 아니라 **전원(PSU 보호 동작·연결부) 또는
+서보 하나가 DATA 를 잡고 있는 경우**로 추정 — 전원 재투입 후 `dxl_diag dump` 로 wdog(98)·
+p_vel(112) 가 0 이면 서보가 재부팅된 것(전원), 값이 남아 있으면 회선·어댑터 쪽이다.
+
+## 세 번째 전 버스 사망과 자동 복구 — 모션 쇼 데모 (2026-09-05)
+
+원 그리기 soak 세 번째 실행(09:01 시작, `ubp15.json` 10 Hz, `demo_circle.py --shared`)
+이 t = 1014 s 에 같은 패턴으로 끝났다: 15축 전부 broadcast·개별 읽기 모두 4사이클
+침묵 → 전축 comm_loss e-stop. 그 전 1014 초 동안 침묵 45회는 전부 recovered, lost 0.
+직전 우측 전압 11.4~11.6 V(좌 12.4~12.8 V). 세 번 모두 12~17분대.
+
+이번엔 panel 을 내리고 `dxl_diag dump` 를 바로 찍었다: **15축 전부 응답**, wdog(98)
+0, p_vel(112) 0, torque 0, present 는 2048 부근(팔이 늘어진 자세). 즉 서보가 전부
+재부팅됐고(전원 순간 강하로 확정에 가까움, 어댑터·회선 문제 아님) 버스는 전원 재투입
+없이 스스로 돌아왔다. 어제 pyserial ping 이 0x00 만 받은 것은 아직 설명 못 함.
+
+이 고장은 코드로는 못 막지만, 데모가 살아남게는 할 수 있다. `tools/demo_show.py` 는
+`--launch configs/ubp15.json` 으로 panel 을 자식 프로세스로 띄우고, 관절이 e-stop
+되면 panel 을 끝내고 다시 띄운 뒤(5 → 60 s 백오프) base 로 돌아가 끊긴 act 를 처음부터
+한다. `/api/reset` 만으로는 안 되는 이유: 통신 유실 후 세션이 링크를 닫아 버리고
+(`control_loop.rs` "Reconnecting is the operator's move") 재연결 API 가 없다. reset 은
+통과하지만 15축이 `blocked: ["Not connected."]` 로 남는다(확인함).
+
+같은 날 벤치에서 확인한 것 두 가지:
+
+- **`/api/stop` 은 토크를 풀지 않는다.** panel 의 bring-up 이 auto-arm 이라 disarm
+  된 관절이 다음 사이클에 다시 arm 된다(stop 2 s 뒤 15축 armed, 서보 torque 1). 데모가
+  기계를 놓을 때는 `/api/estop` 을 쓴다: latch 되어 재arm 이 없고 stop burst 가 토크
+  off 를 실어 나간다(종료 후 dump 에서 torque 0, wdog 20 확인). panel 자체는 Ctrl+C
+  핸들러가 없어 그냥 죽으므로, 스크립트가 estop → 1 s → 프로세스 종료 순서를 지킨다.
+- **`wait_settled` 는 프로파일 이동 중에 바로 돌아온다.** `target_rad` 가 프로파일을
+  따라가므로 위치 오차가 처음부터 작다. 첫 setpoint 에서 팔이 0.76 rad 뒤처진 채로
+  스트리밍이 시작됐다. `demo_show.py` 의 `approach` 는 `moving_to_rad` 가 null 이 되고
+  오차가 허용치 안일 때를 도착으로 본다. `demo_circle.py` 는 손대지 않았다(원의 첫
+  점이 base 와 가까워 실제로는 문제가 안 됐다).
+
+쇼 실기(1사이클, 8자 3회 12 s + 손 흔들기 12 s + 휴식 2 s): 8자 팔 오차 ≤ 0.12 rad,
+손 흔들기(sh_p -0.75, elb_p -1.4, elb_y ±0.4 rad 0.5 Hz) 처짐 0.33 rad, 우측 전압
+최저 10.8 V(MX 하한 10.0). 강제 `/api/estop` 으로 복구 경로 확인: 5 s 뒤 panel 재기동,
+15축 armed, base 복귀, act 재시작까지 9 s.

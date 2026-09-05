@@ -38,6 +38,8 @@ class Monitor:
         self.status = {}
         self.events = collections.deque(maxlen=500)
         self.quit_requested = False
+        self.quit_token = None        # when set, POST /api/quit must carry it (the page may be public)
+        self.public_url = None        # a tunnel's address, when the show opened one
         self.camera = None            # callable -> jpeg bytes or None
         self.started_at = time.time()
         self._server = None
@@ -111,6 +113,8 @@ class Monitor:
                           "age_s": time.time() - self.latest_at if self.latest_at else None,
                           "rate_hz": self.latest.get("rate_hz") if self.latest else None,
                           "robot": self.latest.get("robot") if self.latest else None},
+                "public_url": self.public_url,
+                "quit_needs_token": self.quit_token is not None,
                 "joints": joints,
                 "status": dict(self.status),
                 "events": list(self.events)[-60:],
@@ -179,14 +183,35 @@ class Monitor:
                     self._send(404, b"not found", "text/plain")
 
             def do_POST(self):
-                if self.path == "/api/quit":
+                url = urlparse(self.path)
+                if url.path == "/api/quit":
+                    if monitor.quit_token is not None:
+                        length = int(self.headers.get("Content-Length") or 0)
+                        body = self.rfile.read(length).decode(errors="replace") if length else ""
+                        try:
+                            given = json.loads(body).get("token") if body else None
+                        except ValueError:
+                            given = None
+                        if given != monitor.quit_token:
+                            monitor.event("quit", f"quit refused from {self.client_address[0]}: wrong token")
+                            self._send(403, b'{"error":"wrong token"}')
+                            return
                     monitor.quit_requested = True
                     monitor.event("quit", "quit requested from the monitor page")
                     self._send(200, b'{"ok":true}')
                 else:
                     self._send(404, b"not found", "text/plain")
 
-        self._server = ThreadingHTTPServer(self.addr, Handler)
+        class Server(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                # A viewer closing the page mid-response is not worth a traceback.
+                import sys
+                error = sys.exc_info()[1]
+                if isinstance(error, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+                    return
+                super().handle_error(request, client_address)
+
+        self._server = Server(self.addr, Handler)
         self._server.daemon_threads = True
         threading.Thread(target=self._server.serve_forever, name="monitor-http", daemon=True).start()
         return f"http://{self.addr[0]}:{self.addr[1]}"
@@ -257,7 +282,8 @@ async function snapshot() {
     $("tracker").className = "pill " + (tr.error ? "bad" : tr.candidate ? "ok" : "");
     $("faces").innerHTML = (tr.tracks || []).map(f => `<span style="color:${f.greeted ? '#f85149' : '#3fb950'}">#${f.id} ${fmt(f.distance_m,2)} m yaw ${fmt(f.yaw,0)}° pit ${fmt(f.pitch,0)}° look ${fmt(f.looking_for,1)} s${f.greeted ? ' greeted' : ''}</span>`).join("");
   } else { $("tracker").textContent = "no tracker"; $("tracker").className = "pill"; }
-  $("clock").textContent = `up ${Math.floor(s.uptime_s/60)} min`;
+  $("clock").textContent = `up ${Math.floor(s.uptime_s/60)} min` + (s.public_url ? ` · ${s.public_url.replace(/^https?:\/\//, "")}` : "");
+  window.quitNeedsToken = !!s.quit_needs_token;
   const tb = $("joints").querySelector("tbody");
   tb.innerHTML = s.joints.map(j => {
     const state = j.estop ? "e-stop" : j.armed ? "armed" : "disarmed";
@@ -303,7 +329,13 @@ async function history() {
 }
 
 function camera() { const img = $("cam"); img.src = "/camera.jpg?" + Date.now(); }
-$("quit").addEventListener("click", async () => { if (confirm("Finish the show: base pose, release, exit?")) await fetch("/api/quit", {method: "POST"}); });
+$("quit").addEventListener("click", async () => {
+  if (!confirm("Finish the show: base pose, release, exit?")) return;
+  const token = window.quitNeedsToken ? prompt("quit token (printed where the show was started)") : null;
+  if (window.quitNeedsToken && !token) return;
+  const r = await fetch("/api/quit", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({token})});
+  if (!r.ok) alert("refused: " + (await r.text()));
+});
 snapshot(); history(); camera();
 setInterval(snapshot, 200); setInterval(history, 2000); setInterval(camera, 200);
 </script></body></html>

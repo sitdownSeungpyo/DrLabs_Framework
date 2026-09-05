@@ -48,9 +48,12 @@ import datetime
 import json
 import math
 import os
+import random
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.error import HTTPError, URLError
 
@@ -524,6 +527,57 @@ class Supervisor:
                     self.stop_panel(release=False)
 
 
+# ---------------------------------------------------------------- the tunnel
+
+class Tunnel:
+    """A Cloudflare quick tunnel to the monitoring page: `cloudflared tunnel
+    --url <local>` prints a random *.trycloudflare.com address, which is
+    picked out of its log and shown on the page. No account, no config; the
+    address changes every start, and anyone who has it can open the page —
+    which is why the Quit button wants the token."""
+
+    URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+    def __init__(self, exe, local_url):
+        self.exe = exe
+        self.local_url = local_url
+        self.proc = None
+        self.url = None
+
+    def start(self):
+        if not os.path.exists(self.exe):
+            note("tunnel", f"no cloudflared at {self.exe}; download it from "
+                           f"https://github.com/cloudflare/cloudflared/releases (cloudflared-windows-amd64.exe)")
+            return
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.proc = subprocess.Popen(
+            [self.exe, "tunnel", "--url", self.local_url, "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags)
+        threading.Thread(target=self._watch, name="tunnel-log", daemon=True).start()
+
+    def _watch(self):
+        for line in self.proc.stdout:
+            m = self.URL.search(line)
+            if m and self.url is None:
+                self.url = m.group(0)
+                note("tunnel", f"monitoring page is public at {self.url}")
+                if MONITOR is not None:
+                    MONITOR.public_url = self.url
+            elif "ERR" in line and ("connection" in line.lower() or "failed" in line.lower()):
+                note("tunnel", line.strip()[:200])
+        if MONITOR is not None:
+            MONITOR.public_url = None
+        note("tunnel", "cloudflared exited")
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 # ---------------------------------------------------------------- the face
 
 class HeadOverlay:
@@ -916,6 +970,13 @@ def main():
     ap.add_argument("--calibrate-delta", type=float, default=0.15, help="rad to turn for the calibration")
     # monitor
     ap.add_argument("--monitor-addr", default="127.0.0.1:8086", help="the monitoring page; 'off' disables it")
+    ap.add_argument("--tunnel", default="off", choices=["off", "cloudflare"],
+                    help="publish the monitoring page through a Cloudflare quick tunnel (a random "
+                         "*.trycloudflare.com address, printed and shown on the page)")
+    ap.add_argument("--cloudflared", default=os.path.join(ROOT, "tools", "bin", "cloudflared.exe"))
+    ap.add_argument("--quit-token", default=None,
+                    help="what the page's Quit button must present; default: random, printed at start "
+                         "(always required with --tunnel, since anyone with the address can open the page)")
     args = ap.parse_args()
 
     if any(s not in "lr" for s in args.wave_arms) or not args.wave_arms:
@@ -950,11 +1011,18 @@ def main():
         return
 
     global MONITOR
+    tunnel = None
     if args.monitor_addr.lower() != "off":
         import show_monitor
         host, _, port = args.monitor_addr.rpartition(":")
         MONITOR = show_monitor.Monitor(args.panel, (host or "127.0.0.1", int(port)))
-        log(f"monitor page on {MONITOR.start()}")
+        MONITOR.quit_token = args.quit_token or "".join(
+            random.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(6))
+        local_url = MONITOR.start()
+        log(f"monitor page on {local_url}   (quit token: {MONITOR.quit_token})")
+        if args.tunnel == "cloudflare":
+            tunnel = Tunnel(args.cloudflared, local_url)
+            tunnel.start()
 
     tracker = None
     faces = None
@@ -1020,6 +1088,8 @@ def main():
     finally:
         if tracker is not None:
             tracker.stop()
+        if tunnel is not None:
+            tunnel.stop()
     if supervisor.owns_panel:
         supervisor.stop_panel(release=True)
 

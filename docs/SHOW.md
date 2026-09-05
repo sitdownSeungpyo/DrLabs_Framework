@@ -106,3 +106,16 @@ stdlib만으로 8086에 페이지를 띄운다. 쇼와 별도 스레드가 200 m
 
 JSON: `/api/snapshot`, `/api/history?seconds=600`, `/camera.jpg`. 페이지 렌더링은 브라우저
 확장이 안 붙어 이 세션에서 눈으로 확인하지 못했다(엔드포인트는 확인함).
+
+## 밖에서 보기 (`--tunnel cloudflare`)
+
+127.0.0.1은 이 PC 안에서만 통한다. `--tunnel cloudflare`를 주면 쇼가
+`tools/bin/cloudflared.exe tunnel --url http://127.0.0.1:8086`을 자식으로 띄우고 로그에서
+`https://<랜덤>.trycloudflare.com` 주소를 뽑아 시작 로그·이벤트·페이지 상단에 보여준다.
+계정·설정 없음, 주소는 기동마다 바뀜. cloudflared는 git 밖(`*.exe`)이라
+https://github.com/cloudflare/cloudflared/releases 의 `cloudflared-windows-amd64.exe`를
+`tools/bin/`에 두면 된다(2026-09-05: 2026.8.3으로 확인).
+
+주소를 아는 누구나 페이지를 열 수 있으므로 Quit 버튼은 **토큰**을 요구한다. 토큰은
+`--quit-token`으로 정하거나 기본으로 6자 난수를 만들어 시작 로그에 찍는다(`quit token: …`).
+틀린 토큰은 403과 이벤트 로그로 남는다. 나머지 엔드포인트는 읽기 전용이다.

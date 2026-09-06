@@ -258,7 +258,7 @@ PAGE = r"""<!doctype html>
   <section><h2>Voltage (V), last 10 min</h2><canvas id="cv"></canvas><div id="lv" class="legend"></div></section>
   <section><h2>Position error (rad), last 10 min</h2><canvas id="ce"></canvas><div id="le" class="legend"></div></section>
   <section><h2>Events</h2><div id="events"></div></section>
-  <section><h2>Camera</h2><img id="cam" alt="no camera"><div id="faces" class="legend"></div></section>
+  <section><h2>Camera <span id="camstate" class="pill warn" style="font-weight:normal"></span></h2><img id="cam" alt="no camera"><div id="faces" class="legend"></div></section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -328,7 +328,18 @@ async function history() {
   draw($("ce"), $("le"), h, "err", 0, 0.8, v => v.toFixed(1));
 }
 
-function camera() { const img = $("cam"); img.src = "/camera.jpg?" + Date.now(); }
+// One frame in flight at a time: the next request goes out only when the
+// previous picture has arrived (or failed). Firing a new src every 200 ms
+// regardless let requests pile up over a slow link and the picture froze
+// while the JSON polling, which is small, kept up (seen 2026-09-06).
+let camLast = 0;
+function camera() {
+  const img = $("cam"), next = new Image();
+  next.onload = () => { img.src = next.src; camLast = Date.now(); $("camstate").textContent = ""; setTimeout(camera, 150); };
+  next.onerror = () => { $("camstate").textContent = "camera: no frame (" + Math.round((Date.now() - camLast) / 1000) + " s)"; setTimeout(camera, 1000); };
+  next.src = "/camera.jpg?" + Date.now();
+}
+setInterval(() => { if (camLast && Date.now() - camLast > 3000) $("camstate").textContent = "camera: stale " + Math.round((Date.now() - camLast) / 1000) + " s"; }, 1000);
 $("quit").addEventListener("click", async () => {
   if (!confirm("Finish the show: base pose, release, exit?")) return;
   const token = window.quitNeedsToken ? prompt("quit token (printed where the show was started)") : null;
@@ -337,6 +348,6 @@ $("quit").addEventListener("click", async () => {
   if (!r.ok) alert("refused: " + (await r.text()));
 });
 snapshot(); history(); camera();
-setInterval(snapshot, 200); setInterval(history, 2000); setInterval(camera, 200);
+setInterval(snapshot, 200); setInterval(history, 2000);
 </script></body></html>
 """

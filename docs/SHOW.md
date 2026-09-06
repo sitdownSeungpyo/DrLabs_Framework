@@ -132,3 +132,11 @@ https://github.com/cloudflare/cloudflared/releases 의 `cloudflared-windows-amd6
 주소를 아는 누구나 페이지를 열 수 있으므로 Quit 버튼은 **토큰**을 요구한다. 토큰은
 `--quit-token`으로 정하거나 기본으로 6자 난수를 만들어 시작 로그에 찍는다(`quit token: …`).
 틀린 토큰은 403과 이벤트 로그로 남는다. 나머지 엔드포인트는 읽기 전용이다.
+
+2026-09-06: 밤사이 Wi-Fi가 바뀌자 cloudflared가 16 s마다 연결 오류만 내고 주소는 죽은 채였다.
+이제 `Tunnel`이 90 s 이상 좋은 연결이 없거나 프로세스가 끝나면 cloudflared를 다시 띄운다
+(주소는 새로 난다; 5→60 s 백오프). 또 이 날의 Wi-Fi(10.17.57.x) DNS는 `*.trycloudflare.com`을
+NXDOMAIN으로 막았다(1.1.1.1은 정상 응답, IP 직접 지정 시 200) — 그런 망 안에서는 공개 주소
+대신 `--monitor-addr 0.0.0.0:8086`으로 LAN 주소(`http://<이 PC IP>:8086`)를 쓴다. 다른 기기에서
+열리려면 Windows 방화벽이 python.exe의 8086 인바운드를 허용해야 한다(첫 실행 때 묻는 창에서
+허용, 또는 관리자 PowerShell `New-NetFirewallRule -DisplayName "drlabs show monitor" -Direction Inbound -Protocol TCP -LocalPort 8086 -Action Allow`).

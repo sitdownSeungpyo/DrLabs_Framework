@@ -562,22 +562,44 @@ class Tunnel:
 
     URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
-    def __init__(self, exe, local_url):
+    def __init__(self, exe, local_url, error_patience=90.0):
         self.exe = exe
         self.local_url = local_url
         self.proc = None
         self.url = None
+        self.stopping = False
+        # A quick tunnel does not come back from a broken network on its
+        # own (measured 2026-09-06: connection errors every 16 s all morning
+        # after the Wi-Fi changed overnight, the address dead). After this
+        # long without a good line it is started afresh, with a new address.
+        self.error_patience = error_patience
+        self.first_error_at = None
 
     def start(self):
         if not os.path.exists(self.exe):
             note("tunnel", f"no cloudflared at {self.exe}; download it from "
                            f"https://github.com/cloudflare/cloudflared/releases (cloudflared-windows-amd64.exe)")
             return
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        self.proc = subprocess.Popen(
-            [self.exe, "tunnel", "--url", self.local_url, "--no-autoupdate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags)
-        threading.Thread(target=self._watch, name="tunnel-log", daemon=True).start()
+        self.stopping = False
+        threading.Thread(target=self._run, name="tunnel", daemon=True).start()
+
+    def _run(self):
+        backoff = 5.0
+        while not self.stopping:
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            self.url = None
+            self.first_error_at = None
+            if MONITOR is not None:
+                MONITOR.public_url = None
+            self.proc = subprocess.Popen(
+                [self.exe, "tunnel", "--url", self.local_url, "--no-autoupdate"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags)
+            self._watch()
+            if self.stopping:
+                return
+            note("tunnel", f"cloudflared ended; starting it again in {backoff:.0f} s")
+            time.sleep(backoff)
+            backoff = min(60.0, backoff * 2)
 
     def _watch(self):
         for line in self.proc.stdout:
@@ -588,18 +610,28 @@ class Tunnel:
                 if MONITOR is not None:
                     MONITOR.public_url = self.url
             elif "ERR" in line and ("connection" in line.lower() or "failed" in line.lower()):
-                note("tunnel", line.strip()[:200])
-        if MONITOR is not None:
-            MONITOR.public_url = None
-        note("tunnel", "cloudflared exited")
+                if self.first_error_at is None:
+                    self.first_error_at = time.monotonic()
+                    note("tunnel", line.strip()[:200])
+                elif time.monotonic() - self.first_error_at > self.error_patience:
+                    note("tunnel", f"no good connection for {self.error_patience:.0f} s; restarting cloudflared")
+                    self._end_process()
+                    break
+            elif "Registered tunnel connection" in line or "connection successful" in line.lower():
+                self.first_error_at = None
+        self._end_process()
 
-    def stop(self):
+    def _end_process(self):
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+
+    def stop(self):
+        self.stopping = True
+        self._end_process()
 
 
 # ---------------------------------------------------------------- the face

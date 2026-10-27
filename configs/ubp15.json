@@ -1,0 +1,335 @@
+{
+ "robot": "UBP",
+ "rate_hz": 10,
+ "buses": [
+  {
+   "name": "dxl0",
+   "transport": "serial",
+   "port": "COM7",
+   "baud": 3000000
+  }
+ ],
+ "poses": {
+  "zero": {
+   "l_sh_p": 0.0,
+   "r_sh_p": 0.0,
+   "l_sh_r": 0.0,
+   "r_sh_r": 0.0,
+   "l_sh_y": 0.0,
+   "r_sh_y": 0.0,
+   "l_elb_p": 0.0,
+   "r_elb_p": 0.0,
+   "l_elb_y": 0.0,
+   "r_elb_y": 0.0,
+   "r_wrist_p": 0.0,
+   "l_gripper": 0.0,
+   "r_gripper": 0.0,
+   "head_p": 0.0,
+   "head_y": 0.0
+  },
+  "base": {
+   "l_sh_p": 0.2618,
+   "r_sh_p": 0.2618,
+   "l_sh_r": -0.2618,
+   "r_sh_r": -0.2618,
+   "l_sh_y": 0.0,
+   "r_sh_y": 0.0,
+   "l_elb_p": -0.7854,
+   "r_elb_p": -0.7854,
+   "l_elb_y": 0.0,
+   "r_elb_y": 0.0,
+   "r_wrist_p": 0.0,
+   "l_gripper": 0.0,
+   "r_gripper": 0.0,
+   "head_p": -0.1745,
+   "head_y": 0.0
+  }
+ },
+ "joints": [
+  {
+   "name": "l_sh_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 1,
+   "options": {
+    "profile": "mx64"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -1.559,
+    "max_rad": 1.694,
+    "max_torque_nm": 1.0,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_sh_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 2,
+   "options": {
+    "profile": "mx64"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.697,
+    "max_rad": 1.694,
+    "max_torque_nm": 1.0,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "l_sh_r",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 3,
+   "options": {
+    "profile": "mx64"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -2.026,
+    "max_rad": 0.084,
+    "max_torque_nm": 1.0,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_sh_r",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 4,
+   "options": {
+    "profile": "mx64"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.963,
+    "max_rad": 0.114,
+    "max_torque_nm": 1.0,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "l_sh_y",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 5,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -1.71,
+    "max_rad": 1.647,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_sh_y",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 6,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.562,
+    "max_rad": 1.644,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "l_elb_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 7,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -1.617,
+    "max_rad": 0.661,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_elb_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 8,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.881,
+    "max_rad": 0.25,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "l_elb_y",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 9,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -1.574,
+    "max_rad": 1.404,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_elb_y",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 10,
+   "options": {
+    "profile": "mx28"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.672,
+    "max_rad": 2.029,
+    "max_torque_nm": 0.5,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "r_wrist_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 12,
+   "options": {
+    "profile": "xl430"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -1.028,
+    "max_rad": 1.562,
+    "max_torque_nm": 0.3,
+    "max_velocity_rad_s": 1.5,
+    "max_accel_rad_s2": 6.0
+   }
+  },
+  {
+   "name": "l_gripper",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 13,
+   "options": {
+    "profile": "xl330"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -0.002,
+    "max_rad": 2.425,
+    "max_torque_nm": 0.1,
+    "max_velocity_rad_s": 0.5,
+    "max_accel_rad_s2": 2.0
+   }
+  },
+  {
+   "name": "r_gripper",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 14,
+   "options": {
+    "profile": "xl330"
+   },
+   "gear_ratio": 1.0,
+   "direction": -1,
+   "offset_rad": -3.141593,
+   "limits": {
+    "min_rad": -2.474,
+    "max_rad": 0.807,
+    "max_torque_nm": 0.1,
+    "max_velocity_rad_s": 0.5,
+    "max_accel_rad_s2": 2.0
+   }
+  },
+  {
+   "name": "head_p",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 15,
+   "options": {
+    "profile": "2xl430"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -1.272,
+    "max_rad": 1.367,
+    "max_torque_nm": 0.3,
+    "max_velocity_rad_s": 1.0,
+    "max_accel_rad_s2": 4.0
+   }
+  },
+  {
+   "name": "head_y",
+   "bus": "dxl0",
+   "driver": "dynamixel",
+   "id": 16,
+   "options": {
+    "profile": "2xl430"
+   },
+   "gear_ratio": 1.0,
+   "direction": 1,
+   "offset_rad": 3.141593,
+   "limits": {
+    "min_rad": -2.059,
+    "max_rad": 0.41,
+    "max_torque_nm": 0.3,
+    "max_velocity_rad_s": 1.0,
+    "max_accel_rad_s2": 4.0
+   }
+  }
+ ]
+}

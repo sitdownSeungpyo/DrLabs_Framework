@@ -1,18 +1,30 @@
 //! The bench panel: a browser, some sliders, and a live machine.
 //!
-//! The assets are compiled in rather than read from disk, so the panel travels
-//! with the binary. That is the whole point of the layout: copy `drlabs` and a
-//! JSON description onto a machine, run one command, and there is a robot under
-//! control with a way to drive it.
+//! The panel is a client of the runtime. `drlabs rt` owns the buses; this
+//! process owns a browser session, talks LowCmd/LowState to the runtime
+//! over UDP, and serves the same HTTP API it always has — so the Python
+//! tools in `tools/` that drive it did not have to change.
+//!
+//! What moved here from the runtime, because the runtime no longer does it:
+//! profiled moves (a trapezoid per joint, streamed as setpoints), holds, the
+//! teach-mode recorder, and the targets the sliders last set.
+//!
+//! The assets are compiled in rather than read from disk, so the panel
+//! travels with the binary.
 
 mod http;
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use drlabs_core::units::{Rad, RadPerSec, RadPerSec2};
-use drlabs_robot::{Config, RangeLearner, Robot};
+use drlabs_api::{Client, Description};
+use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
+use drlabs_core::AxisStatus;
+use drlabs_rt::Config;
+use drlabs_safety::{Blocked, TripCode};
+use drlabs_session::trajectory::Trapezoidal;
 
 use crate::flags::{Flags, Kind};
 use http::{parse_learn, parse_limits, parse_move, parse_pose, quote, Request, Response};
@@ -21,125 +33,368 @@ const INDEX: &str = include_str!("static/index.html");
 const APP_JS: &str = include_str!("static/app.js");
 const STYLE: &str = include_str!("static/style.css");
 
-const PANEL_FLAGS: &[(&str, Kind)] = &[("addr", Kind::Value), ("check", Kind::Switch)];
+const PANEL_FLAGS: &[(&str, Kind)] = &[
+    ("addr", Kind::Value),
+    ("rt", Kind::Value),
+    ("check", Kind::Switch),
+];
+
+/// How often a running move puts out its next setpoint.
+const MOVE_RATE_HZ: f64 = 100.0;
 
 pub fn panel(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, PANEL_FLAGS).map_err(|error| error.to_string())?;
-    let path = match flags.positional.first() {
-        Some(path) => path.clone(),
-        None => return Err("usage: drlabs panel [-addr host:port] <robot.json>".into()),
-    };
     // Loopback by default. This server is a bench tool: it has no
     // authentication, and a machine that can be driven by anything that can
     // reach a port should not be reachable from a network by accident.
     let addr = flags.string("addr", "127.0.0.1:8080");
-
-    let config = Config::load(std::path::Path::new(&path)).map_err(|error| error.to_string())?;
+    let runtime = flags.string("rt", "127.0.0.1:7700");
+    // The description is optional: it is only needed to write edited limits
+    // back. Everything else comes from the runtime.
+    let path = flags.positional.first().map(std::path::PathBuf::from);
+    if let Some(path) = &path {
+        Config::load(path).map_err(|error| error.to_string())?;
+    }
     if flags.switch("check") {
         println!("Description is valid. Nothing was opened.");
         return Ok(());
     }
 
-    let mut robot = Robot::new(config).map_err(|error| error.to_string())?;
-    println!("Bringing up {} joints…", robot.config.joints.len());
-    robot.bring_up().map_err(|error| error.to_string())?;
+    let client = Client::connect(runtime.as_str(), Duration::from_millis(50))
+        .map_err(|error| format!("cannot open a socket to {runtime}: {error}"))?;
+    let description = client
+        .describe(Duration::from_secs(3))
+        .map_err(|error| format!("{error}: is `drlabs rt` running?"))?;
+    client.set_axes(description.joints.len());
+    println!(
+        "{}: {} joints at {} Hz, via {}",
+        description.robot,
+        description.joints.len(),
+        description.rate_hz,
+        client.server()
+    );
 
     let listener = TcpListener::bind(&addr).map_err(|error| {
-        // A port already in use is the commonest way this fails, and the
-        // machine is live by now — say so rather than leaving a bare io error.
+        // A port already in use is the commonest way this fails.
         format!("cannot listen on {addr}: {error}")
     })?;
     let bound = listener
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or(addr);
-
     println!("\npanel on http://{bound}");
     println!("  Ctrl+C to stop\n");
 
-    let robot = Arc::new(robot);
-    let learner = RangeLearner::new();
-
-    // The deadman wants to hear from a supervisor. The panel polls, but a
-    // browser that has been closed does not, and the machine should not be left
-    // energised waiting for one — so the heartbeat comes from here, and the
-    // panel's own liveness is what the operator watches.
-    let beating = robot.clone();
-    std::thread::spawn(move || loop {
-        beating.heartbeat();
-        std::thread::sleep(Duration::from_millis(200));
-    });
-
     let ctx = Arc::new(Panel {
-        robot: robot.clone(),
-        learner,
-        path: std::path::PathBuf::from(&path),
+        client,
+        targets: Mutex::new(vec![f64::NAN; description.joints.len()]),
+        mover: Mutex::new(None),
+        learner: Mutex::new(Learner::new(description.joints.len())),
+        description,
+        path,
     });
+    spawn_mover(Arc::clone(&ctx));
+    spawn_learner(Arc::clone(&ctx));
     http::serve(listener, move |request| handle(&ctx, request));
     Ok(())
 }
 
-/// What a request handler needs: the machine, the recorder, and the file the
-/// machine was described by.
+/// What a request handler needs.
 struct Panel {
-    robot: Arc<Robot>,
-    learner: RangeLearner,
-    /// The description this panel was started with. Edited limits go back to
-    /// exactly this file and nowhere else.
-    path: std::path::PathBuf,
+    client: Client,
+    description: Description,
+    /// The last target each joint was given, by index. NaN until it has one.
+    targets: Mutex<Vec<f64>>,
+    mover: Mutex<Option<Move>>,
+    learner: Mutex<Learner>,
+    /// The description this panel was started with, if any. Edited limits
+    /// go back to exactly this file and nowhere else.
+    path: Option<std::path::PathBuf>,
+}
+
+/// A profiled move in progress: one trapezoid per joint, all started at
+/// once. The trapezoid is unit-agnostic arithmetic; it is used here in
+/// radians.
+struct Move {
+    profiles: Vec<(usize, Trapezoidal)>,
+    started: Instant,
+    total: f64,
+}
+
+impl Move {
+    fn target_of(&self, index: usize) -> Option<f64> {
+        self.profiles
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, profile)| profile.target().value())
+    }
+
+    fn progress(&self) -> f64 {
+        if self.total <= 0.0 {
+            1.0
+        } else {
+            (self.started.elapsed().as_secs_f64() / self.total).min(1.0)
+        }
+    }
+}
+
+/// Streams the running move's setpoints, and finishes it.
+fn spawn_mover(ctx: Arc<Panel>) {
+    std::thread::Builder::new()
+        .name("drlabs-panel-move".into())
+        .spawn(move || {
+            let period = Duration::from_secs_f64(1.0 / MOVE_RATE_HZ);
+            loop {
+                std::thread::sleep(period);
+                let mut mover = ctx.mover.lock().unwrap();
+                let Some(current) = mover.as_ref() else {
+                    continue;
+                };
+                let t = current.started.elapsed().as_secs_f64();
+                let done = t >= current.total;
+                let mut targets = ctx.targets.lock().unwrap();
+                for (index, profile) in &current.profiles {
+                    let q = profile.sample(t).position.value();
+                    ctx.client.drive(*index, q as f32);
+                    targets[*index] = q;
+                }
+                drop(targets);
+                let _ = ctx.client.send(0);
+                if done {
+                    *mover = None;
+                }
+            }
+        })
+        .expect("a move thread");
+}
+
+/// Teach mode: the joints are released and their travel recorded.
+struct Learner {
+    running: bool,
+    started: Option<Instant>,
+    seconds: f64,
+    min: Vec<f64>,
+    max: Vec<f64>,
+    samples: Vec<u64>,
+}
+
+impl Learner {
+    fn new(n: usize) -> Self {
+        Self {
+            running: false,
+            started: None,
+            seconds: 0.0,
+            min: vec![f64::NAN; n],
+            max: vec![f64::NAN; n],
+            samples: vec![0; n],
+        }
+    }
+
+    fn clear(&mut self) {
+        for value in &mut self.min {
+            *value = f64::NAN;
+        }
+        for value in &mut self.max {
+            *value = f64::NAN;
+        }
+        for value in &mut self.samples {
+            *value = 0;
+        }
+        self.started = None;
+    }
+}
+
+fn spawn_learner(ctx: Arc<Panel>) {
+    std::thread::Builder::new()
+        .name("drlabs-panel-learn".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(25));
+            let mut learner = ctx.learner.lock().unwrap();
+            if !learner.running {
+                continue;
+            }
+            if let Some(started) = learner.started {
+                if started.elapsed().as_secs_f64() >= learner.seconds {
+                    learner.running = false;
+                    continue;
+                }
+            }
+            let Some((state, _)) = ctx.client.latest() else {
+                continue;
+            };
+            for (index, motor) in state.active().iter().enumerate() {
+                if index >= learner.min.len() || !motor.q.is_finite() {
+                    continue;
+                }
+                let q = motor.q as f64;
+                learner.min[index] = if learner.min[index].is_nan() {
+                    q
+                } else {
+                    learner.min[index].min(q)
+                };
+                learner.max[index] = if learner.max[index].is_nan() {
+                    q
+                } else {
+                    learner.max[index].max(q)
+                };
+                learner.samples[index] += 1;
+            }
+        })
+        .expect("a learn thread");
+}
+
+impl Panel {
+    fn stopped_reason(&self) -> Option<String> {
+        let (state, _) = self.client.latest()?;
+        if state.estop == 0 {
+            return None;
+        }
+        Some(format!(
+            "e-stop latched ({})",
+            TripCode::from_u8(state.estop_code as u8)
+                .map(|code| code.code())
+                .unwrap_or("unknown")
+        ))
+    }
+
+    /// Commands joints straight to targets, cancelling any move on them.
+    fn pose(&self, targets: &BTreeMap<String, f64>) -> Result<(), String> {
+        if let Some(reason) = self.stopped_reason() {
+            return Err(reason);
+        }
+        let mut resolved = Vec::with_capacity(targets.len());
+        for (name, &value) in targets {
+            let joint = self
+                .description
+                .joint(name)
+                .ok_or_else(|| format!("no joint named {name:?}"))?;
+            resolved.push((joint.index, value.clamp(joint.min_rad, joint.max_rad)));
+        }
+        let mut mover = self.mover.lock().unwrap();
+        if let Some(current) = mover.as_mut() {
+            current
+                .profiles
+                .retain(|(index, _)| !resolved.iter().any(|(i, _)| i == index));
+            if current.profiles.is_empty() {
+                *mover = None;
+            }
+        }
+        let mut last = self.targets.lock().unwrap();
+        for (index, q) in &resolved {
+            self.client.drive(*index, *q as f32);
+            last[*index] = *q;
+        }
+        drop(last);
+        drop(mover);
+        self.client.send(0).map_err(|error| error.to_string())
+    }
+
+    /// Starts a profiled move from where each joint is now.
+    fn start_move(
+        &self,
+        targets: &BTreeMap<String, f64>,
+        max_velocity: f64,
+        accel: f64,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.stopped_reason() {
+            return Err(reason);
+        }
+        let (state, _) = self
+            .client
+            .latest()
+            .ok_or("no state from the runtime yet")?;
+        let mut profiles = Vec::with_capacity(targets.len());
+        for (name, &value) in targets {
+            let joint = self
+                .description
+                .joint(name)
+                .ok_or_else(|| format!("no joint named {name:?}"))?;
+            let start = state
+                .state
+                .get(joint.index)
+                .map(|m| m.q as f64)
+                .filter(|q| q.is_finite())
+                .ok_or_else(|| format!("{name:?} reports no position to move from"))?;
+            let target = value.clamp(joint.min_rad, joint.max_rad);
+            let velocity = max_velocity.min(joint.max_velocity_rad_s);
+            let acceleration = if joint.max_accel_rad_s2 > 0.0 {
+                accel.min(joint.max_accel_rad_s2)
+            } else {
+                accel
+            };
+            let profile = Trapezoidal::new(
+                Rev(start),
+                Rev(target),
+                RevPerSec(velocity),
+                RevPerSec2(acceleration),
+            )
+            .map_err(|error| format!("{name:?}: {error}"))?;
+            profiles.push((joint.index, profile));
+        }
+        let total = profiles
+            .iter()
+            .map(|(_, p)| p.total_time())
+            .fold(0.0, f64::max);
+        *self.mover.lock().unwrap() = Some(Move {
+            profiles,
+            started: Instant::now(),
+            total,
+        });
+        Ok(())
+    }
+
+    fn hold_all(&self) -> Result<(), String> {
+        let (state, _) = self
+            .client
+            .latest()
+            .ok_or("no state from the runtime yet")?;
+        let mut targets = BTreeMap::new();
+        for joint in &self.description.joints {
+            if let Some(motor) = state.state.get(joint.index) {
+                if motor.q.is_finite() {
+                    targets.insert(joint.name.clone(), motor.q as f64);
+                }
+            }
+        }
+        self.pose(&targets)
+    }
+
+    fn release_all(&self) -> Result<(), String> {
+        *self.mover.lock().unwrap() = None;
+        self.client.release_all();
+        self.client.send(0).map_err(|error| error.to_string())
+    }
 }
 
 fn handle(ctx: &Panel, request: &Request) -> Response {
-    let robot: &Robot = &ctx.robot;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => Response::html(INDEX),
         ("GET", "/app.js") => Response::javascript(APP_JS),
         ("GET", "/style.css") => Response::css(STYLE),
-        ("GET", "/api/state") => Response::json(state_json(robot)),
+        ("GET", "/api/state") => Response::json(state_json(ctx)),
 
         ("POST", "/api/pose") => match parse_pose(&request.body) {
             Err(reason) => Response::refused(&reason),
-            Ok(targets) => {
-                let pose: std::collections::BTreeMap<String, Rad> = targets
-                    .into_iter()
-                    .map(|(name, value)| (name, Rad(value)))
-                    .collect();
-                match robot.set_positions(&pose) {
-                    Ok(()) => Response::json("{\"ok\":true}".into()),
-                    Err(error) => Response::refused(&error.to_string()),
-                }
-            }
+            Ok(targets) => match ctx.pose(&targets) {
+                Ok(()) => Response::json("{\"ok\":true}".into()),
+                Err(reason) => Response::refused(&reason),
+            },
         },
 
         // A profiled move: the sliders set a target directly, this plans one.
-        // Both the per-joint "go" and the whole-body buttons come through here,
-        // because "every joint to zero" and "one joint to zero" differ only in
-        // how many names are in the request.
         ("POST", "/api/move") => match parse_move(&request.body) {
             Err(reason) => Response::refused(&reason),
             Ok(request) => {
-                let result = match &request.pose {
-                    Some(pose) => robot.move_to_pose(
-                        pose,
-                        RadPerSec(request.max_velocity),
-                        RadPerSec2(request.accel),
-                    ),
-                    None => {
-                        let targets = request
-                            .targets
-                            .iter()
-                            .map(|(name, &value)| (name.clone(), Rad(value)))
-                            .collect();
-                        robot.move_many(
-                            &targets,
-                            RadPerSec(request.max_velocity),
-                            RadPerSec2(request.accel),
-                        )
-                    }
+                let targets = match &request.pose {
+                    Some(pose) => match ctx.description.poses.get(pose) {
+                        Some(targets) => targets.clone(),
+                        None => return Response::refused(&format!("no pose named {pose:?}")),
+                    },
+                    None => request.targets.clone(),
                 };
-                match result {
+                match ctx.start_move(&targets, request.max_velocity, request.accel) {
                     Ok(()) => Response::json("{\"ok\":true}".into()),
-                    Err(error) => Response::refused(&error.to_string()),
+                    Err(reason) => Response::refused(&reason),
                 }
             }
         },
@@ -149,165 +404,265 @@ fn handle(ctx: &Panel, request: &Request) -> Response {
         // would report is the one the loop asked for.
         ("POST", "/api/learn/start") => match parse_learn(&request.body) {
             Err(reason) => Response::refused(&reason),
-            Ok(seconds) => match ctx.learner.start(ctx.robot.clone(), seconds) {
-                Ok(()) => Response::json("{\"ok\":true}".into()),
-                Err(reason) => Response::refused(&reason),
-            },
+            Ok(seconds) => {
+                if let Err(reason) = ctx.release_all() {
+                    return Response::refused(&reason);
+                }
+                let mut learner = ctx.learner.lock().unwrap();
+                learner.clear();
+                learner.running = true;
+                learner.started = Some(Instant::now());
+                learner.seconds = seconds;
+                Response::json("{\"ok\":true}".into())
+            }
         },
         ("POST", "/api/learn/stop") => {
-            ctx.learner.stop();
+            ctx.learner.lock().unwrap().running = false;
             Response::json("{\"ok\":true}".into())
         }
         ("POST", "/api/learn/clear") => {
-            ctx.learner.clear();
+            let mut learner = ctx.learner.lock().unwrap();
+            learner.running = false;
+            learner.clear();
             Response::json("{\"ok\":true}".into())
         }
-        ("GET", "/api/learn") => Response::json(learn_json(&ctx.learner, robot)),
+        ("GET", "/api/learn") => Response::json(learn_json(ctx)),
 
         // Edited limits go back to the description. Nothing here changes the
-        // running machine: the mapping and the envelope were built when it came
-        // up, and rebuilding them underneath a live joint is not something to
-        // do from a web request.
-        ("POST", "/api/limits") => match parse_limits(&request.body) {
-            Err(reason) => Response::refused(&reason),
-            Ok(edits) => match Config::write_limits(&ctx.path, &edits) {
+        // running machine: the runtime built its envelope when it came up.
+        ("POST", "/api/limits") => match (&ctx.path, parse_limits(&request.body)) {
+            (_, Err(reason)) => Response::refused(&reason),
+            (None, Ok(_)) => Response::refused(
+                "the panel was started without a description file, so there is nowhere to \
+                 write edited limits",
+            ),
+            (Some(path), Ok(edits)) => match Config::write_limits(path, &edits) {
                 Ok(_) => Response::json(format!(
                     "{{\"ok\":true,\"written\":{},\"restart_required\":true}}",
-                    quote(&ctx.path.display().to_string())
+                    quote(&path.display().to_string())
                 )),
                 Err(error) => Response::refused(&error.0),
             },
         },
 
         ("POST", "/api/estop") => {
-            robot.estop("the panel's E-STOP was pressed");
-            Response::json("{\"ok\":true}".into())
+            *ctx.mover.lock().unwrap() = None;
+            match ctx.client.estop() {
+                Ok(()) => Response::json("{\"ok\":true}".into()),
+                Err(error) => Response::refused(&error.to_string()),
+            }
         }
-        ("POST", "/api/reset") => match robot.reset_estop() {
+        ("POST", "/api/reset") => {
+            *ctx.mover.lock().unwrap() = None;
+            for target in ctx.targets.lock().unwrap().iter_mut() {
+                *target = f64::NAN;
+            }
+            match ctx.client.reset_estop() {
+                Ok(()) => Response::json("{\"ok\":true}".into()),
+                Err(error) => Response::refused(&error.to_string()),
+            }
+        }
+        ("POST", "/api/hold") => match ctx.hold_all() {
             Ok(()) => Response::json("{\"ok\":true}".into()),
-            Err(error) => Response::refused(&error.to_string()),
+            Err(reason) => Response::refused(&reason),
         },
-        ("POST", "/api/hold") => {
-            let mut failures = Vec::new();
-            for name in robot.joint_names() {
-                if let Err(error) = robot.hold(name) {
-                    failures.push(format!("{name}: {error}"));
-                }
-            }
-            if failures.is_empty() {
-                Response::json("{\"ok\":true}".into())
-            } else {
-                Response::refused(&failures.join(", "))
-            }
-        }
-        ("POST", "/api/stop") => {
-            for name in robot.joint_names() {
-                let _ = robot.stop(name);
-            }
-            Response::json("{\"ok\":true}".into())
-        }
+        ("POST", "/api/stop") => match ctx.release_all() {
+            Ok(()) => Response::json("{\"ok\":true}".into()),
+            Err(reason) => Response::refused(&reason),
+        },
 
         _ => Response::not_found(),
+    }
+}
+
+fn number(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value}")
+    } else {
+        "null".into()
     }
 }
 
 /// The whole machine, as the panel wants it.
 ///
 /// Hand-written rather than derived, because the panel's shape and the
-/// framework's are not the same thing and pinning one to the other means every
+/// runtime's are not the same thing and pinning one to the other means every
 /// internal rename is a UI change.
-fn state_json(robot: &Robot) -> String {
-    let states = robot.state();
-    let mut joints = Vec::with_capacity(states.len());
+fn state_json(ctx: &Panel) -> String {
+    let latest = ctx.client.latest();
+    let connected = latest
+        .as_ref()
+        .map(|(_, age)| *age < Duration::from_secs(1))
+        .unwrap_or(false);
+    let state = latest.map(|(state, _)| state);
+    let targets = ctx.targets.lock().unwrap().clone();
+    let (moving_to, progress): (Vec<Option<f64>>, f64) = {
+        let mover = ctx.mover.lock().unwrap();
+        match mover.as_ref() {
+            Some(current) => (
+                (0..ctx.description.joints.len())
+                    .map(|index| current.target_of(index))
+                    .collect(),
+                current.progress(),
+            ),
+            None => (vec![None; ctx.description.joints.len()], 0.0),
+        }
+    };
+    let estop_reason = state
+        .as_ref()
+        .filter(|state| state.estop != 0)
+        .and_then(|state| TripCode::from_u8(state.estop_code as u8))
+        .map(|code| code.code().to_string())
+        .unwrap_or_default();
 
-    for state in &states {
-        let config = robot
-            .config
-            .joint(&state.name)
-            .expect("a state exists for every configured joint");
-
-        let number = |value: Option<f64>| match value {
-            // null, not zero. A driver that did not read a torque reports
-            // nothing, and 0.000 Nm would be a different claim entirely.
-            Some(value) if value.is_finite() => format!("{value}"),
-            _ => "null".into(),
+    let mut joints = Vec::with_capacity(ctx.description.joints.len());
+    for joint in &ctx.description.joints {
+        let motor = state
+            .as_ref()
+            .and_then(|state| (joint.index < state.n as usize).then(|| state.state[joint.index]));
+        let status = motor.and_then(|m| AxisStatus::from_u8(m.status));
+        let armed = matches!(
+            status,
+            Some(AxisStatus::Ok | AxisStatus::Alert | AxisStatus::Refused)
+        );
+        let position = motor.map(|m| m.q as f64).unwrap_or(f64::NAN);
+        // The target is what the panel last asked for, or where the joint
+        // is: a tool waiting for "position near target" must not see null.
+        let target = targets
+            .get(joint.index)
+            .copied()
+            .filter(|t| t.is_finite())
+            .unwrap_or(position);
+        let blocked = motor
+            .and_then(|m| match m.blocked {
+                0 => None,
+                b => Some(quote(blocked_name(b))),
+            })
+            .map(|s| vec![s])
+            .unwrap_or_default();
+        let fault_name = match motor.map(|m| m.fault).unwrap_or(0) {
+            0 => String::new(),
+            code => format!("fault 0x{code:x}"),
         };
-        let blocked: Vec<String> = state.blocked.iter().map(|line| quote(line)).collect();
 
         joints.push(format!(
             "{{\"name\":{},\"driver\":{},\"bus\":{},\"id\":{},\
               \"min_rad\":{},\"max_rad\":{},\
               \"armed\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
               \"position_rad\":{},\"target_rad\":{},\"torque_nm\":{},\
-              \"voltage_v\":{},\"rate_hz\":{},\"fault_name\":{},              \"moving_to_rad\":{},\"progress\":{},\"blocked\":[{}]}}",
-            quote(&state.name),
-            quote(&config.driver),
-            quote(&config.bus),
-            config.id,
-            config.limits.min_rad,
-            config.limits.max_rad,
-            state.armed,
-            state.estop,
-            quote(&state.estop_reason),
-            quote(state.mode.as_str()),
-            number(state.position_rad),
-            number(Some(state.target_rad)),
-            number(state.torque_nm),
-            number(state.voltage_v),
-            number(Some(state.rate_hz)),
-            quote(&state.fault_name),
-            number(state.moving_to_rad),
-            number(Some(state.progress)),
+              \"velocity_rad_s\":{},\"current_a\":{},\"temperature_c\":{},\
+              \"voltage_v\":{},\"rate_hz\":{},\"fault_name\":{},\
+              \"moving_to_rad\":{},\"progress\":{},\"blocked\":[{}]}}",
+            quote(&joint.name),
+            quote(&joint.driver),
+            quote(&joint.bus),
+            joint.id,
+            joint.min_rad,
+            joint.max_rad,
+            armed,
+            !estop_reason.is_empty(),
+            quote(&estop_reason),
+            quote(status.map(|s| s.as_str()).unwrap_or("silent")),
+            number(position),
+            number(target),
+            number(motor.map(|m| m.tau as f64).unwrap_or(f64::NAN)),
+            number(motor.map(|m| m.dq as f64).unwrap_or(f64::NAN)),
+            number(motor.map(|m| m.current as f64).unwrap_or(f64::NAN)),
+            number(motor.map(|m| m.temp as f64).unwrap_or(f64::NAN)),
+            number(motor.map(|m| m.voltage as f64).unwrap_or(f64::NAN)),
+            ctx.description.rate_hz,
+            quote(&fault_name),
+            number(moving_to[joint.index].unwrap_or(f64::NAN)),
+            number(if moving_to[joint.index].is_some() {
+                progress
+            } else {
+                0.0
+            }),
             blocked.join(",")
         ));
     }
 
-    // The poses come from the description, so the panel grows a button when the
-    // machine grows a pose and nothing has to be rebuilt.
-    let poses: Vec<String> = robot.pose_names().iter().map(|name| quote(name)).collect();
-
+    let poses: Vec<String> = ctx
+        .description
+        .poses
+        .keys()
+        .map(|name| quote(name))
+        .collect();
     format!(
         "{{\"robot\":{},\"rate_hz\":{},\"connected\":{},\"poses\":[{}],\"joints\":[{}]}}",
-        quote(&robot.config.robot),
-        robot.config.rate_hz,
-        !states.is_empty(),
+        quote(&ctx.description.robot),
+        ctx.description.rate_hz,
+        connected,
         poses.join(","),
         joints.join(",")
     )
 }
 
-/// What teach mode has seen, next to what the description says today.
-fn learn_json(learner: &RangeLearner, robot: &Robot) -> String {
-    let status = learner.status(robot);
-    let number = |value: Option<f64>| match value {
-        Some(value) if value.is_finite() => format!("{value}"),
-        _ => "null".into(),
-    };
+fn blocked_name(byte: u8) -> &'static str {
+    match byte {
+        1 => Blocked::NoTelemetry.as_str(),
+        2 => Blocked::VoltageLow.as_str(),
+        3 => Blocked::VoltageHigh.as_str(),
+        4 => Blocked::ControllerFault.as_str(),
+        5 => Blocked::NoPosition.as_str(),
+        6 => Blocked::OutsideEnvelope.as_str(),
+        7 => Blocked::Estop.as_str(),
+        _ => "blocked",
+    }
+}
 
-    let joints: Vec<String> = status
+/// What teach mode has seen, next to what the description says today.
+fn learn_json(ctx: &Panel) -> String {
+    let learner = ctx.learner.lock().unwrap();
+    let latest = ctx.client.latest().map(|(state, _)| state);
+    let elapsed = learner
+        .started
+        .map(|at| at.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    let remaining = if learner.running {
+        (learner.seconds - elapsed).max(0.0)
+    } else {
+        0.0
+    };
+    let joints: Vec<String> = ctx
+        .description
         .joints
         .iter()
         .map(|joint| {
+            let index = joint.index;
+            let current = latest
+                .as_ref()
+                .and_then(|s| s.state.get(index).map(|m| m.q as f64))
+                .unwrap_or(f64::NAN);
+            let span = learner.max[index] - learner.min[index];
             format!(
-                "{{\"name\":{},\"min_rad\":{},\"max_rad\":{},\"current_rad\":{},                  \"span_rad\":{},\"samples\":{},                  \"configured_min_rad\":{},\"configured_max_rad\":{},\"direction\":{}}}",
+                "{{\"name\":{},\"min_rad\":{},\"max_rad\":{},\"current_rad\":{},\
+                  \"span_rad\":{},\"samples\":{},\
+                  \"configured_min_rad\":{},\"configured_max_rad\":{},\"direction\":{}}}",
                 quote(&joint.name),
-                number(joint.min_rad),
-                number(joint.max_rad),
-                number(joint.current_rad),
-                number(joint.span_rad()),
-                joint.samples,
-                joint.configured_min_rad,
-                joint.configured_max_rad,
-                joint.direction,
+                number(learner.min[index]),
+                number(learner.max[index]),
+                number(current),
+                number(span),
+                learner.samples[index],
+                joint.min_rad,
+                joint.max_rad,
+                // The runtime's description does not carry the sense; the
+                // file does, and the file is what an edit goes back to.
+                ctx.path
+                    .as_ref()
+                    .and_then(|path| Config::load(path).ok())
+                    .and_then(|config| config.joint(&joint.name).map(|j| j.direction))
+                    .unwrap_or(1.0),
             )
         })
         .collect();
 
     format!(
         "{{\"running\":{},\"elapsed_s\":{:.2},\"remaining_s\":{:.2},\"joints\":[{}]}}",
-        status.running,
-        status.elapsed_s,
-        status.remaining_s,
+        learner.running,
+        elapsed,
+        remaining,
         joints.join(",")
     )
 }
@@ -391,16 +746,13 @@ mod tests {
             APP_JS.contains("goes limp"),
             "the confirmation has to say what actually happens"
         );
-        // A native dialog blocks the page, and a panel showing a live machine
-        // must not stop rendering because one is open.
         assert!(
             !APP_JS.contains("confirm(") && !APP_JS.contains("alert("),
             "the panel must not use a blocking browser dialog"
         );
     }
 
-    /// Every field the panel reads has to be one the panel sends. A rename on
-    /// this side is a widget that silently renders nothing.
+    /// Every field the panel reads has to be one the panel sends.
     #[test]
     fn the_state_payload_carries_what_the_script_reads() {
         for field in [
@@ -418,22 +770,12 @@ mod tests {
         }
     }
 
-    /// The E-STOP is the one control that must never be hunted for, so it is
-    /// pushed to its own end of the row and coloured.
     #[test]
     fn the_estop_is_not_one_button_among_others() {
         assert!(STYLE.contains("margin-left: auto"));
         assert!(INDEX.contains("btn btn-estop"));
     }
 
-    /// A class assignment must not drop the class the element was found by.
-    ///
-    /// Found in a browser on this bench, and only there. `render` looked up
-    /// `.joint-armed`, then assigned `className = "pill pill-ok"` — which threw
-    /// the marker away. The first render worked; every one after it hit a null
-    /// and threw halfway through, so the panel sat on stale numbers with the
-    /// connection pill flickering to "disconnected" while the machine was
-    /// perfectly alive.
     #[test]
     fn restyling_an_element_keeps_the_class_it_was_found_by() {
         for marker in ["joint-armed", "joint-mode"] {
@@ -443,16 +785,14 @@ mod tests {
             );
             assert!(
                 APP_JS.contains(&format!("\"{marker} pill \"")),
-                "the {marker} pill drops its own marker class when it is restyled, so the second                  render cannot find it"
+                "the {marker} pill drops its own marker class when it is restyled"
             );
         }
     }
 
     /// Nothing safety-related may be drawn from what the operator pressed.
-    /// Armed, e-stopped and faulted come only from state the robot sent.
     #[test]
     fn the_script_renders_safety_state_only_from_the_robot() {
-        // The E-STOP handler posts and does nothing else — no local repaint.
         let handler = APP_JS
             .split("getElementById(\"estop\")")
             .nth(1)
@@ -463,5 +803,21 @@ mod tests {
             !handler.contains("className") && !handler.contains("textContent"),
             "the e-stop handler must not paint the machine as stopped: {handler}"
         );
+    }
+
+    /// A move's progress and target are reported per joint while it runs,
+    /// and the trapezoid is used in radians end to end.
+    #[test]
+    fn a_move_reports_where_each_joint_is_going() {
+        let profile =
+            Trapezoidal::new(Rev(0.0), Rev(1.0), RevPerSec(1.0), RevPerSec2(2.0)).unwrap();
+        let current = Move {
+            profiles: vec![(3, profile)],
+            started: Instant::now(),
+            total: profile.total_time(),
+        };
+        assert_eq!(current.target_of(3), Some(1.0));
+        assert_eq!(current.target_of(0), None);
+        assert!(current.progress() < 0.5);
     }
 }

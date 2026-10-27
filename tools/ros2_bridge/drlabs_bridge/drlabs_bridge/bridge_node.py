@@ -1,4 +1,4 @@
-"""A managed ROS 2 node that fronts a running ``drlabs bringup`` server.
+"""A managed ROS 2 node that fronts a running ``drlabs rt`` runtime.
 
     ROS 2                                   drlabs bringup
     joint_commands  ──┐                  ┌──  JSON lines
@@ -62,10 +62,10 @@ class BridgeNode(LifecycleNode):
 
         self.declare_parameter(
             "host", "127.0.0.1",
-            ParameterDescriptor(description="Address of the drlabs bringup server."))
+            ParameterDescriptor(description="Address of the drlabs rt runtime."))
         self.declare_parameter(
-            "port", 7777,
-            ParameterDescriptor(description="TCP port the bringup server listens on."))
+            "port", 7700,
+            ParameterDescriptor(description="UDP port the runtime listens on."))
         self.declare_parameter(
             "publish_rate", 50.0,
             ParameterDescriptor(description=(

@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use drlabs_robot::config::LimitEdit;
+use drlabs_rt::config::LimitEdit;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 

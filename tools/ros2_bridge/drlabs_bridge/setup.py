@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer="Seungpyo Sun",
     maintainer_email="seungpyoseon@gmail.com",
-    description="ROS 2 bridge to a drlabs bringup server.",
+    description="ROS 2 bridge to the drlabs rt runtime.",
     license="MIT",
     tests_require=["pytest"],
     entry_points={

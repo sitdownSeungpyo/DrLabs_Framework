@@ -121,3 +121,14 @@ ros2 launch drlabs_bridge bridge.launch.py
 ros2 topic hz /joint_states        # should match publish_rate
 ros2 topic info -v /joint_states   # QoS endpoints agree
 ```
+
+## 2026-10-27: the bridge now fronts `drlabs rt`
+
+The JSON-lines server this document describes was the Go `bringup`; the
+Rust tree never implemented it. The bridge's `link.py` now speaks the
+runtime's LowCmd/LowState frames through `tools/drlabs_client` (see
+`docs/RT.md`), and the node's `port` parameter defaults to 7700. The ROS
+surface — `joint_states`, `joint_commands`, `~/estop`, `~/reset`,
+`~/connection` — is unchanged. Velocity commands are refused: the runtime
+drives position servos in this version. `test/test_link.py` stands up a fake
+runtime on loopback and needs no ROS.

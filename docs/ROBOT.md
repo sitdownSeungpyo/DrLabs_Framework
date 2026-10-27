@@ -274,3 +274,12 @@ Three simulated joints, 100 Hz, one with `direction: -1` and two geared 6:1:
 Not yet exercised on hardware. In particular: two motors sharing one real bus.
 The locking is correct by construction and the mapping is covered by tests, but
 neither has met a real adapter with two controllers on it.
+
+## 2026-10-27: the runtime replaces per-joint sessions
+
+`drlabs rt <robot.json>` (crate `drlabs-rt`, `docs/RT.md`) runs one thread
+per bus and exchanges fixed-size LowCmd/LowState records with clients over
+UDP. `drlabs panel` is now a client of it, with the same HTTP API as before.
+`drlabs bringup` and the per-joint `Session` path remain for single-axis
+tools and are not developed further. The JSON-lines protocol described above
+has no Rust server.

@@ -5,6 +5,7 @@ resolver = "2"
 # layout is in docs/RUST.md; nothing is listed here until it builds.
 members = [
     "apps/drlabs-cli",
+    "crates/drlabs-api",
     "crates/drlabs-core",
     "crates/drlabs-robot",
     "crates/drlabs-rt",
@@ -27,6 +28,7 @@ license = "MIT"
 repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 
 [workspace.dependencies]
+drlabs-api = { path = "crates/drlabs-api" }
 drlabs-core = { path = "crates/drlabs-core" }
 drlabs-robot = { path = "crates/drlabs-robot" }
 drlabs-rt = { path = "crates/drlabs-rt" }

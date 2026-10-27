@@ -18,6 +18,7 @@ mod bringup;
 mod flags;
 mod panel;
 mod probe;
+mod rt;
 mod serve;
 
 use std::process::ExitCode;
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         "run" => probe::run(rest),
         "bringup" => bringup::bringup(rest),
         "panel" => panel::panel(rest),
+        "rt" => rt::rt(rest),
         "serve" => serve::serve(rest),
         "-h" | "--help" | "help" => {
             usage();
@@ -102,10 +104,15 @@ Usage:
   drlabs bringup [flags] <robot.json>
                                      Bring a whole machine up from a
                                      description and hold it there
-  drlabs panel   [flags] <robot.json>
-                                     The same, with a browser panel to drive it
+  drlabs panel   [-addr host:port] [-rt host:port] [robot.json]
+                                     A browser panel on a running `drlabs rt`;
+                                     robot.json only for writing edited limits
   drlabs serve   [flags]             The servo role: energise one axis and take
                                      newline-delimited JSON commands over TCP
+  drlabs rt      [-check] [-seconds N] [-drive] <robot.json>
+                                     The real-time runtime: one thread per bus,
+                                     LowCmd/LowState records; -check validates
+                                     the description and opens nothing
 
 Common flags:
   -driver   moteus | dynamixel | robstride | odrive | sim   (default moteus)

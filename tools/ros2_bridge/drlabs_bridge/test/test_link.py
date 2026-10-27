@@ -1,250 +1,166 @@
 """Host tests for the link.
 
-These need no ROS installation and no hardware: they stand up a fake bringup
-server on a loopback socket and drive the real client against it.  That covers
-the half of the bridge most likely to be wrong — the wire format, and what
-happens when the link drops — while the node itself needs a machine with rclpy.
+These need no ROS installation and no hardware: they stand up a fake runtime
+on a loopback UDP socket and drive the real link against it.  That covers the
+half of the bridge most likely to be wrong — the wire format, the command
+mapping, and what happens when the runtime goes quiet — while the node itself
+needs a machine with rclpy.
 
-    pytest ros2/drlabs_bridge/test
+    python tools/ros2_bridge/drlabs_bridge/test/test_link.py
+    pytest tools/ros2_bridge/drlabs_bridge/test
 """
 
 import json
+import os
 import socket
+import sys
 import threading
 import time
 
-import pytest
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "..", "drlabs_client"))
 
-from drlabs_bridge.link import (CONNECTING, DISCONNECTED, LOST, READY, Backoff,
-                                JointState, RobotLink)
+from drlabs_bridge.link import LOST, READY, JointState, RobotLink  # noqa: E402
+from drlabs_client.codec import (  # noqa: E402
+    CMD, DESCRIBE, DRIVE, ESTOP, OFF, LowState, MotorState, decode,
+    encode_describe_reply, encode_state,
+)
 
 
-class FakeServer:
-    """A bringup server that answers commands and streams state."""
+class FakeRuntime:
+    """A runtime that describes two joints, streams states to whoever has
+    spoken, and records every command."""
 
-    def __init__(self, joints=("a", "b"), state_hz=50.0, port=0):
+    def __init__(self, joints=("a", "b"), state_hz=100.0):
         self.joints = list(joints)
-        self.state_period = 1.0 / state_hz
-        self.received = []
-        self.refuse = False
-        self.port = port
-        self._listener = None
-        self._running = False
-        self._thread = None
-        self.open()
-
-    def open(self):
-        """Start listening, on the same port as last time when there was one."""
-        listener = socket.socket()
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", self.port))
-        listener.listen(1)
-        self.port = listener.getsockname()[1]
-        self._listener = listener
+        self.period = 1.0 / state_hz
+        self.commands = []
+        self.positions = [0.1, -0.2]
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.settimeout(0.05)
+        self.port = self._sock.getsockname()[1]
+        self._subscribers = {}
         self._running = True
-        self._sessions = []
+        self._seq = 0
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
+    def describe_json(self):
+        return json.dumps({
+            "protocol": 1, "robot": "fake", "rate_hz": 500, "period_ns": 2_000_000,
+            "cmd_timeout_ms": 100, "on_cmd_timeout": "hold",
+            "joints": [{"index": i, "name": n, "bus": "sim", "driver": "sim", "id": i + 1,
+                        "min_rad": -1.0, "max_rad": 1.0, "max_torque_nm": 1.0,
+                        "max_velocity_rad_s": 2.0, "max_accel_rad_s2": 4.0}
+                       for i, n in enumerate(self.joints)],
+            "poses": {"zero": {n: 0.0 for n in self.joints}},
+        })
+
     def _serve(self):
+        next_state = time.monotonic()
         while self._running:
             try:
-                self._listener.settimeout(0.2)
-                conn, _ = self._listener.accept()
-            except (socket.timeout, OSError):
-                continue
-            self._sessions.append(conn)
-            threading.Thread(target=self._session, args=(conn,), daemon=True).start()
+                data, addr = self._sock.recvfrom(65536)
+                kind, payload = decode(data)
+                self._subscribers[addr] = time.monotonic()
+                if kind == DESCRIBE:
+                    self._sock.sendto(encode_describe_reply(self.describe_json()), addr)
+                elif kind == CMD:
+                    self.commands.append(payload)
+            except (socket.timeout, ValueError):
+                pass
+            if time.monotonic() >= next_state:
+                next_state += self.period
+                self._seq += 1
+                driving = self.commands[-1].cmd if self.commands else []
+                state = LowState(seq=self._seq, tick=self._seq, period_ns=2_000_000, state=[
+                    MotorState(q=self.positions[i], dq=0.0, voltage=12.0, temp=30.0,
+                               status=0 if i < len(driving) and driving[i].mode == DRIVE else 4)
+                    for i in range(len(self.joints))])
+                frame = encode_state(state)
+                now = time.monotonic()
+                for addr, seen in list(self._subscribers.items()):
+                    if now - seen < 2.0:
+                        self._sock.sendto(frame, addr)
 
-    def _session(self, conn):
-        stream = conn.makefile("rwb")
-        stop = threading.Event()
-
-        def push_state():
-            while self._running and not stop.is_set():
-                payload = {"type": "state", "joints": [
-                    {"name": name, "armed": True, "mode": "position",
-                     "estop": False, "position_rad": 0.25, "velocity_rad_s": 0.0,
-                     "torque_nm": None, "fault": 0, "fault_name": "No fault"}
-                    for name in self.joints]}
-                try:
-                    stream.write((json.dumps(payload) + "\n").encode())
-                    stream.flush()
-                except OSError:
-                    return
-                time.sleep(self.state_period)
-
-        threading.Thread(target=push_state, daemon=True).start()
-        try:
-            for raw in stream:
-                command = json.loads(raw)
-                self.received.append(command)
-                reply = {"type": "reply", "ok": not self.refuse}
-                if self.refuse:
-                    reply["error"] = "arm the axis first"
-                if command.get("cmd") == "joints":
-                    reply["value"] = list(self.joints)
-                stream.write((json.dumps(reply) + "\n").encode())
-                stream.flush()
-        except (OSError, ValueError):
-            pass
-        finally:
-            stop.set()
-            conn.close()
-
-    def close(self):
-        """Stop listening *and* drop every accepted session.
-
-        Closing only the listener leaves existing clients connected, which is
-        not what a bringup process being killed looks like — and a test that
-        models it that way never exercises the reconnect path at all.
-        """
+    def stop(self):
         self._running = False
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-        for conn in getattr(self, "_sessions", []):
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                conn.close()
-            except OSError:
-                pass
-        self._sessions = []
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=2.0)
+        self._thread.join(timeout=1.0)
+        self._sock.close()
 
 
-@pytest.fixture
-def server():
-    fake = FakeServer()
-    yield fake
-    fake.close()
-
-
-def wait_until(predicate, timeout=3.0):
+def wait_for(predicate, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return True
-        time.sleep(0.02)
+        time.sleep(0.01)
     return False
 
 
-def test_connects_and_streams_state(server):
-    seen = []
-    link = RobotLink("127.0.0.1", server.port, on_state=seen.append)
-    link.start()
+def test_link_connects_and_reports_joints():
+    runtime = FakeRuntime()
+    states, transitions = [], []
+    link = RobotLink("127.0.0.1", runtime.port,
+                     on_state=states.append, on_connection=transitions.append)
     try:
-        assert wait_until(lambda: link.state == READY)
-        assert wait_until(lambda: len(seen) >= 3)
-        assert [j.name for j in seen[-1]] == server.joints
+        link.start()
+        assert wait_for(lambda: link.state == READY), transitions
+        assert link.joint_names == ["a", "b"]
+        assert wait_for(lambda: len(states) > 3)
+        joints = states[-1]
+        assert [j.name for j in joints] == ["a", "b"]
+        assert isinstance(joints[0], JointState)
+        assert abs(joints[0].position_rad - 0.1) < 1e-6
+        assert joints[0].voltage_v == 12.0
+        assert joints[0].torque_nm is None, "an unreported torque is None, not zero"
+        assert not joints[0].armed
     finally:
         link.stop()
+        runtime.stop()
 
 
-def test_joint_names_come_from_the_state_stream(server):
-    """The roster arrives with the state, so it costs no round trip.
-
-    It also must not be requested by the thread that reads the answer, which is
-    what an earlier version did — and it timed out every time.
-    """
-    link = RobotLink("127.0.0.1", server.port)
-    link.start()
+def test_commands_become_frames():
+    runtime = FakeRuntime()
+    link = RobotLink("127.0.0.1", runtime.port)
     try:
-        assert wait_until(lambda: link.joint_names == server.joints)
-        assert not any(c.get("cmd") == "joints" for c in server.received)
+        link.start()
+        assert wait_for(lambda: link.state == READY)
+        assert link.set_positions({"b": 0.5}) == {"ok": True}
+        assert wait_for(lambda: runtime.commands and runtime.commands[-1].cmd[1].mode == DRIVE)
+        cmd = runtime.commands[-1]
+        assert abs(cmd.cmd[1].q - 0.5) < 1e-6
+        assert cmd.cmd[0].mode == OFF, "a joint not named stays as it was"
+
+        assert link.stop_joint("b") == {"ok": True}
+        assert wait_for(lambda: runtime.commands[-1].cmd[1].mode == OFF)
+
+        assert link.estop("test") == {"ok": True}
+        assert wait_for(lambda: runtime.commands[-1].flags & ESTOP)
+
+        assert link.set_velocity("a", 1.0)["ok"] is False
     finally:
         link.stop()
+        runtime.stop()
 
 
-def test_pose_command_is_one_message(server):
-    link = RobotLink("127.0.0.1", server.port)
-    link.start()
+def test_a_quiet_runtime_is_reported_lost():
+    runtime = FakeRuntime()
+    transitions = []
+    link = RobotLink("127.0.0.1", runtime.port, on_connection=transitions.append)
     try:
-        assert wait_until(lambda: link.state == READY)
-        reply = link.set_positions({"a": 0.1, "b": -0.2})
-        assert reply["ok"] is True
-        pose = [c for c in server.received if c.get("cmd") == "pose"]
-        assert pose and pose[-1]["joints"] == {"a": 0.1, "b": -0.2}
-    finally:
-        link.stop()
-
-
-def test_a_refusal_is_an_answer_not_an_exception(server):
-    """The robot saying no is information, and the caller has to see it."""
-    server.refuse = True
-    link = RobotLink("127.0.0.1", server.port)
-    link.start()
-    try:
-        assert wait_until(lambda: link.state == READY)
-        reply = link.set_position("a", 0.1)
-        assert reply["ok"] is False
-        assert "arm the axis first" in reply["error"]
-    finally:
-        link.stop()
-
-
-def test_commands_fail_loudly_while_disconnected():
-    link = RobotLink("127.0.0.1", 1)  # nothing listens on port 1
-    link.start()
-    try:
-        assert wait_until(lambda: link.state in (CONNECTING, LOST))
-        with pytest.raises(OSError):
-            link.set_position("a", 0.1)
+        link.start()
+        assert wait_for(lambda: link.state == READY)
+        runtime.stop()
+        assert wait_for(lambda: link.state == LOST, timeout=5.0), transitions
     finally:
         link.stop(release=False)
 
 
-def test_reconnects_after_the_server_returns():
-    """Every link drops; what matters is that it comes back by itself."""
-    server = FakeServer()
-    seen = []
-    link = RobotLink("127.0.0.1", server.port, on_state=seen.append)
-    link.start()
-    try:
-        assert wait_until(lambda: link.state == READY)
-
-        server.close()
-        assert wait_until(lambda: link.state in (LOST, CONNECTING), timeout=5.0)
-
-        server.open()  # same port, as a restarted bringup would be
-        try:
-            before = len(seen)
-            assert wait_until(lambda: link.state == READY, timeout=10.0)
-            assert wait_until(lambda: len(seen) > before, timeout=5.0)
-            assert link.set_positions({"a": 0.0})["ok"] is True
-        finally:
-            server.close()
-    finally:
-        link.stop(release=False)
-
-
-def test_stop_reports_disconnected(server):
-    states = []
-    link = RobotLink("127.0.0.1", server.port, on_connection=states.append)
-    link.start()
-    assert wait_until(lambda: link.state == READY)
-    link.stop()
-    assert link.state == DISCONNECTED
-    assert states[-1] == DISCONNECTED
-
-
-def test_missing_measurements_stay_missing():
-    """None is not zero, and the difference is the whole point of reporting it."""
-    state = JointState.from_json({"name": "a", "position_rad": 0.5, "torque_nm": None})
-    assert state.position_rad == 0.5
-    assert state.torque_nm is None
-    assert state.temperature_c is None
-
-
-def test_backoff_grows_and_stays_bounded():
-    backoff = Backoff(initial=0.1, maximum=1.0, factor=2.0)
-    delays = [backoff.next_delay() for _ in range(10)]
-    assert all(0 < d <= 1.0 for d in delays)
-    assert delays[-1] > delays[0]
-    backoff.reset()
-    assert backoff.next_delay() <= 0.1
+if __name__ == "__main__":
+    for name, test in list(globals().items()):
+        if name.startswith("test_"):
+            test()
+            print("ok", name)

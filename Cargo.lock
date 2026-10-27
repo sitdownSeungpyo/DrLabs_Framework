@@ -3,15 +3,28 @@
 version = 3
 
 [[package]]
+name = "drlabs-api"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-rt",
+ "drlabs-timing",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "drlabs-cli"
 version = "0.1.0"
 dependencies = [
+ "drlabs-api",
  "drlabs-core",
  "drlabs-dynamixel",
  "drlabs-moteus",
  "drlabs-odrive",
  "drlabs-robot",
  "drlabs-robstride",
+ "drlabs-rt",
  "drlabs-safety",
  "drlabs-session",
  "drlabs-sim",
@@ -84,6 +97,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "drlabs-rt"
+version = "0.1.0"
+dependencies = [
+ "drlabs-core",
+ "drlabs-dynamixel",
+ "drlabs-robstride",
+ "drlabs-safety",
+ "drlabs-sim",
+ "drlabs-timing",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "drlabs-safety"
 version = "0.1.0"
 dependencies = [
@@ -111,6 +139,7 @@ dependencies = [
 name = "drlabs-timing"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "windows-sys 0.59.0",
 ]
 

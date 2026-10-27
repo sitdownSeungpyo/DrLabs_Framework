@@ -1,0 +1,24 @@
+# Build settings that travel with the repository.
+#
+# The robot PC is not the development PC.  Nothing here assumes the two share
+# an architecture: tune for a target by naming its CPU, and only use
+# `target-cpu=native` when the build runs on the machine that will run the
+# binary.  A `native` build copied to a different CPU dies with an illegal
+# instruction, which on a robot looks like "the daemon just exits".
+#
+# Build on the robot:      cargo build --profile rt
+# Cross from this PC:      cargo zigbuild --target aarch64-unknown-linux-gnu --profile rt
+#                          (cargo install cargo-zigbuild; needs zig on PATH)
+# Type-check a target:     cargo check --workspace --target aarch64-unknown-linux-gnu
+
+[target.aarch64-unknown-linux-gnu]
+# Fill in the board once it is chosen:
+#   Raspberry Pi 5 / RK3588 big cores:  cortex-a76
+#   Jetson Orin:                        cortex-a78
+#   Raspberry Pi 4:                     cortex-a72
+# Left generic until then, so the binary runs on any of them.
+rustflags = []
+
+[target.x86_64-unknown-linux-gnu]
+# x86-64-v2 (SSE4.2, POPCNT) is every x86 mini-PC made in the last decade.
+rustflags = ["-C", "target-cpu=x86-64-v2"]

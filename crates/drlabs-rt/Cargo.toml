@@ -1,0 +1,19 @@
+[package]
+name = "drlabs-rt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The real-time runtime: one thread per bus, fixed-size LowCmd/LowState records, the safety gate between them"
+
+[dependencies]
+drlabs-core = { workspace = true }
+drlabs-safety = { workspace = true }
+drlabs-sim = { workspace = true }
+drlabs-timing = { workspace = true }
+drlabs-dynamixel = { workspace = true }
+drlabs-robstride = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

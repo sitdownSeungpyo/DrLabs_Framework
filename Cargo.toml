@@ -7,6 +7,7 @@ members = [
     "apps/drlabs-cli",
     "crates/drlabs-core",
     "crates/drlabs-robot",
+    "crates/drlabs-rt",
     "crates/drlabs-safety",
     "crates/drlabs-sim",
     "crates/drlabs-session",
@@ -28,6 +29,7 @@ repository = "https://github.com/sitdownSeungpyo/DrLabs_Framework"
 [workspace.dependencies]
 drlabs-core = { path = "crates/drlabs-core" }
 drlabs-robot = { path = "crates/drlabs-robot" }
+drlabs-rt = { path = "crates/drlabs-rt" }
 drlabs-safety = { path = "crates/drlabs-safety" }
 drlabs-sim = { path = "crates/drlabs-sim" }
 drlabs-session = { path = "crates/drlabs-session" }
@@ -45,9 +47,20 @@ thiserror = "1"
 # The machine ships as one file.  Optimise for that: one codegen unit, fat LTO,
 # and panics that abort rather than unwind -- there is nothing above a control
 # loop to catch an unwind and carry on sensibly.
+#
+# Symbols are kept (debug = 1 is line tables only) so a crash on a robot PC
+# leaves a backtrace worth reading; the `rt` profile below strips them for
+# the copy that ships.  Per-target CPU tuning lives in .cargo/config.toml.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = 1
+strip = false
+
+# What goes on the robot: release, stripped.  `cargo build --profile rt`.
+[profile.rt]
+inherits = "release"
 strip = true
+debug = 0

@@ -1,0 +1,38 @@
+{
+  "robot": "sim26",
+  "rate_hz": 500,
+  "rt": { "deadline_miss_trip": 50 },
+  "api": { "udp": "127.0.0.1:7700", "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" },
+  "buses": [
+    { "name": "simA", "transport": "sim" },
+    { "name": "simB", "transport": "sim" }
+  ],
+  "joints": [
+    { "name": "j00", "bus": "simA", "driver": "sim", "id": 1,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j01", "bus": "simA", "driver": "sim", "id": 2,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j02", "bus": "simA", "driver": "sim", "id": 3,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j03", "bus": "simA", "driver": "sim", "id": 4,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j04", "bus": "simA", "driver": "sim", "id": 5,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j05", "bus": "simA", "driver": "sim", "id": 6,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j06", "bus": "simA", "driver": "sim", "id": 7,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j07", "bus": "simA", "driver": "sim", "id": 8,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j08", "bus": "simA", "driver": "sim", "id": 9,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j09", "bus": "simA", "driver": "sim", "id": 10, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j10", "bus": "simA", "driver": "sim", "id": 11, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j11", "bus": "simA", "driver": "sim", "id": 12, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j12", "bus": "simA", "driver": "sim", "id": 13, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j13", "bus": "simB", "driver": "sim", "id": 1,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j14", "bus": "simB", "driver": "sim", "id": 2,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j15", "bus": "simB", "driver": "sim", "id": 3,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j16", "bus": "simB", "driver": "sim", "id": 4,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j17", "bus": "simB", "driver": "sim", "id": 5,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j18", "bus": "simB", "driver": "sim", "id": 6,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j19", "bus": "simB", "driver": "sim", "id": 7,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j20", "bus": "simB", "driver": "sim", "id": 8,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j21", "bus": "simB", "driver": "sim", "id": 9,  "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j22", "bus": "simB", "driver": "sim", "id": 10, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j23", "bus": "simB", "driver": "sim", "id": 11, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j24", "bus": "simB", "driver": "sim", "id": 12, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } },
+    { "name": "j25", "bus": "simB", "driver": "sim", "id": 13, "gear_ratio": 1, "direction": 1, "limits": { "min_rad": -1.5, "max_rad": 1.5, "max_torque_nm": 1, "max_velocity_rad_s": 6, "max_accel_rad_s2": 30 } }
+  ]
+}

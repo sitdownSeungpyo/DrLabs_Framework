@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 mod platform;
+pub mod rt;
 
 /// How long before the deadline the wait switches from sleeping to spinning.
 ///

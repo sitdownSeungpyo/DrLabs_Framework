@@ -8,4 +8,7 @@ repository.workspace = true
 description = "The scheduling accuracy a motor control loop needs."
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Media"] }
+windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

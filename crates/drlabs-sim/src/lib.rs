@@ -14,14 +14,23 @@
 //! What it is not: a model of any real controller. The gains are plausible and
 //! the thermal model is a first-order fit with no basis beyond looking right on
 //! a plot. Nothing about a machine should be concluded from it.
+//!
+//! The physics lives in [`SimAxis`]. [`SimLink`] wraps one of them behind the
+//! single-axis [`Link`] surface; [`bus::SimBus`] drives a row of them behind
+//! the group [`drlabs_core::Bus`] surface with one clock for the lot.
+
+pub mod bus;
 
 use std::time::Instant;
 
+use drlabs_core::bus::{AxisFault, AxisReply, AxisStatus};
 use drlabs_core::command::{Command, ControlMode, Mode, QueryProfile, TorqueLimit};
 use drlabs_core::error::{Error, Result};
 use drlabs_core::link::{BoardStatus, Capabilities, Envelope, Identity, Link};
 use drlabs_core::telemetry::{Fault, Telemetry};
 use drlabs_core::units::{Amps, Celsius, Nm, Rev, RevPerSec, RevPerSec2, Volts};
+
+pub use bus::SimBus;
 
 /// What the simulated axis is made of.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,10 +99,11 @@ impl Default for SimParams {
     }
 }
 
-/// A simulated axis behind the ordinary [`Link`] surface.
-pub struct SimLink {
-    id: u8,
-    kind: &'static str,
+/// One simulated axis: a rotor, the controller loop driving it, and the
+/// registers that controller keeps. No clock of its own — the caller says
+/// how much time passed, so a row of these can share one.
+#[derive(Debug, Clone, Copy)]
+pub struct SimAxis {
     pub physics: Physics,
 
     position: f64,
@@ -106,22 +116,12 @@ pub struct SimLink {
     mode: ControlMode,
 
     params: SimParams,
-    last: Option<Instant>,
-    open: bool,
     elapsed: f64,
 }
 
-impl SimLink {
-    pub fn new(id: u8) -> Self {
-        Self::with_physics(id, "sim", Physics::default())
-    }
-
-    /// A simulator that reports itself as a particular family, so a config that
-    /// names `moteus-sim` gets something that says "moteus" in its status.
-    pub fn with_physics(id: u8, kind: &'static str, physics: Physics) -> Self {
+impl SimAxis {
+    pub fn new(physics: Physics) -> Self {
         Self {
-            id,
-            kind,
             board_temp: 24.0,
             motor_temp: 24.0,
             voltage: physics.supply.value(),
@@ -131,8 +131,6 @@ impl SimLink {
             control: ControlState::default(),
             mode: ControlMode::Stop,
             params: SimParams::default(),
-            last: None,
-            open: false,
             elapsed: 0.0,
         }
     }
@@ -147,6 +145,14 @@ impl SimLink {
 
     pub fn position(&self) -> Rev {
         Rev(self.position)
+    }
+
+    pub fn velocity(&self) -> RevPerSec {
+        RevPerSec(self.velocity)
+    }
+
+    pub fn mode(&self) -> ControlMode {
+        self.mode
     }
 
     /// Records the sticky registers a command carries.
@@ -244,6 +250,60 @@ impl SimLink {
         torque
     }
 
+    /// Advances the axis by `dt` seconds under `command`, returning the
+    /// torque and current of the last substep. Allocates nothing.
+    pub fn advance(&mut self, command: &Command, dt: f64) -> (f64, f64) {
+        self.elapsed += dt;
+        self.apply_params(command);
+        let max_torque = self
+            .params
+            .max_torque
+            .unwrap_or(self.physics.default_torque.value());
+
+        if let Mode::SetOutput { position } = command.mode {
+            // Re-referencing moves the *label*, not the shaft.
+            let offset = position.value() - self.position;
+            self.position += offset;
+            self.control.position = self.position;
+        }
+
+        let steps = (dt / self.physics.substep_seconds).round().max(1.0) as usize;
+        let h = dt / steps as f64;
+        let mut torque = 0.0;
+        for _ in 0..steps {
+            torque = self.step(command, max_torque, h);
+        }
+
+        let current = torque / self.physics.torque_constant;
+        // A first-order thermal fit. It looks right on a plot and means nothing
+        // about any real motor.
+        self.motor_temp += (0.6 * current * current - 0.05 * (self.motor_temp - 24.0)) * dt;
+        self.board_temp += (0.3 * current * current - 0.04 * (self.board_temp - 24.0)) * dt;
+        self.voltage =
+            self.physics.supply.value() - 0.05 * current.abs() + 0.02 * (self.elapsed).sin();
+        (torque, current)
+    }
+
+    /// The readings a bus hands back, with no strings in them.
+    pub fn reply(&self, torque: f64, current: f64, profile: QueryProfile) -> AxisReply {
+        let mut reply = AxisReply {
+            status: AxisStatus::Ok,
+            mode: Some(self.mode as i32),
+            fault: Some(AxisFault::default()),
+            position: Some(Rev(self.position)),
+            velocity: Some(RevPerSec(self.velocity)),
+            torque: Some(Nm(torque)),
+            current: Some(Amps(current)),
+            voltage: Some(Volts(self.voltage)),
+            board_temperature: Some(Celsius(self.board_temp)),
+            motor_temperature: None,
+        };
+        if profile != QueryProfile::Fast {
+            reply.motor_temperature = Some(Celsius(self.motor_temp));
+        }
+        reply
+    }
+
     fn telemetry(&self, torque: f64, current: f64, profile: QueryProfile) -> Telemetry {
         let mut telemetry = Telemetry {
             mode: Some(self.mode as i32),
@@ -282,6 +342,108 @@ impl SimLink {
     }
 }
 
+/// Every mode the simulator can express.
+pub(crate) fn capabilities() -> Capabilities {
+    Capabilities {
+        modes: vec![
+            ControlMode::Stop,
+            ControlMode::Query,
+            ControlMode::Position,
+            ControlMode::Velocity,
+            ControlMode::Torque,
+            ControlMode::Hold,
+            ControlMode::Brake,
+            ControlMode::StayWithin,
+            ControlMode::SetOutput,
+        ],
+        max_rate_hz: 1000,
+        has_watchdog: true,
+        reports_temperature: true,
+        reports_current: true,
+        reports_voltage: true,
+    }
+}
+
+pub(crate) fn envelope(physics: &Physics) -> Envelope {
+    Envelope {
+        voltage_min: Some(Volts(10.0)),
+        voltage_max: Some(Volts(44.0)),
+        voltage_rated: Some(physics.supply),
+        velocity_max: Some(RevPerSec(100.0)),
+        peak_current: Some(Amps(40.0)),
+    }
+}
+
+/// Says plainly that it is a simulation.
+///
+/// `BoardStatus::Supported` would be a lie of exactly the kind this
+/// framework spends its effort avoiding: an operator glancing at a status
+/// line should never have to work out whether the machine is real.
+pub(crate) fn identity(kind: &str) -> Identity {
+    Identity {
+        board: format!("simulated axis ({kind})"),
+        firmware: "simulation".into(),
+        status: BoardStatus::Unknown,
+        simulated: true,
+        ..Identity::new("sim")
+    }
+}
+
+/// Wall-clock seconds since `last`, bounded.
+///
+/// Bounded because a debugger pause or a laptop resuming from sleep would
+/// otherwise integrate a minute of motion in one step. The first call, with
+/// no `last`, is one millisecond.
+pub(crate) fn elapsed(last: &mut Option<Instant>, now: Instant) -> f64 {
+    let dt = last
+        .map(|last| now.duration_since(last).as_secs_f64().clamp(1e-4, 0.05))
+        .unwrap_or(0.001);
+    *last = Some(now);
+    dt
+}
+
+/// A simulated axis behind the ordinary [`Link`] surface.
+pub struct SimLink {
+    id: u8,
+    kind: &'static str,
+    axis: SimAxis,
+    last: Option<Instant>,
+    open: bool,
+}
+
+impl SimLink {
+    pub fn new(id: u8) -> Self {
+        Self::with_physics(id, "sim", Physics::default())
+    }
+
+    /// A simulator that reports itself as a particular family, so a config that
+    /// names `moteus-sim` gets something that says "moteus" in its status.
+    pub fn with_physics(id: u8, kind: &'static str, physics: Physics) -> Self {
+        Self {
+            id,
+            kind,
+            axis: SimAxis::new(physics),
+            last: None,
+            open: false,
+        }
+    }
+
+    /// Places the axis somewhere, for a test that needs it to start away from
+    /// zero.
+    pub fn at(mut self, position: Rev) -> Self {
+        self.axis = self.axis.at(position);
+        self
+    }
+
+    pub fn position(&self) -> Rev {
+        self.axis.position()
+    }
+
+    pub fn physics(&self) -> Physics {
+        self.axis.physics
+    }
+}
+
 impl Link for SimLink {
     fn kind(&self) -> &'static str {
         self.kind
@@ -292,7 +454,10 @@ impl Link for SimLink {
             ("driver".into(), self.kind.into()),
             ("id".into(), self.id.to_string()),
             ("transport".into(), "simulated".into()),
-            ("inertia".into(), format!("{} kg·m²", self.physics.inertia)),
+            (
+                "inertia".into(),
+                format!("{} kg·m²", self.axis.physics.inertia),
+            ),
         ]
     }
 
@@ -307,95 +472,25 @@ impl Link for SimLink {
         Ok(())
     }
 
-    /// Says plainly that it is a simulation.
-    ///
-    /// `BoardStatus::Supported` would be a lie of exactly the kind this
-    /// framework spends its effort avoiding: an operator glancing at a status
-    /// line should never have to work out whether the machine is real.
     fn identify(&mut self) -> Result<Option<Identity>> {
-        Ok(Some(Identity {
-            board: format!("simulated axis ({})", self.kind),
-            firmware: "simulation".into(),
-            status: BoardStatus::Unknown,
-            simulated: true,
-            ..Identity::new("sim")
-        }))
+        Ok(Some(identity(self.kind)))
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            modes: vec![
-                ControlMode::Stop,
-                ControlMode::Query,
-                ControlMode::Position,
-                ControlMode::Velocity,
-                ControlMode::Torque,
-                ControlMode::Hold,
-                ControlMode::Brake,
-                ControlMode::StayWithin,
-                ControlMode::SetOutput,
-            ],
-            max_rate_hz: 1000,
-            has_watchdog: true,
-            reports_temperature: true,
-            reports_current: true,
-            reports_voltage: true,
-        }
+        capabilities()
     }
 
     fn envelope(&self) -> Option<Envelope> {
-        Some(Envelope {
-            voltage_min: Some(Volts(10.0)),
-            voltage_max: Some(Volts(44.0)),
-            voltage_rated: Some(self.physics.supply),
-            velocity_max: Some(RevPerSec(100.0)),
-            peak_current: Some(Amps(40.0)),
-        })
+        Some(envelope(&self.axis.physics))
     }
 
     fn cycle(&mut self, command: &Command, profile: QueryProfile) -> Result<Option<Telemetry>> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let now = Instant::now();
-        // Bounded, because a debugger pause or a laptop resuming from sleep
-        // would otherwise integrate a minute of motion in one step.
-        let dt = self
-            .last
-            .map(|last| now.duration_since(last).as_secs_f64().clamp(1e-4, 0.05))
-            .unwrap_or(0.001);
-        self.last = Some(now);
-        self.elapsed += dt;
-
-        self.apply_params(command);
-        let max_torque = self
-            .params
-            .max_torque
-            .unwrap_or(self.physics.default_torque.value());
-
-        if let Mode::SetOutput { position } = command.mode {
-            // Re-referencing moves the *label*, not the shaft.
-            let offset = position.value() - self.position;
-            self.position += offset;
-            self.control.position = self.position;
-        }
-
-        let steps = (dt / self.physics.substep_seconds).round().max(1.0) as usize;
-        let h = dt / steps as f64;
-        let mut torque = 0.0;
-        for _ in 0..steps {
-            torque = self.step(command, max_torque, h);
-        }
-
-        let current = torque / self.physics.torque_constant;
-        // A first-order thermal fit. It looks right on a plot and means nothing
-        // about any real motor.
-        self.motor_temp += (0.6 * current * current - 0.05 * (self.motor_temp - 24.0)) * dt;
-        self.board_temp += (0.3 * current * current - 0.04 * (self.board_temp - 24.0)) * dt;
-        self.voltage =
-            self.physics.supply.value() - 0.05 * current.abs() + 0.02 * (self.elapsed).sin();
-
-        Ok(Some(self.telemetry(torque, current, profile)))
+        let dt = elapsed(&mut self.last, Instant::now());
+        let (torque, current) = self.axis.advance(command, dt);
+        Ok(Some(self.axis.telemetry(torque, current, profile)))
     }
 }
 

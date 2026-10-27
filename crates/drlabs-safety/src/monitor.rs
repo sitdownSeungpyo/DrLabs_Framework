@@ -31,15 +31,15 @@ impl std::fmt::Display for Trip {
 impl std::error::Error for Trip {}
 
 /// Measures how long a condition has held continuously, so a momentary
-/// excursion does not latch a stop.
+/// excursion does not latch a stop. Shared with [`crate::Guard`].
 #[derive(Debug, Clone, Copy, Default)]
-struct Persistence {
+pub(crate) struct Persistence {
     since: Option<Instant>,
 }
 
 impl Persistence {
     /// Whether `condition` has been true without interruption for `seconds`.
-    fn held(&mut self, condition: bool, now: Instant, seconds: f64) -> bool {
+    pub(crate) fn held(&mut self, condition: bool, now: Instant, seconds: f64) -> bool {
         if !condition {
             self.since = None;
             return false;

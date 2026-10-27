@@ -13,16 +13,20 @@
 //! * **"Not reported" is not a number.** Telemetry uses `Option`, not a NaN
 //!   sentinel, so a missing torque cannot be read as zero torque.
 
+pub mod bus;
 pub mod command;
 pub mod error;
 pub mod link;
+pub mod lowlevel;
 pub mod render;
 pub mod telemetry;
 pub mod units;
 
+pub use bus::{AxisCmd, AxisFault, AxisReply, AxisStatus, Bus};
 pub use command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
 pub use error::{Error, Result};
 pub use link::{BoardStatus, Capabilities, Envelope, Identity, Link};
+pub use lowlevel::{LowCmd, LowState, MotorCmd, MotorState, MAX_AXES, PROTOCOL_VERSION};
 pub use render::{render, MotorUnits, Units};
 pub use telemetry::Telemetry;
 pub use units::{Amps, Celsius, Nm, Rad, RadPerSec, RadPerSec2, Rev, RevPerSec, RevPerSec2, Volts};

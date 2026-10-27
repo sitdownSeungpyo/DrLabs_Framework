@@ -17,7 +17,9 @@
 //! Nothing here is ever written to a controller's persistent configuration.
 
 pub mod config;
+pub mod guard;
 pub mod monitor;
 
 pub use config::{Config, Preset, PRESETS};
+pub use guard::{Blocked, Guard, TripCode, Warnings};
 pub use monitor::{Monitor, Preflight, Trip};

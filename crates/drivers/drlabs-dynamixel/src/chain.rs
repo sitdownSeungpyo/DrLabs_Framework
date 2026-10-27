@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use drlabs_core::error::Result;
+use drlabs_core::error::{Error, Result};
 
 use crate::driver::Driver;
 
@@ -63,9 +63,35 @@ struct Member {
     block: Option<Vec<u8>>,
     answered: bool,
 
+    /// How many bytes this cycle's block read asked this servo for; zero when
+    /// it was left out. The recovery read asks for the same block.
+    asked: u16,
+
+    /// Consecutive cycles in which this servo answered neither the broadcast
+    /// nor the recovery read. Past `RECOVERY_GIVE_UP` the recovery read is
+    /// skipped until the servo answers a broadcast again: a servo that is
+    /// gone should not cost the chain a reply budget every period.
+    misses: u32,
+
+    /// Whether the last reply carried the hardware alert bit: the servo's
+    /// error register is non-zero, whether or not that register has been
+    /// read yet on the slower fault cadence.
+    alert: bool,
+
     /// The hardware-error byte as it last came back. Faults latch in the
     /// servo until power-cycled, so a slightly stale byte is still the truth.
     fault: Option<u8>,
+
+    /// The bus-watchdog register, and the byte it last read as. Zero means
+    /// this servo has no watchdog register and is left out of that read.
+    ///
+    /// Read on the fault cadence for the same reason faults are: a fired
+    /// watchdog latches at 0xFF, and while it is latched the servo answers
+    /// every goal write with a data-range or access error — which a sync
+    /// write, being unanswered, never hears. Without this read a latched
+    /// servo looks like one that accepts every goal and moves to none.
+    watchdog_addr: u16,
+    watchdog: Option<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +142,12 @@ const WIDE_EVERY: u32 = 10;
 /// whole chain answers.
 const MAX_SYNC_READ: usize = 8;
 
+/// After this many consecutive silent cycles a servo is no longer asked
+/// alone. Matches the session's comm-loss threshold: by then the joint is
+/// e-stopped, and the recovery read would only be paying a reply budget a
+/// period to confirm it. The first broadcast it answers resets the count.
+const RECOVERY_GIVE_UP: u32 = 5;
+
 impl Chain {
     pub fn new(driver: Arc<Driver>, period: Duration) -> Self {
         Self {
@@ -160,6 +192,14 @@ impl Chain {
         member.read_len = read_len;
         member.fast_len = fast_len;
         member.fault_addr = fault_addr;
+    }
+
+    /// Names the register this servo's bus watchdog lives in, so the chain
+    /// can watch for it latching.
+    pub fn set_watchdog_addr(&self, id: u8, address: u16) {
+        if let Some(member) = self.lock().members.get_mut(&id) {
+            member.watchdog_addr = address;
+        }
     }
 
     pub fn leave(&self, id: u8) {
@@ -237,9 +277,47 @@ impl Chain {
         self.lock().members.get(&id).and_then(|member| member.fault)
     }
 
+    /// Whether this servo's last reply carried the hardware alert bit. Set on
+    /// every reply while its error register is non-zero, so it is known a
+    /// cycle after the fault happens, before the register itself is read.
+    pub fn alert(&self, id: u8) -> bool {
+        self.lock()
+            .members
+            .get(&id)
+            .map(|member| member.answered && member.alert)
+            .unwrap_or(false)
+    }
+
+    /// The bus-watchdog byte as the chain last read it, on the fault cadence.
+    /// `Some(0xFF)` is a latched watchdog. `None` means not read yet, or the
+    /// servo has no such register.
+    pub fn watchdog(&self, id: u8) -> Option<u8> {
+        self.lock().members.get(&id).and_then(|member| member.watchdog)
+    }
+
+    /// Forgets a latched reading once the link has cleared the register, so
+    /// the same latch is not reported again before the next fault read.
+    pub fn forget_watchdog(&self, id: u8) {
+        if let Some(member) = self.lock().members.get_mut(&id) {
+            member.watchdog = None;
+        }
+    }
+
     /// One period on the wire: every goal out in one packet, every reading back
     /// in one more.
     fn cycle(&self, inner: &mut Inner) -> Result<()> {
+        if trace_enabled() {
+            if let Some(at) = inner.read_at {
+                let gap = at.elapsed();
+                if gap > self.period.saturating_mul(2) {
+                    eprintln!(
+                        "[dxl-chain] {:.0} ms since the last cycle (period {:.0} ms)",
+                        gap.as_secs_f64() * 1e3,
+                        self.period.as_secs_f64() * 1e3
+                    );
+                }
+            }
+        }
         // Every write on this bus rides one of a few broadcast sync writes,
         // emitted in a fixed order so a joint arms correctly: torque off, then
         // the limits, then torque on, then the goals. A broadcast is not
@@ -309,19 +387,17 @@ impl Chain {
             None => true,
         };
         let mut reads: BTreeMap<(u16, u16), Vec<u8>> = BTreeMap::new();
-        for (&id, member) in inner.members.iter() {
+        for (&id, member) in inner.members.iter_mut() {
             let len = if wide || member.fast_len == 0 {
                 member.read_len
             } else {
                 member.fast_len
             };
+            member.asked = len;
+            member.answered = false;
             if len > 0 {
                 reads.entry((member.read_base, len)).or_default().push(id);
             }
-        }
-
-        for member in inner.members.values_mut() {
-            member.answered = false;
         }
 
         // Split large groups into chunks: a single sync read of sixteen servos
@@ -329,17 +405,22 @@ impl Chain {
         // is reliably the last), so a shorter reply stream per transaction
         // keeps every servo answering. Still O(1) in transactions per period
         // as far as joint count on a chain of this size.
+        let read_started = Instant::now();
         for ((base, len), ids) in reads {
             for chunk in ids.chunks(MAX_SYNC_READ) {
-                let answers = self.driver.sync_read(base, len, chunk)?;
+                let (answers, alerts) = self.driver.sync_read_alerts(base, len, chunk)?;
                 for (id, data) in answers {
                     if let Some(member) = inner.members.get_mut(&id) {
                         member.answered = true;
+                        member.alert = alerts.contains(&id);
                         member.block = Some(data);
+                        member.misses = 0;
                     }
                 }
             }
         }
+
+        self.recover_silent(inner, read_started)?;
 
         if wide {
             inner.wide_read_at = Some(Instant::now());
@@ -359,14 +440,53 @@ impl Chain {
                     reads.entry(member.fault_addr).or_default().push(id);
                 }
             }
+            // Chunked like the block reads, and for a sharper reason: asked
+            // of fifteen servos in one packet, a one-byte read lost every
+            // reply after the eleventh about half the time on this bench,
+            // and each loss cost the chain the full reply timeout — a
+            // 100 ms stall in the middle of a 100 ms period, once a second.
             for (addr, ids) in reads {
-                let answers = self.driver.sync_read(addr, 1, &ids)?;
-                for (id, data) in answers {
-                    if let Some(member) = inner.members.get_mut(&id) {
-                        if let Some(&bits) = data.first() {
-                            member.fault = Some(bits);
+                for chunk in ids.chunks(MAX_SYNC_READ) {
+                    let answers = self.driver.sync_read(addr, 1, chunk)?;
+                    for (id, data) in answers {
+                        if let Some(member) = inner.members.get_mut(&id) {
+                            if let Some(&bits) = data.first() {
+                                member.fault = Some(bits);
+                            }
                         }
                     }
+                }
+            }
+
+            // The watchdog register rides the same cadence, one more
+            // broadcast a second, grouped by address like the faults.
+            let mut reads: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+            for (&id, member) in inner.members.iter() {
+                if member.watchdog_addr > 0 {
+                    reads.entry(member.watchdog_addr).or_default().push(id);
+                }
+            }
+            for (addr, ids) in reads {
+                for chunk in ids.chunks(MAX_SYNC_READ) {
+                    let answers = self.driver.sync_read(addr, 1, chunk)?;
+                    for (id, data) in answers {
+                        if let Some(member) = inner.members.get_mut(&id) {
+                            if let Some(&byte) = data.first() {
+                                member.watchdog = Some(byte);
+                            }
+                        }
+                    }
+                }
+            }
+            if trace_enabled() {
+                let latched: Vec<u8> = inner
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.watchdog == Some(0xFF))
+                    .map(|(&id, _)| id)
+                    .collect();
+                if !latched.is_empty() {
+                    eprintln!("[dxl-chain] watchdog latched on ids {latched:?}");
                 }
             }
             inner.faults_read_at = Some(Instant::now());
@@ -376,12 +496,84 @@ impl Chain {
         Ok(())
     }
 
+    /// Asks each servo that stayed silent on the block broadcast once more,
+    /// alone, before the cycle reports it as unanswered.
+    ///
+    /// Why this exists: on the sixteen-servo bench a sync read of eight loses
+    /// its tail under load — ids 5 through 8 of a chunk, together, a few times
+    /// an hour. Servos answer a sync read in turn, each after the one before
+    /// it, so a single dropped reply silences everyone behind it; asked
+    /// directly, the same servos answer. Before this pass one lost packet
+    /// became four missed cycles for four joints, five of those in a row
+    /// became a comm-loss e-stop, and the elbow dropped.
+    ///
+    /// Bounded two ways. Each read has the driver's reply budget, not the
+    /// transaction timeout. And a servo silent for `RECOVERY_GIVE_UP` cycles
+    /// running is left to the broadcast alone until it answers one: a servo
+    /// that is gone must not cost every other joint a reply budget a period.
+    fn recover_silent(&self, inner: &mut Inner, read_started: Instant) -> Result<()> {
+        let silent: Vec<u8> = inner
+            .members
+            .iter()
+            .filter(|(_, m)| !m.answered && m.asked > 0)
+            .map(|(&id, _)| id)
+            .collect();
+        if silent.is_empty() {
+            return Ok(());
+        }
+
+        let mut recovered = Vec::new();
+        let mut lost = Vec::new();
+        let mut given_up = Vec::new();
+        for id in &silent {
+            let Some(member) = inner.members.get_mut(id) else {
+                continue;
+            };
+            if member.misses >= RECOVERY_GIVE_UP {
+                member.misses = member.misses.saturating_add(1);
+                given_up.push(*id);
+                continue;
+            }
+            match self.driver.read_quick(*id, member.read_base, member.asked) {
+                Ok((data, alert)) if data.len() >= member.asked as usize => {
+                    member.answered = true;
+                    member.alert = alert;
+                    member.block = Some(data);
+                    member.misses = 0;
+                    recovered.push(*id);
+                }
+                // The port itself failing is the chain's failure, not one
+                // servo's silence.
+                Err(error @ Error::Transport { .. }) => return Err(error),
+                Ok(_) | Err(_) => {
+                    member.misses = member.misses.saturating_add(1);
+                    lost.push(*id);
+                }
+            }
+        }
+
+        if trace_enabled() {
+            eprintln!(
+                "[dxl-chain] silent on the broadcast {silent:?}: recovered {recovered:?}, \
+                 lost {lost:?}, given up {given_up:?} ({:.1} ms for the read phase)",
+                read_started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A poisoned lock means another link panicked mid-transaction. The
         // chain's own state is a cache of what the servos said, so carrying on
         // with it is safer than taking the whole machine down.
         self.inner.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
+
+/// Bench tracing of the chain's timing and watchdog reads, to stderr, when
+/// `DRLABS_DXL_TRACE` is set. Off it costs one environment lookup a cycle.
+fn trace_enabled() -> bool {
+    std::env::var_os("DRLABS_DXL_TRACE").is_some()
 }
 
 impl std::fmt::Debug for Chain {
@@ -406,10 +598,15 @@ mod tests {
         written: Arc<StdMutex<Vec<u8>>>,
         replies: Arc<StdMutex<Vec<Vec<u8>>>>,
         flushes: Arc<StdMutex<u64>>,
+        /// What a servo answers when read *directly* (a READ addressed to
+        /// its id), as opposed to the scripted broadcast replies above. A
+        /// servo in this map is one that drops out of the sync read but is
+        /// still there when asked alone.
+        direct: Arc<StdMutex<BTreeMap<u8, Vec<u8>>>>,
     }
 
     impl FakeChain {
-        fn answer(&self, id: u8, params: &[u8]) {
+        fn status_packet(id: u8, params: &[u8]) -> Vec<u8> {
             let mut packet = vec![0xFF, 0xFF, 0xFD, 0x00, id];
             let length = 1 + 1 + params.len() + 2;
             packet.push((length & 0xFF) as u8);
@@ -419,10 +616,39 @@ mod tests {
             packet.extend_from_slice(params);
             let crc = crate::protocol::update_crc(0, &packet);
             packet.extend_from_slice(&crc.to_le_bytes());
-            self.replies.lock().unwrap().push(packet);
+            packet
+        }
+        fn answer(&self, id: u8, params: &[u8]) {
+            self.replies
+                .lock()
+                .unwrap()
+                .push(Self::status_packet(id, params));
+        }
+        fn answer_direct(&self, id: u8, params: &[u8]) {
+            self.direct.lock().unwrap().insert(id, params.to_vec());
         }
         fn sent(&self) -> Vec<u8> {
             self.written.lock().unwrap().clone()
+        }
+        /// The ids that were asked with a direct READ (instruction 0x02),
+        /// in the order they were asked.
+        fn direct_reads(&self) -> Vec<u8> {
+            let sent = self.sent();
+            let mut ids = Vec::new();
+            let mut i = 0;
+            while i + 8 <= sent.len() {
+                if sent[i..i + 4] == [0xFF, 0xFF, 0xFD, 0x00] {
+                    let id = sent[i + 4];
+                    let length = u16::from_le_bytes([sent[i + 5], sent[i + 6]]) as usize;
+                    if sent[i + 7] == 0x02 && id != 0xFE {
+                        ids.push(id);
+                    }
+                    i += 7 + length;
+                } else {
+                    i += 1;
+                }
+            }
+            ids
         }
     }
 
@@ -439,6 +665,16 @@ mod tests {
         }
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.written.lock().unwrap().extend_from_slice(buf);
+            // A direct READ to a servo with a scripted direct answer is
+            // answered on the spot; a broadcast is answered by the script.
+            if buf.len() >= 8 && buf[..4] == [0xFF, 0xFF, 0xFD, 0x00] && buf[7] == 0x02 {
+                if let Some(params) = self.direct.lock().unwrap().get(&buf[4]) {
+                    self.replies
+                        .lock()
+                        .unwrap()
+                        .push(Self::status_packet(buf[4], params));
+                }
+            }
             Ok(buf.len())
         }
         fn flush_buffers(&mut self) -> std::io::Result<()> {
@@ -450,6 +686,7 @@ mod tests {
     fn chain(servo: &FakeChain, period: Duration) -> Chain {
         let mut driver = Driver::new(SharedPort::new(Box::new(servo.clone())));
         driver.timeout = Duration::from_millis(20);
+        driver.reply_timeout = Duration::from_millis(5);
         driver.poll_interval = Duration::from_micros(100);
         // The behaviour tests below are about the present-value cycle. The
         // fault broadcast still fires once, on the first cycle, but a long
@@ -520,7 +757,59 @@ mod tests {
         chain.join(2, 126, 10, 10, 70);
 
         assert_eq!(chain.refresh(1).unwrap(), Some(vec![7; 10]));
+        assert_eq!(
+            servo.direct_reads(),
+            vec![2],
+            "the silent servo was asked once, alone"
+        );
+        // A zero period, so this asks for a fresh cycle in which nobody
+        // answers; id 2 is still a dropped cycle, not an error.
         assert_eq!(chain.refresh(2).unwrap(), None, "id 2 never answered");
+    }
+
+    /// The bench failure this guards against: a servo drops out of the sync
+    /// read but answers when asked alone. The cycle asks, and the joint gets
+    /// its reading instead of a missed cycle.
+    #[test]
+    fn a_servo_silent_on_the_broadcast_is_recovered_by_a_direct_read() {
+        let servo = FakeChain::default();
+        servo.answer(1, &[7; 10]); // id 2 drops out of the broadcast…
+        servo.answer_direct(2, &[9; 10]); // …but answers a direct read
+        let chain = chain(&servo, Duration::from_secs(60));
+        chain.join(1, 126, 10, 10, 70);
+        chain.join(2, 126, 10, 10, 70);
+
+        assert_eq!(chain.refresh(1).unwrap(), Some(vec![7; 10]));
+        assert_eq!(chain.refresh(2).unwrap(), Some(vec![9; 10]), "recovered");
+        assert_eq!(servo.direct_reads(), vec![2]);
+    }
+
+    /// A servo that is really gone is asked alone for a few cycles, then left
+    /// to the broadcast — until it answers one, when the asking resumes.
+    #[test]
+    fn recovery_gives_up_on_a_servo_that_stays_silent_and_resumes_when_it_returns() {
+        let servo = FakeChain::default();
+        let chain = chain(&servo, Duration::from_millis(0));
+        chain.join(1, 126, 10, 10, 70);
+        chain.join(2, 126, 10, 10, 70);
+
+        for _ in 0..(RECOVERY_GIVE_UP + 3) {
+            servo.answer(1, &[1; 10]); // id 2 silent every cycle
+            assert_eq!(chain.refresh(2).unwrap(), None);
+        }
+        assert_eq!(
+            servo.direct_reads().len(),
+            RECOVERY_GIVE_UP as usize,
+            "asked alone until the give-up count, then left to the broadcast"
+        );
+
+        // It answers a broadcast again: the next silence is asked about.
+        servo.answer(1, &[1; 10]);
+        servo.answer(2, &[2; 10]);
+        assert_eq!(chain.refresh(2).unwrap(), Some(vec![2; 10]));
+        servo.answer(1, &[1; 10]);
+        assert_eq!(chain.refresh(2).unwrap(), None);
+        assert_eq!(servo.direct_reads().len(), RECOVERY_GIVE_UP as usize + 1);
     }
 
     /// A reading inside the period is the one already taken. This is what stops
@@ -804,5 +1093,69 @@ mod tests {
             !sent.contains(&0xC8),
             "id 2 was cleared and must not be commanded"
         );
+    }
+
+    /// The bus-watchdog register is read with the faults, one more broadcast
+    /// on the same cadence, and a latched servo (0xFF) is reported as such.
+    /// This is what lets a sync-written goal that the servo silently refused
+    /// become a visible failure.
+    #[test]
+    fn the_watchdog_register_rides_the_fault_broadcast() {
+        let servo = FakeChain::default();
+        servo.answer(1, &[0; 10]); // block replies
+        servo.answer(2, &[0; 10]);
+        servo.answer(1, &[0x00]); // fault replies
+        servo.answer(2, &[0x00]);
+        servo.answer(1, &[20]); // watchdog replies: id 1 armed at 400 ms,
+        servo.answer(2, &[0xFF]); // id 2 latched
+        let chain = chain(&servo, Duration::from_millis(0));
+        chain.join(1, 126, 10, 10, 70);
+        chain.join(2, 126, 10, 10, 70);
+        chain.set_watchdog_addr(1, 98);
+        chain.set_watchdog_addr(2, 98);
+
+        chain.refresh(1).expect("the chain answered");
+        assert_eq!(chain.watchdog(1), Some(20));
+        assert_eq!(chain.watchdog(2), Some(0xFF));
+
+        // Pinned encoding: sync read (0x82), address 98, length 1, ids 1 2.
+        let sent = servo.sent();
+        let watchdog_read = [0x82, 98, 0, 1, 0, 1, 2];
+        assert!(
+            sent.windows(watchdog_read.len()).any(|w| w == watchdog_read),
+            "no one-byte sync read of register 98 went out: {sent:02X?}"
+        );
+
+        // Once the link has cleared the latch the reading is forgotten, so
+        // the same latch is not reported twice before the next fault read.
+        chain.forget_watchdog(2);
+        assert_eq!(chain.watchdog(2), None);
+    }
+
+    /// The one-byte fault and watchdog broadcasts are chunked like the block
+    /// reads: nine members become two sync reads of each register.
+    #[test]
+    fn fault_and_watchdog_reads_are_chunked() {
+        let servo = FakeChain::default();
+        for id in 1..=9u8 {
+            servo.answer(id, &[0; 10]);
+        }
+        for id in 1..=9u8 {
+            servo.answer(id, &[0]); // faults
+        }
+        for id in 1..=9u8 {
+            servo.answer(id, &[20]); // watchdogs
+        }
+        let chain = chain(&servo, Duration::from_millis(0));
+        for id in 1..=9u8 {
+            chain.join(id, 126, 10, 10, 70);
+            chain.set_watchdog_addr(id, 98);
+        }
+
+        chain.refresh(1).expect("the chain answered");
+
+        assert_eq!(sync_read_count(&servo.sent(), 70), 2, "fault reads not chunked");
+        assert_eq!(sync_read_count(&servo.sent(), 98), 2, "watchdog reads not chunked");
+        assert_eq!(chain.watchdog(9), Some(20));
     }
 }

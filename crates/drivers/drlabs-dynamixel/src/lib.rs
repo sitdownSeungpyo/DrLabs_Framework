@@ -13,12 +13,14 @@
 //! places to fix the next time the wire turns out to work differently than
 //! anyone thought.
 
+pub mod bus;
 pub mod chain;
 pub mod driver;
 pub mod link;
 pub mod profile;
 pub mod protocol;
 
+pub use bus::DynamixelBus;
 pub use driver::Driver;
 pub use link::DynamixelLink;
 pub use profile::{Profile, XL330, X_SERIES};

@@ -20,6 +20,14 @@ pub const INST_SYNC_READ: u8 = 0x82;
 pub const INST_SYNC_WRITE: u8 = 0x83;
 pub const INST_BULK_READ: u8 = 0x92;
 pub const INST_BULK_WRITE: u8 = 0x93;
+/// Sync read answered as *one* packet for the whole chain. See
+/// [`parse_fast_sync_read`].
+pub const INST_FAST_SYNC_READ: u8 = 0x8A;
+pub const INST_FAST_BULK_READ: u8 = 0x9A;
+
+/// The broadcast id. A fast sync read's combined reply carries it in the id
+/// field, since no single servo sent the packet.
+pub const BROADCAST_ID: u8 = 0xFE;
 
 /// Header(4) + id(1) + length(2).
 pub const MIN_HEADER_SIZE: usize = 7;
@@ -84,22 +92,87 @@ pub fn destuff_params(data: &[u8]) -> Vec<u8> {
 /// Assembles one instruction packet.
 pub fn build_packet(id: u8, instruction: u8, params: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(params.len() + 12);
-    packet.extend_from_slice(&HEADER);
-    packet.push(id);
+    write_packet(&mut packet, id, instruction, params);
+    packet
+}
 
-    let stuffed = stuff_params(params);
-    // instruction + params + CRC.
-    let length = 1 + stuffed.len() + 2;
-    packet.push((length & 0xFF) as u8);
-    packet.push(((length >> 8) & 0xFF) as u8);
-    packet.push(instruction);
-    packet.extend_from_slice(&stuffed);
+/// Assembles one instruction packet into `out`, which is cleared first.
+///
+/// The form a real-time caller uses: with `out` kept from one cycle to the
+/// next nothing here allocates once it has grown to the largest packet the
+/// bus sends. The stuffing is done in place rather than through
+/// [`stuff_params`], which would allocate a copy of the parameters.
+pub fn write_packet(out: &mut Vec<u8>, id: u8, instruction: u8, params: &[u8]) {
+    out.clear();
+    out.extend_from_slice(&HEADER);
+    out.push(id);
+    // Length is patched once the stuffed parameters are in.
+    out.push(0);
+    out.push(0);
+    out.push(instruction);
+
+    let mut ff_count = 0;
+    for &byte in params {
+        out.push(byte);
+        if byte == 0xFF {
+            ff_count += 1;
+        } else {
+            if ff_count >= 2 && byte == 0xFD {
+                out.push(0xFD);
+            }
+            ff_count = 0;
+        }
+    }
+
+    // instruction + stuffed params + CRC.
+    let length = out.len() - MIN_HEADER_SIZE + 2;
+    out[5] = (length & 0xFF) as u8;
+    out[6] = ((length >> 8) & 0xFF) as u8;
 
     // The CRC covers everything so far, header included.
-    let crc = update_crc(0, &packet);
-    packet.push((crc & 0xFF) as u8);
-    packet.push(((crc >> 8) & 0xFF) as u8);
-    packet
+    let crc = update_crc(0, out);
+    out.push((crc & 0xFF) as u8);
+    out.push(((crc >> 8) & 0xFF) as u8);
+}
+
+/// [`destuff_params`] into a buffer the caller keeps, which is cleared first.
+pub fn destuff_into(out: &mut Vec<u8>, data: &[u8]) {
+    out.clear();
+    let mut i = 0;
+    while i < data.len() {
+        if i + 3 < data.len() && data[i..i + 4] == [0xFF, 0xFF, 0xFD, 0xFD] {
+            out.extend_from_slice(&[0xFF, 0xFF, 0xFD]);
+            i += 4;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+}
+
+/// Validates a status packet and hands back its id, error byte and *raw*
+/// (still stuffed) parameters, borrowing rather than copying. Pair with
+/// [`destuff_into`] for the parameters as the servo meant them.
+pub fn parse_packet_borrowed(packet: &[u8]) -> Result<(u8, u8, &[u8]), ParseError> {
+    if packet.len() < 11 {
+        return Err(ParseError::TooShort);
+    }
+    if packet[0..3] != HEADER[0..3] {
+        return Err(ParseError::BadHeader);
+    }
+    let length = u16::from_le_bytes([packet[5], packet[6]]) as usize;
+    if packet.len() != length + MIN_HEADER_SIZE {
+        return Err(ParseError::LengthMismatch {
+            expected: length + MIN_HEADER_SIZE,
+            actual: packet.len(),
+        });
+    }
+    let received = u16::from_le_bytes([packet[packet.len() - 2], packet[packet.len() - 1]]);
+    let computed = update_crc(0, &packet[..packet.len() - 2]);
+    if received != computed {
+        return Err(ParseError::BadCrc { computed, received });
+    }
+    Ok((packet[4], packet[8], &packet[9..packet.len() - 2]))
 }
 
 /// What a status packet said.
@@ -158,6 +231,92 @@ pub fn parse_packet(packet: &[u8]) -> Result<StatusPacket, ParseError> {
         error: packet[8],
         params,
     })
+}
+
+/// One servo's share of a fast sync read reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastSegment {
+    pub id: u8,
+    pub error: u8,
+    pub data: Vec<u8>,
+}
+
+/// Decodes the combined reply to a fast sync read (0x8A).
+///
+/// A plain sync read is answered once per servo, each reply a whole packet
+/// with its own header, length and CRC — 11 bytes of overhead per servo and a
+/// bus turnaround between every two. A fast sync read is answered as one
+/// packet: the first servo starts it, and every servo after appends its
+/// error byte, its id, its data and a CRC to the same stream. The id field
+/// of that packet is the broadcast id, the length field counts the whole
+/// stream, and the segment stride is `data_length + 4`.
+///
+/// Only the CRC that closes the packet is checked, over everything before
+/// it. That is what the official SDK does (`updateCRC(0, rxpacket,
+/// wait_length - 2)`), and what the protocol document means by "check CRC
+/// only at the end". The intermediate CRCs are stepped over. Nothing in the
+/// stream is byte-stuffed — the document says so, and the SDK receives these
+/// replies with stuffing removal switched off.
+pub fn parse_fast_sync_read(
+    packet: &[u8],
+    data_length: usize,
+) -> Result<Vec<FastSegment>, ParseError> {
+    let mut segments = Vec::new();
+    for_each_fast_segment(packet, data_length, |id, error, data| {
+        segments.push(FastSegment {
+            id,
+            error,
+            data: data.to_vec(),
+        })
+    })?;
+    Ok(segments)
+}
+
+/// [`parse_fast_sync_read`] without the allocation: validates the packet and
+/// calls `sink` with each segment's id, error byte and data, borrowed.
+pub fn for_each_fast_segment(
+    packet: &[u8],
+    data_length: usize,
+    mut sink: impl FnMut(u8, u8, &[u8]),
+) -> Result<(), ParseError> {
+    if packet.len() < 11 {
+        return Err(ParseError::TooShort);
+    }
+    if packet[0..3] != HEADER[0..3] {
+        return Err(ParseError::BadHeader);
+    }
+    let length = u16::from_le_bytes([packet[5], packet[6]]) as usize;
+    if packet.len() != length + MIN_HEADER_SIZE {
+        return Err(ParseError::LengthMismatch {
+            expected: length + MIN_HEADER_SIZE,
+            actual: packet.len(),
+        });
+    }
+    let received = u16::from_le_bytes([packet[packet.len() - 2], packet[packet.len() - 1]]);
+    let computed = update_crc(0, &packet[..packet.len() - 2]);
+    if received != computed {
+        return Err(ParseError::BadCrc { computed, received });
+    }
+
+    // Instruction byte, then segments of error + id + data + CRC.
+    let stride = data_length + 4;
+    let body = length - 1;
+    if body % stride != 0 {
+        return Err(ParseError::LengthMismatch {
+            expected: MIN_HEADER_SIZE + 1 + (body / stride + 1) * stride,
+            actual: packet.len(),
+        });
+    }
+    let mut index = 8;
+    while index + stride <= packet.len() {
+        sink(
+            packet[index + 1],
+            packet[index],
+            &packet[index + 2..index + 2 + data_length],
+        );
+        index += stride;
+    }
+    Ok(())
 }
 
 /// Finds the start of a header, or `None`.
@@ -225,6 +384,49 @@ mod tests {
         assert_eq!(stuff_params(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
     }
 
+    /// The in-place builder and the allocating one produce the same bytes,
+    /// stuffing included.
+    #[test]
+    fn the_in_place_builder_matches_the_allocating_one() {
+        let mut out = Vec::new();
+        for (id, inst, params) in [
+            (1u8, INST_PING, vec![]),
+            (1, INST_WRITE, vec![64, 0, 1]),
+            (
+                0xFE,
+                INST_SYNC_WRITE,
+                vec![116, 0, 4, 0, 1, 0xFF, 0xFF, 0xFD, 0x00],
+            ),
+            (7, INST_READ, vec![0xFF, 0xFF, 0xFD, 0xFD]),
+        ] {
+            write_packet(&mut out, id, inst, &params);
+            assert_eq!(
+                out,
+                build_packet(id, inst, &params),
+                "{inst:02X} {params:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_borrowed_parse_agrees_with_the_owning_one() {
+        let mut packet = vec![0xFF, 0xFF, 0xFD, 0x00, 0x01, 0x00, 0x00, 0x55, 0x80];
+        let params = [0xFF, 0xFF, 0xFD, 0xFD, 0x07];
+        packet.extend_from_slice(&params);
+        let length = (packet.len() - MIN_HEADER_SIZE + 2) as u16;
+        packet[5..7].copy_from_slice(&length.to_le_bytes());
+        let crc = update_crc(0, &packet);
+        packet.extend_from_slice(&crc.to_le_bytes());
+
+        let owned = parse_packet(&packet).unwrap();
+        let (id, error, raw) = parse_packet_borrowed(&packet).unwrap();
+        let mut data = Vec::new();
+        destuff_into(&mut data, raw);
+        assert_eq!((id, error), (owned.id, owned.error));
+        assert_eq!(data, owned.params);
+        assert_eq!(data, vec![0xFF, 0xFF, 0xFD, 0x07]);
+    }
+
     #[test]
     fn stuffing_round_trips() {
         for payload in [
@@ -276,6 +478,84 @@ mod tests {
     fn a_truncated_packet_is_refused_rather_than_padded() {
         let packet = vec![0xFF, 0xFF, 0xFD, 0x00, 0x01];
         assert_eq!(parse_packet(&packet), Err(ParseError::TooShort));
+    }
+
+    /// Builds a fast sync read reply the way a chain does: one header, then
+    /// each servo's error, id, data and a CRC over the stream so far, with the
+    /// last CRC closing the packet.
+    fn fast_reply(data_length: usize, servos: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
+        let stride = data_length + 4;
+        let length = 1 + servos.len() * stride;
+        let mut packet = vec![0xFF, 0xFF, 0xFD, 0x00, BROADCAST_ID];
+        packet.extend_from_slice(&(length as u16).to_le_bytes());
+        packet.push(INST_STATUS);
+        for (id, error, data) in servos {
+            packet.push(*error);
+            packet.push(*id);
+            packet.extend_from_slice(data);
+            let crc = update_crc(0, &packet);
+            packet.extend_from_slice(&crc.to_le_bytes());
+        }
+        packet
+    }
+
+    /// The layout from the protocol document's worked example: three servos,
+    /// four bytes each, 32 bytes in all with a length field of 25.
+    #[test]
+    fn a_fast_sync_read_reply_decodes_every_segment() {
+        let packet = fast_reply(
+            4,
+            &[
+                (1, 0, vec![1, 0, 0, 0]),
+                (2, 0, vec![2, 0, 0, 0]),
+                (3, ALERT, vec![3, 0, 0, 0]),
+            ],
+        );
+        assert_eq!(packet.len(), 32);
+        assert_eq!(packet[5], 25);
+
+        let segments = parse_fast_sync_read(&packet, 4).expect("a valid combined reply");
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].id, 1);
+        assert_eq!(segments[1].data, vec![2, 0, 0, 0]);
+        assert_eq!(segments[2].error, ALERT);
+    }
+
+    const ALERT: u8 = 0x80;
+
+    /// A length that is not a whole number of segments is a reply from a
+    /// different read than the one asked, and is refused rather than sliced.
+    #[test]
+    fn a_fast_sync_read_reply_of_the_wrong_width_is_refused() {
+        let packet = fast_reply(4, &[(1, 0, vec![1, 0, 0, 0])]);
+        assert!(matches!(
+            parse_fast_sync_read(&packet, 10),
+            Err(ParseError::LengthMismatch { .. })
+        ));
+    }
+
+    /// Only the closing CRC is checked, and it covers the whole stream —
+    /// including the intermediate CRCs the servos wrote before it.
+    #[test]
+    fn a_fast_sync_read_reply_is_closed_by_its_last_crc() {
+        let mut packet = fast_reply(2, &[(1, 0, vec![1, 0]), (2, 0, vec![2, 0])]);
+        assert!(parse_fast_sync_read(&packet, 2).is_ok());
+
+        // Corrupt the first servo's CRC: the stream is still accepted,
+        // because the servo after it closed the packet over the real bytes.
+        let first_crc = 8 + 2 + 2;
+        packet[first_crc] ^= 0xFF;
+        let mut reclosed = packet[..packet.len() - 2].to_vec();
+        reclosed.extend_from_slice(&update_crc(0, &reclosed).to_le_bytes());
+        assert!(parse_fast_sync_read(&reclosed, 2).is_ok());
+
+        // Corrupt the last one and the whole reply is refused.
+        let last = packet.len() - 1;
+        packet[last] ^= 0xFF;
+        assert!(matches!(
+            parse_fast_sync_read(&packet, 2),
+            Err(ParseError::BadCrc { .. })
+        ));
     }
 
     #[test]

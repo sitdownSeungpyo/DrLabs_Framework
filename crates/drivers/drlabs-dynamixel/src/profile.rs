@@ -255,10 +255,74 @@ pub const MX28: Profile = Profile {
     ..MX64
 };
 
+/// PH54-200-S500-R / PH54-100-S500-R: the P series, Protocol 2.0, RS-485.
+///
+/// **Unverified.** No P-series servo has been on this bench. The addresses
+/// marked below were read from the PH54-200-S500-R e-Manual control table
+/// in this session; the rest of the layout and every scale are from memory
+/// of that table and have not been checked against hardware. A P profile
+/// is selected only by name, never from a model number, so nothing is
+/// driven through it by accident. The first thing to do with a real P
+/// servo is `dxl_diag dump` against this table.
+///
+/// What is different from the X family: the control table moves to the
+/// 500s, the encoder counts a million pulses a revolution, velocity is in
+/// 0.01 rev/min and the supply is 24 V.
+pub const PH54: Profile = Profile {
+    name: "PH54",
+    addr_model_number: 0,
+    addr_firmware_version: 6,
+    addr_return_delay: 9,            // e-Manual: Return Delay Time (9), 2 µs units
+    addr_operating_mode: 11,
+    addr_velocity_limit: 44,
+    addr_torque_enable: 512,
+    addr_led: 513,
+    addr_hardware_error: 518,
+    addr_bus_watchdog: 546,          // e-Manual: Bus Watchdog (546), 20 ms units
+    addr_goal_pwm: 548,
+    addr_goal_current: 550,          // e-Manual: Goal Current (550), 2 bytes, 1 mA
+    addr_goal_velocity: 552,
+    addr_profile_accel: 556,
+    addr_profile_velocity: 560,
+    addr_goal_position: 564,         // e-Manual: Goal Position (564), 4 bytes
+    addr_present_current: 574,       // e-Manual: Present Current (574), 2 bytes, 1 mA
+    addr_present_velocity: 576,      // e-Manual: Present Velocity (576), 4 bytes, 0.01 rev/min
+    addr_present_position: 580,      // e-Manual: Present Position (580), 4 bytes
+    addr_present_voltage: 592,       // e-Manual: Present Input Voltage (592), 0.1 V
+    addr_present_temperature: 594,   // e-Manual: Present Temperature (594), 1 °C
+
+    // PH54-200-S500 and PH54-100-S500: 1,003,846 pulses per revolution.
+    counts_per_rev: 1_003_846.0,
+    velocity_rpm_per_count: 0.01,
+    current_amps_per_count: 0.001,
+    voltage_volts_per_count: 0.1,
+    accel_rev_per_min2_per_count: 1.0,
+    watchdog_seconds_per_count: 0.020,
+    watchdog_max_count: 127,
+
+    has_current_sense: true,
+    torque_constant: None,
+    // 29.2 rev/min no-load at 24 V for the -200; the -100 is a little faster.
+    max_velocity_rev_per_sec: 0.5,
+    voltage_min: 10.0,
+    voltage_max: 30.0,
+    voltage_rated: 24.0,
+};
+
+/// PM54-060-S250-R / PM54-040-S250-R: the smaller P-series frame. Same
+/// table as [`PH54`], half the encoder resolution. **Unverified**, as above.
+pub const PM54: Profile = Profile {
+    name: "PM54",
+    counts_per_rev: 502_834.0,
+    // 55 rev/min no-load at 24 V for the -040.
+    max_velocity_rev_per_sec: 0.9,
+    ..PH54
+};
+
 /// Every name [`profile_named`] accepts, for error messages that tell an
 /// operator what the alternatives were.
 pub const PROFILE_NAMES: &[&str] = &[
-    "x", "xseries", "xl330", "xl430", "2xl430", "xc430", "mx64", "mx106", "mx28",
+    "x", "xseries", "xl330", "xl430", "2xl430", "xc430", "mx64", "mx106", "mx28", "ph54", "pm54",
 ];
 
 /// The families that can be named in a configuration.
@@ -274,6 +338,9 @@ pub fn profile_named(name: &str) -> Option<Profile> {
         "mx64" => MX64,
         "mx106" => MX106,
         "mx28" => MX28,
+        // By name only: see the profiles' own notes.
+        "ph54" => PH54,
+        "pm54" => PM54,
         _ => return None,
     })
 }
@@ -556,6 +623,32 @@ mod tests {
     #[test]
     fn an_unrecognised_model_is_not_an_error() {
         assert_eq!(known_model(9999), None);
+    }
+
+    /// The P-series table is laid out so that the same two contiguous
+    /// reads the X family uses — ten bytes through position, twenty-one
+    /// through temperature — work unchanged. Nothing here is verified on
+    /// hardware; the test pins the arithmetic, not the servo.
+    #[test]
+    fn the_p_series_table_keeps_the_present_block_contiguous() {
+        for profile in [PH54, PM54] {
+            assert_eq!(
+                profile.addr_present_position + 4 - profile.addr_present_current,
+                10
+            );
+            assert_eq!(
+                profile.addr_present_temperature + 1 - profile.addr_present_current,
+                21
+            );
+            assert_eq!(profile_named(&profile.name.to_lowercase()), Some(profile));
+        }
+        // And no model number resolves to one: unverified tables are chosen
+        // on purpose or not at all.
+        for model in 0..=4000u32 {
+            if let Some(known) = known_model(model) {
+                assert!(!known.profile.starts_with('p'), "{}", known.name);
+            }
+        }
     }
 
     /// The code an operator actually meets, and the reason its message names a

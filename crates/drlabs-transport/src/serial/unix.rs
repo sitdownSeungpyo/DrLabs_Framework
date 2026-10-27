@@ -85,7 +85,16 @@ impl Port {
         term.c_cc[libc::VMIN] = 0;
         term.c_cc[libc::VTIME] = 0;
 
-        let speed = baud_constant(baud);
+        let speed = baud_constant(baud).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{baud} baud is not a rate termios offers on Linux (up to 4000000 in the \
+                     standard steps); a Dynamixel at 4.5, 6 or 10.5 Mbaud needs the BOTHER \
+                     path through termios2, which this build does not have yet"
+                ),
+            )
+        })?;
         if unsafe { libc::cfsetispeed(&mut term, speed) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -155,11 +164,13 @@ impl Drop for Port {
 /// The termios speed constant for a baud rate.
 ///
 /// Linux takes an enumerated constant that happens not to equal the rate;
-/// macOS takes the rate itself. Anything unrecognised falls back to 115200,
-/// which is wrong but talks to something, rather than failing to open.
+/// macOS takes the rate itself. A rate Linux has no constant for is `None`,
+/// and the open fails saying so. It used to fall back to 115200 — "wrong but
+/// talks to something" — which on a chain described at 3 Mbaud is a bus
+/// where every servo is silent and nothing says why.
 #[cfg(target_os = "linux")]
-fn baud_constant(baud: u32) -> libc::speed_t {
-    match baud {
+fn baud_constant(baud: u32) -> Option<libc::speed_t> {
+    Some(match baud {
         9600 => libc::B9600,
         19200 => libc::B19200,
         38400 => libc::B38400,
@@ -174,13 +185,13 @@ fn baud_constant(baud: u32) -> libc::speed_t {
         2000000 => libc::B2000000,
         3000000 => libc::B3000000,
         4000000 => libc::B4000000,
-        _ => libc::B115200,
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn baud_constant(baud: u32) -> libc::speed_t {
-    baud as libc::speed_t
+fn baud_constant(baud: u32) -> Option<libc::speed_t> {
+    Some(baud as libc::speed_t)
 }
 
 /// The device nodes a USB serial adapter shows up as.

@@ -536,3 +536,46 @@ p_vel(112) 가 0 이면 서보가 재부팅된 것(전원), 값이 남아 있으
 손 흔들기(sh_p -0.75, elb_p -1.4, elb_y ±0.4 rad 0.5 Hz) 처짐 0.33 rad, 우측 전압
 최저 10.8 V(MX 하한 10.0). 강제 `/api/estop` 으로 복구 경로 확인: 5 s 뒤 panel 재기동,
 15축 armed, base 복귀, act 재시작까지 9 s.
+
+## 버스 단위 드라이버와 Fast Sync Read (2026-10-27)
+
+`DynamixelBus`(`src/bus.rs`)는 `Chain`의 반대 모양이다. `Chain`은 조인트 스레드 N개가
+포트 하나를 두고 "먼저 잡은 쪽이 버스 전체 트랜잭션"을 하는 구조였고, `DynamixelBus`는
+스레드 하나가 축 전부를 한 틱에 처리한다. 뮤텍스를 기다릴 상대가 없다.
+
+한 틱의 와이어 순서: 토크 off(이탈 축) → 바뀐 한계(watchdog 546/98, accel, velocity —
+바뀐 것만) → 토크 on(진입 축) → goal position sync write 1회 → present block 읽기 →
+1초마다 hardware error·bus watchdog 레지스터. 정상 상태에서는 **쓰기 1 + 읽기 1**.
+틱 안에서 EEPROM 쓰기·개별 복구 읽기·응답 예산 이상 대기는 하지 않는다(침묵 축은
+`Silent`로 보고하고 다음 틱에 다시 묻는다). 운영 모드는 open 때 Extended Position으로
+맞춰 두고 틱에서는 바꾸지 않는다.
+
+**Fast Sync Read (0x8A)** — 확인함(ROBOTIS Protocol 2.0 문서, 공식 SDK 수신 코드):
+- 요청은 Sync Read와 같은 파라미터, 응답은 **패킷 1개**(ID 0xFE). 첫 서보가 시작하고
+  이후 서보가 `ERR, ID, data, CRC`를 같은 스트림에 덧붙인다. 세그먼트 stride는
+  `X+4`, 전체 길이는 `8 + n(X+4)` 바이트.
+- 공식 SDK(`protocol2_packet_handler.cpp`)는 **마지막 CRC만** 전체 패킷에 대해 검사하고
+  (`updateCRC(0, rxpacket, wait_length-2)`), 중간 CRC는 stride로 건너뛰며,
+  byte stuffing 제거를 하지 않는다(`skip_stuffing`). 이 드라이버도 같다.
+- 지원 여부는 펌웨어에 달렸다. 미지원 서보는 자기 ID로 Instruction Error(0x02)를
+  단독 응답하고, 드라이버는 `FastOutcome::Unsupported(id)`로 보고한다. open 때 서보마다
+  단독으로 한 번 보내 지원군/미지원군을 나누고, 미지원군은 기존 Sync Read 8개 청크로
+  같은 틱에 읽는다. 지원 펌웨어 버전은 **미확인**(3rd-party 문서: X430/X540 v45+,
+  X330 v47+; MX(2.0)은 모름).
+
+와이어 예산(계산값, 미측정): 15축 MX/X, 3 Mbps, 10 바이트 블록 —
+Fast Sync Read 전부 지원 시 29+218+89 = 336 B ≈ 1.12 ms/틱(56 %) + RDT 15×20 µs.
+현재 청크 방식은 ≈ 441 B + USB 왕복 2회. 26축 P시리즈 1버스는 556 B → 3 M에서 93 %,
+4 M에서 70 %; 2버스 × 13이면 3 M에서 49 %.
+
+측정 도구(`examples/dxl_diag.rs`):
+```
+dxl_diag COM7 3000000 fastprobe 1,2,...,16          # 서보별 모델·펌웨어·0x8A 수락 여부
+dxl_diag COM7 3000000 syncstress <ids> 8 20 hz=500 write        # 현재 방식
+dxl_diag COM7 3000000 syncstress <ids> 8 20 hz=500 write fast   # Fast Sync Read
+```
+`fastprobe`가 설계를 가른다. 측정값은 이 아래에 적는다 — 2026-10-27 현재 COM7 미연결로
+**미측정**.
+
+P시리즈 프로파일 `ph54`/`pm54`는 e-Manual에서 확인한 주소(574/576/580/592/594/564/550/546/9)
+외에는 기억에 의존한 **미검증** 표이며, 모델 번호로는 선택되지 않고 이름으로만 선택된다.

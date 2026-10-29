@@ -20,7 +20,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      - name: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace 2>&1 | tee test.log; then
+            # Put the failing tests' own output on the Checks tab as
+            # annotations, so a failure says which test and why without
+            # anyone opening the raw log.
+            sed -n '/^failures:$/,$p' test.log | grep -v '^$' | head -60 | sed 's/^/::error::/'
+            exit 1
+          fi
 
   aarch64:
     runs-on: ubuntu-latest

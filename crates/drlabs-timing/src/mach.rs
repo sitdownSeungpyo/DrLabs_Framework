@@ -51,6 +51,13 @@ struct TimebaseInfo {
 }
 
 extern "C" {
+    fn sysctlbyname(
+        name: *const std::os::raw::c_char,
+        oldp: *mut std::os::raw::c_void,
+        oldlenp: *mut usize,
+        newp: *const std::os::raw::c_void,
+        newlen: usize,
+    ) -> std::os::raw::c_int;
     static mach_task_self_: MachPort;
     fn mach_thread_self() -> MachPort;
     fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
@@ -99,6 +106,32 @@ fn to_absolute(duration: Duration) -> u32 {
 
 /// The period assumed when the caller does not know its own.
 pub const DEFAULT_PERIOD: Duration = Duration::from_millis(1);
+
+/// Whether this macOS is a guest under a hypervisor (`kern.hv_vmm_present`).
+///
+/// A guest's time-constraint thread is real-time only as far as the host lets
+/// it be, and on GitHub's macOS runners that is not far: the same sleep that
+/// lands 20 µs late on this bench lands 2.5 ms late in median and 9 ms at
+/// worst there. Tests that assert the hardware's timing check this first, and
+/// a daemon may want to say it in its scheduling line.
+pub fn in_virtual_machine() -> bool {
+    // A byte string rather than a C-string literal: those need Rust 1.77 and
+    // the workspace promises 1.75.
+    const NAME: &[u8] = b"kern.hv_vmm_present\0";
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    // SAFETY: a NUL-terminated name, a buffer of the length passed, no write.
+    let result = unsafe {
+        sysctlbyname(
+            NAME.as_ptr() as *const std::os::raw::c_char,
+            &mut value as *mut i32 as *mut std::os::raw::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    result == 0 && value != 0
+}
 
 /// Puts the calling thread under the time-constraint policy for a loop that
 /// runs every `period`.

@@ -309,13 +309,21 @@ mod tests {
     /// The measurement that decided the macOS design: a raised thread's sleep
     /// lands within a fraction of a millisecond where a default thread's lands
     /// milliseconds late — 3.5 ms on average for this wait. Twenty samples of
-    /// the longest wait a loop here makes, judged by their median: the defect
-    /// this guards against is systematic, every sleep late by a quarter, and
-    /// a median catches that while shrugging off the one preemption a shared
-    /// CI runner's virtual machine will deliver somewhere in 370 ms.
+    /// the longest wait a loop here makes, judged by their median, since the
+    /// defect this guards against is systematic.
+    ///
+    /// This is a statement about the machine, not the code, so it is only made
+    /// on a real one. Under a hypervisor the policy is granted and not
+    /// honoured: GitHub's macOS runner measured a 2.46 ms median and 9.4 ms
+    /// worst for this very loop (run 40835476377), with the same binary that
+    /// measures 20–90 µs on the bench.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_raised_thread_sleeps_accurately_on_macos() {
+        if mach::in_virtual_machine() {
+            eprintln!("skipped: a virtual machine cannot promise its guest's timing");
+            return;
+        }
         let _serial = holding_resolution();
         std::thread::spawn(|| {
             let resolution = Resolution::raise();

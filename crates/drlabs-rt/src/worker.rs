@@ -59,8 +59,10 @@ pub struct WorkerConfig {
     pub full_every: u32,
     /// Every this many ticks, the complete parameter set is re-sent.
     pub resend_every: u32,
-    /// Real-time priority to ask the OS for (Linux SCHED_FIFO 1..99). Zero
-    /// asks for none.
+    /// Real-time priority to ask the OS for: Linux SCHED_FIFO 1..99; on
+    /// macOS any non-zero value asks for the time-constraint policy at this
+    /// bus's period and the number is otherwise ignored; Windows
+    /// TIME_CRITICAL. Zero asks for none.
     pub priority: u32,
     /// The core to pin the thread to.
     pub cpu: Option<usize>,
@@ -178,14 +180,14 @@ impl BusWorker {
             self.estop.latch(TripCode::Transport);
             return;
         }
-        let granted = drlabs_timing::rt::promote(self.config.priority, self.config.cpu);
+        let period = self.config.period;
+        let granted = drlabs_timing::rt::promote(self.config.priority, self.config.cpu, period);
         eprintln!(
             "[{}] scheduling: {}",
             self.config.name,
             granted.describe(self.config.priority, self.config.cpu)
         );
         let _resolution = Resolution::raise();
-        let period = self.config.period;
         let spin = drlabs_timing::DEFAULT_SPIN.min(period / 4);
 
         let mut next = epoch;

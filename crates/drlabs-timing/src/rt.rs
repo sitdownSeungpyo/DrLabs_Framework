@@ -6,6 +6,12 @@
 //! reported separately, so a daemon running unprivileged says exactly which
 //! guarantee it is running without.
 //!
+//! macOS: the mach time-constraint policy, declared for the loop's actual
+//! period. It needs no privilege and it is the only thing on that OS that
+//! makes a wait land on time (see [`crate::mach`]). There is no numeric
+//! priority — any non-zero request asks for the policy — no core pinning on
+//! Apple Silicon, and no `mlockall`; the report says so.
+//!
 //! Windows: `THREAD_PRIORITY_TIME_CRITICAL`, which is the most the ordinary
 //! scheduler offers, and a core affinity mask. Neither is a guarantee, and
 //! the result says so.
@@ -13,12 +19,17 @@
 //! Everything here is best effort by design: a refused request is a line
 //! in the log, not a reason to stop a machine that would otherwise run.
 
+use std::time::Duration;
+
 /// What the OS granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Granted {
-    /// A real-time scheduling class (SCHED_FIFO), or on Windows the top
-    /// ordinary priority.
+    /// A real-time scheduling class (SCHED_FIFO), the mach time-constraint
+    /// policy, or on Windows the top ordinary priority.
     pub priority: bool,
+    /// What `priority` means on this OS, for the log — `"SCHED_FIFO"`,
+    /// `"time-constraint"`, `"TIME_CRITICAL"`. Empty when nothing was asked.
+    pub policy: &'static str,
     /// The thread is pinned to the requested core.
     pub affinity: bool,
     /// The process's pages are locked in memory (Linux only).
@@ -33,10 +44,11 @@ impl Granted {
     pub fn describe(&self, priority: u32, cpu: Option<usize>) -> String {
         let mut parts = Vec::new();
         if priority > 0 {
-            parts.push(if self.priority {
-                format!("priority {priority}: granted")
+            let verdict = if self.priority { "granted" } else { "refused" };
+            parts.push(if self.policy.is_empty() {
+                format!("priority {priority}: {verdict}")
             } else {
-                format!("priority {priority}: refused")
+                format!("priority {priority}: {verdict} ({})", self.policy)
             });
         }
         if let Some(cpu) = cpu {
@@ -61,9 +73,11 @@ impl Granted {
 }
 
 /// Promotes the calling thread. `priority` 0 asks for no scheduling change;
-/// `cpu` `None` asks for no pinning.
-pub fn promote(priority: u32, cpu: Option<usize>) -> Granted {
-    imp::promote(priority, cpu)
+/// `cpu` `None` asks for no pinning. `period` is how often the thread will
+/// run — macOS declares it to the scheduler; the others do not need it, and
+/// `Duration::ZERO` is accepted everywhere as "unknown".
+pub fn promote(priority: u32, cpu: Option<usize>, period: Duration) -> Granted {
+    imp::promote(priority, cpu, period)
 }
 
 /// Locks the process's current and future pages in memory. Linux only;
@@ -75,10 +89,12 @@ pub fn lock_memory() -> bool {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::Granted;
+    use std::time::Duration;
 
-    pub fn promote(priority: u32, cpu: Option<usize>) -> Granted {
+    pub fn promote(priority: u32, cpu: Option<usize>, _period: Duration) -> Granted {
         let mut granted = Granted::default();
         if priority > 0 {
+            granted.policy = "SCHED_FIFO";
             let param = libc::sched_param {
                 sched_priority: priority.clamp(1, 99) as libc::c_int,
             };
@@ -114,16 +130,48 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::Granted;
+    use crate::mach;
+    use std::time::Duration;
+
+    pub fn promote(priority: u32, cpu: Option<usize>, period: Duration) -> Granted {
+        let mut granted = Granted::default();
+        if priority > 0 {
+            granted.policy = "time-constraint";
+            granted.priority = mach::set_time_constraint(period);
+        }
+        // Apple Silicon does not pin threads to cores: THREAD_AFFINITY_POLICY
+        // returns KERN_NOT_SUPPORTED there, and on Intel Macs it was only ever
+        // a hint. Not asked, so that the report is a plain refusal rather
+        // than a false "pinned".
+        let _ = cpu;
+        // No mlockall on macOS.
+        granted.memory_locked = false;
+        // The policy is honoured by the scheduler but a thread that overruns
+        // its declaration loses it for a while; soft, so not claimed.
+        granted.guaranteed = false;
+        granted
+    }
+
+    pub fn lock_memory() -> bool {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::Granted;
+    use std::time::Duration;
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     };
 
-    pub fn promote(priority: u32, cpu: Option<usize>) -> Granted {
+    pub fn promote(priority: u32, cpu: Option<usize>, _period: Duration) -> Granted {
         let mut granted = Granted::default();
         if priority > 0 {
+            granted.policy = "TIME_CRITICAL";
             // SAFETY: the current thread's pseudo-handle is always valid.
             granted.priority =
                 unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) }
@@ -146,11 +194,12 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod imp {
     use super::Granted;
+    use std::time::Duration;
 
-    pub fn promote(_priority: u32, _cpu: Option<usize>) -> Granted {
+    pub fn promote(_priority: u32, _cpu: Option<usize>, _period: Duration) -> Granted {
         Granted::default()
     }
 
@@ -166,7 +215,7 @@ mod tests {
     /// Asking for nothing is granted nothing and is not an error.
     #[test]
     fn asking_for_nothing_changes_nothing() {
-        let granted = promote(0, None);
+        let granted = promote(0, None, Duration::ZERO);
         assert!(!granted.priority);
         assert!(!granted.affinity);
         let line = granted.describe(0, None);
@@ -178,13 +227,37 @@ mod tests {
     fn a_refusal_is_reported_as_one() {
         let granted = Granted {
             priority: false,
+            policy: "SCHED_FIFO",
             affinity: true,
             memory_locked: false,
             guaranteed: false,
         };
         let line = granted.describe(80, Some(2));
-        assert!(line.contains("priority 80: refused"), "{line}");
+        assert!(line.contains("priority 80: refused (SCHED_FIFO)"), "{line}");
         assert!(line.contains("cpu 2: pinned"), "{line}");
         assert!(line.contains("not real-time"), "{line}");
+    }
+
+    /// macOS grants the policy to an unprivileged process, pins nothing, and
+    /// locks nothing — and says exactly that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_grants_the_policy_and_refuses_the_rest_honestly() {
+        std::thread::spawn(|| {
+            let granted = promote(80, Some(2), Duration::from_millis(2));
+            assert!(granted.priority);
+            assert!(!granted.affinity);
+            assert!(!granted.memory_locked);
+            assert!(!granted.guaranteed);
+            assert!(crate::mach::has_time_constraint());
+            let line = granted.describe(80, Some(2));
+            assert_eq!(
+                line,
+                "priority 80: granted (time-constraint), cpu 2: refused, memory not locked, \
+                 best effort, not real-time"
+            );
+        })
+        .join()
+        .unwrap();
     }
 }

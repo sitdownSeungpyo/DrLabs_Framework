@@ -9,11 +9,20 @@
 //! the coarse error, and a short spin at the end of each wait removes what is
 //! left. The spin is bounded and only covers the final approach, so it costs a
 //! fraction of a core rather than a whole one.
+//!
+//! macOS has the same problem in a different shape — a default thread's sleep
+//! overshoots by a quarter of its length, so a 20 ms wait lands 5 ms late —
+//! and a different remedy, a per-thread scheduling policy. [`Resolution`]
+//! covers both: it is "whatever this OS needs so that this thread's waits
+//! land on time", held for as long as the loop runs.
 
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+pub mod mach;
 mod platform;
 pub mod rt;
 
@@ -27,27 +36,45 @@ static RESOLUTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Holds the finest timer granularity the OS offers for as long as it lives.
 ///
-/// Reference counted, so nested or concurrent holders each get their own and
-/// the release happens when the last one drops. On platforms where the request
-/// is unnecessary or unavailable [`Resolution::raised`] reports false and the
-/// caller carries on either way, since the spin still bounds the error.
+/// On Windows that is the multimedia timer period, which is process-wide and
+/// therefore reference counted: nested or concurrent holders each get their
+/// own and the release happens when the last one drops. On macOS it is the
+/// mach time-constraint policy on the *calling thread*, so it is raised on the
+/// thread that will wait and released there — which is why this type cannot
+/// be sent to another thread. On platforms where the request is unnecessary
+/// or unavailable [`Resolution::raised`] reports false and the caller carries
+/// on either way, since the spin still bounds the error.
 #[derive(Debug)]
 pub struct Resolution {
     raised: bool,
+    /// Not `Send`: the macOS raise belongs to one thread.
+    _thread: PhantomData<*const ()>,
 }
 
 impl Resolution {
     /// Ask the OS for the finest granularity it offers.
     pub fn raise() -> Self {
+        if platform::PER_THREAD {
+            return Self {
+                raised: platform::raise_timer_resolution(),
+                _thread: PhantomData,
+            };
+        }
         // The count is incremented first so that a concurrent drop cannot
         // release the resolution between the check and the request.
         if RESOLUTION_COUNT.fetch_add(1, Ordering::AcqRel) == 0
             && !platform::raise_timer_resolution()
         {
             RESOLUTION_COUNT.fetch_sub(1, Ordering::AcqRel);
-            return Self { raised: false };
+            return Self {
+                raised: false,
+                _thread: PhantomData,
+            };
         }
-        Self { raised: true }
+        Self {
+            raised: true,
+            _thread: PhantomData,
+        }
     }
 
     /// Whether the request was granted.
@@ -58,7 +85,10 @@ impl Resolution {
 
 impl Drop for Resolution {
     fn drop(&mut self) {
-        if self.raised && RESOLUTION_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if !self.raised {
+            return;
+        }
+        if platform::PER_THREAD || RESOLUTION_COUNT.fetch_sub(1, Ordering::AcqRel) == 1 {
             platform::release_timer_resolution();
         }
     }
@@ -179,8 +209,12 @@ mod tests {
         assert_eq!(summarise(&[]), Statistics::default());
     }
 
+    /// Held the way every loop holds it: with the resolution raised first.
+    /// Without that, a 20 ms wait on a default macOS thread lands about 3 ms
+    /// late, and that is the finding, not a tolerance to widen.
     #[test]
     fn a_wait_lands_on_its_deadline() {
+        let _resolution = Resolution::raise();
         let deadline = Instant::now() + Duration::from_millis(20);
         assert_eq!(sleep_until(deadline, None, DEFAULT_SPIN), Woke::Deadline);
 
@@ -230,16 +264,55 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(5));
     }
 
+    /// A nested raise must not release what the outer one still holds —
+    /// whichever mechanism the OS uses.
     #[test]
-    fn resolution_is_reference_counted() {
-        let outer = Resolution::raise();
-        {
-            let inner = Resolution::raise();
-            assert_eq!(inner.raised(), outer.raised());
-        }
-        // The inner drop must not have released what the outer still holds.
-        assert_eq!(RESOLUTION_COUNT.load(Ordering::Acquire), 1);
-        drop(outer);
-        assert_eq!(RESOLUTION_COUNT.load(Ordering::Acquire), 0);
+    fn a_nested_raise_does_not_release_the_outer_one() {
+        std::thread::spawn(|| {
+            let outer = Resolution::raise();
+            {
+                let _inner = Resolution::raise();
+            }
+            if platform::PER_THREAD {
+                // macOS: the inner raise found the thread's policy in place and
+                // took nothing it would have to give back.
+                #[cfg(target_os = "macos")]
+                assert_eq!(mach::has_time_constraint(), outer.raised());
+                assert_eq!(RESOLUTION_COUNT.load(Ordering::Acquire), 0);
+            } else {
+                let held = if outer.raised() { 1 } else { 0 };
+                assert_eq!(RESOLUTION_COUNT.load(Ordering::Acquire), held);
+            }
+            drop(outer);
+            assert_eq!(RESOLUTION_COUNT.load(Ordering::Acquire), 0);
+            #[cfg(target_os = "macos")]
+            assert!(!mach::has_time_constraint());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The measurement that decided the macOS design: a raised thread's sleep
+    /// lands within a fraction of a millisecond where a default thread's lands
+    /// milliseconds late. Twenty samples of the longest wait a loop here makes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_raised_thread_sleeps_accurately_on_macos() {
+        std::thread::spawn(|| {
+            let resolution = Resolution::raise();
+            assert!(resolution.raised());
+            let asked = Duration::from_micros(18_500);
+            let worst = (0..20)
+                .map(|_| {
+                    let started = Instant::now();
+                    std::thread::sleep(asked);
+                    started.elapsed().saturating_sub(asked)
+                })
+                .max()
+                .unwrap();
+            assert!(worst < Duration::from_millis(1), "overshoot {worst:?}");
+        })
+        .join()
+        .unwrap();
     }
 }

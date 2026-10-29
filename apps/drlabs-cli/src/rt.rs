@@ -41,6 +41,15 @@ pub fn rt(args: &[String]) -> Result<(), String> {
 
     let config = Config::load(Path::new(&path)).map_err(|error| error.to_string())?;
     print_plan(&config);
+    if cfg!(target_os = "macos") && !config.rt.cpus.is_empty() {
+        // Not an error: the same description travels to the Linux robot PC,
+        // where the pinning is wanted.
+        eprintln!(
+            "note: rt.cpus {:?} is ignored on macOS, which does not pin threads to cores; \
+             each bus thread will report \"refused\"",
+            config.rt.cpus
+        );
+    }
     if flags.switch("check") {
         return Ok(());
     }

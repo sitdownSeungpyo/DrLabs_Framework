@@ -49,10 +49,13 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct RtConfig {
     /// Cores to pin the bus threads to, in bus order (cycled if fewer).
-    /// Empty leaves them to the scheduler.
+    /// Empty leaves them to the scheduler. Linux and Windows; macOS cannot
+    /// pin and reports the request refused.
     #[serde(default)]
     pub cpus: Vec<usize>,
-    /// Real-time priority (Linux SCHED_FIFO 1..99). Zero asks for none.
+    /// Real-time priority: Linux SCHED_FIFO 1..99; on macOS any non-zero
+    /// value asks for the mach time-constraint policy and the number is
+    /// otherwise ignored; Windows TIME_CRITICAL. Zero asks for none.
     #[serde(default)]
     pub priority: u32,
     /// Consecutive ticks that start a whole period late before the robot is

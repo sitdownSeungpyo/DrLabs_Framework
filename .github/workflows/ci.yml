@@ -28,7 +28,12 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - run: cargo install cargo-zigbuild
-      - uses: mlugg/setup-zig@v1
+      # v1 of this action is retired and its default (a nightly zig) no longer
+      # resolves. Pinned to a release so a new zig cannot break the job on its
+      # own; move it together with cargo-zigbuild.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
       - run: cargo zigbuild --workspace --target aarch64-unknown-linux-gnu --profile rt
       - uses: actions/upload-artifact@v4
         with:

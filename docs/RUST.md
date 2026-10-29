@@ -88,8 +88,8 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | Crate | State | Tests |
 |---|---|---|
 | `drlabs-core` | done, plus the unit renderer | 23 passing |
-| `drlabs-timing` | done | 7 passing |
-| `drlabs-transport` | serial (3 platforms), CAN, fdcanusb | 27 passing |
+| `drlabs-timing` | done; macOS time-constraint scheduling | 13 passing |
+| `drlabs-transport` | serial (3 platforms; macOS via IOSSIOSPEED), CAN, fdcanusb | 29 passing |
 | `drlabs-moteus` | complete: protocol, frames, driver, console | 66 passing |
 | `drlabs-dynamixel` | complete: protocol, driver, sync read/write, link | 30 passing |
 | `drlabs-robstride` | complete: protocol, parameters, controller, link | 46 passing |
@@ -135,13 +135,34 @@ rate. Removing the ceiling and re-running it gives **520,564 Hz against a
 50 Hz configuration** — so the test is known to catch the thing it was written
 for, rather than merely passing.
 
-### Every platform's serial code is at least compiled
+### macOS builds, tests and runs; the hardware path is not yet proven there
 
 The Go tree had a Linux and a macOS serial implementation that nothing on this
-bench had built since they were written. Here `cargo check --target
-x86_64-unknown-linux-gnu` and `--target aarch64-apple-darwin` both pass, so the
-termios path is known to compile even though it cannot be exercised here. That
-is not the same as knowing it works, and it is not claimed to be.
+bench had built since they were written, and until 2026-10-29 the Rust tree was
+in the same state for macOS: `cargo check --target aarch64-apple-darwin`
+passed and nothing had ever run. Running it on an Apple Silicon Mac found two
+things compiling cannot:
+
+* **The baud rate was never set.** macOS takes a non-standard rate only
+  through the `IOSSIOSPEED` ioctl; `cfsetspeed(1_000_000)` returns success and
+  changes nothing. A Dynamixel chain opened that way is silent. The ioctl is
+  now issued after `tcsetattr`, and `write` is a loop that finishes the buffer
+  (`crates/drlabs-transport/src/serial/unix.rs`).
+* **A default thread's sleep lands a quarter late.** 18.5 ms asked, 3.5 ms
+  late on average and 8.7 ms at worst, for `sleep`, `recv_timeout` and
+  `mach_wait_until` alike. The 26-joint simulated runtime missed 72 deadlines
+  in a minute with an 11.4 ms worst case. Under the mach time-constraint policy
+  the same waits land 15–50 µs late and the runtime misses nothing
+  (`crates/drlabs-timing/src/mach.rs`; numbers in [RT.md](RT.md)). Two
+  timing tests that had been written on Windows failed on the Mac for this
+  reason and were fixed by holding the resolution the way every loop does, not
+  by widening a tolerance.
+
+`cargo test --workspace` is green on macOS and the macOS runner is in CI. What
+is **not** yet done is the bench: no U2D2 or fdcanusb has been plugged into a
+Mac, so the IOSSIOSPEED path and Apple's FTDI driver latency are implemented
+against documentation, not measurement. The procedure is written down in
+[DYNAMIXEL.md](DYNAMIXEL.md) and the result will be recorded there.
 
 ### The reference bytes match
 

@@ -42,7 +42,11 @@ drlabs ports
 CAN adapters are listed first where the platform reveals enough to tell. On
 Windows it usually does not — the OS exposes only `COM5` — so if the list is
 ambiguous, unplug the adapter, run it again, and take the port that
-disappeared.
+disappeared. macOS is the same: the list is `/dev/cu.usbmodem…` for a CDC
+device such as the fdcanusb or OpenRB-150 and `/dev/cu.usbserial-…` for an
+FTDI bridge such as the U2D2, with no product name. Use the `cu.` node, never
+the `tty.` twin, which blocks until the adapter asserts carrier detect — which
+a USB adapter never does.
 
 ## Stage 2 — identify, without commanding anything
 

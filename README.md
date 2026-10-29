@@ -149,7 +149,9 @@ drlabs bringup robot.json
 #   {"cmd":"pose","joints":{"r_sh_p":-0.3,"r_elb_p":-2.0}}
 
 # Connect, identify, report, disconnect.  Commands nothing but a stop.
-drlabs probe -driver moteus -port COM7 -id 1
+drlabs probe -driver moteus -port COM7 -id 1                    # Windows
+drlabs probe -driver moteus -port /dev/cu.usbmodem1234501 -id 1  # macOS (cu.*, not tty.*)
+drlabs probe -driver moteus -port /dev/ttyACM0 -id 1             # Linux
 
 # Drive an axis.
 drlabs run -driver moteus -port COM7 -id 1 \
@@ -309,6 +311,18 @@ Measured on Windows 11 with the simulator:
 | 100 Hz | 100.0 Hz | 0.25 ms |
 | 200 Hz | 200.0 Hz | 0.50 ms |
 
+macOS has the opposite shape of the same problem: no coarse quantum, but a
+default thread's sleep overshoots by about a quarter of its length (18.5 ms
+asked, 3.5 ms late on average, 8.7 ms at worst on an Apple Silicon Mac). The
+runtime puts each loop thread under the mach time-constraint policy, after
+which the same waits land 15–50 µs late. Measured with the 26-joint simulator
+at 500 Hz for 60 s:
+
+| | Deadline misses | Worst lateness |
+|---|---|---|
+| default thread | 72 (0.24 %) | 11.42 ms |
+| time-constraint policy | 0 | 0.14 ms |
+
 `Status().Stats` reports the rate actually achieved, not the one requested, and
 the loop warns when it falls below 85% of target. A loop that cannot keep up is
 the most common cause of surprising motor behaviour, and the only way to know is
@@ -359,8 +373,10 @@ in `docs/MOTEUS.md` and `docs/ROBSTRIDE.md`.
 
 ## Requirements
 
-- Go 1.24+
-- No external Go dependencies
+- Rust 1.75+ (`rustup`); no C toolchain, no vendor SDK
+- Windows 10/11, Linux (x86_64, aarch64) or macOS (Apple Silicon). All three
+  run the test suite in CI; the hardware has so far been exercised from
+  Windows only
 
 For hardware: an fdcanusb (or compatible CAN-FD adapter) for moteus, a U2D2 or
 OpenRB-150 for Dynamixel, and a supply matched to the motor.

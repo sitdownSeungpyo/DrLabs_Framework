@@ -92,6 +92,22 @@ under Linux with `rt.priority` set is the number that matters, and it has
 not been taken yet. No hardware bus has been run through this runtime yet
 (COM7 was not connected on 2026-10-27).
 
+macOS 26.5 on Apple Silicon, release build, the same `configs/sim26.json`,
+`drlabs rt -drive -seconds 60` (2026-10-29):
+
+```
+before the time-constraint policy   29969 ticks   72 misses (0.24 %)   late_max 11.42 ms
+rt.priority 0  (default policy)     30053 ticks    0 misses             late_max  0.14 ms
+rt.priority 80 (policy at 2 ms)     30056 ticks    0 misses             late_max  1.44 ms
+```
+
+The first line is what a default macOS thread does: its sleeps overshoot by
+about a quarter of their length, so a 1.5 ms spin lead cannot catch a 2 ms
+sleep. The other two are the same binary with every bus thread under the mach
+time-constraint policy, which `Resolution::raise` now applies on macOS
+whether or not `rt.priority` is set. Single runs each; the difference between
+the last two is within what one run shows.
+
 ## The wire
 
 Frames over UDP; `crates/drlabs-api` is the Rust side, `tools/drlabs_client`
@@ -149,3 +165,18 @@ request becomes `THREAD_PRIORITY_TIME_CRITICAL` and an affinity mask, and is
 reported as best effort whatever it returns. None of this has been run on a
 Linux machine yet; the code type-checks for `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`.
+
+On macOS a non-zero `rt.priority` asks for the mach time-constraint policy,
+declared for the bus's actual period (a quarter of it as computation, half as
+the deadline); the number itself has no meaning there. It needs no privilege.
+`rt.cpus` is ignored — Apple Silicon does not pin threads to cores, and
+`drlabs rt` says so once at start-up — and there is no `mlockall`. The log
+line is therefore always of this shape, and it is accurate:
+
+```
+[simA] scheduling: priority 80: granted (time-constraint), memory not locked, best effort, not real-time
+```
+
+"Best effort" because the policy is soft: a thread that overruns its declared
+computation is scheduled as if it had not asked, for a while. In practice it
+is what makes a loop on macOS keep time at all; see *Measured* above.

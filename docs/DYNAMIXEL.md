@@ -579,3 +579,52 @@ dxl_diag COM7 3000000 syncstress <ids> 8 20 hz=500 write fast   # Fast Sync Read
 
 P시리즈 프로파일 `ph54`/`pm54`는 e-Manual에서 확인한 주소(574/576/580/592/594/564/550/546/9)
 외에는 기억에 의존한 **미검증** 표이며, 모델 번호로는 선택되지 않고 이름으로만 선택된다.
+
+## macOS: IOSSIOSPEED, 그리고 아직 재지 않은 FTDI 레이턴시 타이머 (2026-10-29)
+
+Apple Silicon Mac에서 처음으로 Rust 트리를 빌드하고 돌렸다. 하드웨어는 아직
+Mac에 연결하지 않았으므로 이 절은 **구현한 것과 측정해야 할 것**을 적는다.
+수치는 벤치에서 채운다.
+
+**구현.** macOS는 비표준 보레이트를 `cfsetspeed`로 받지 않는다. 1 000 000을
+넣으면 성공을 돌려주고 어댑터는 이전 속도에 머물러, 체인의 서보 전부가 침묵한다.
+`crates/drlabs-transport/src/serial/unix.rs`는 이제 `tcsetattr` 뒤에
+`IOSSIOSPEED` ioctl(`_IOW('T', 2, speed_t)` = 0x80085402)로 속도를 건다.
+Apple의 내장 FTDI/CDC 드라이버가 이 호출을 받는다. 같은 파일의 `write`는
+non-blocking fd의 부분 쓰기를 끝까지 채우고, 200 ms 동안 빠지지 않으면
+TimedOut — sync write 한 패킷의 절반만 선에 실리면 모든 서보에서 CRC 오류다.
+
+**측정할 것 — 레이턴시 타이머.** FTDI 칩은 수신 버퍼가 62바이트로 차거나
+레이턴시 타이머가 만료될 때만 호스트로 올린다. Linux `ftdi_sio`는 이 타이머를
+1 ms로 둔다. Apple 내장 드라이버의 기본값은 16 ms로 알려져 있고, 그대로라면
+Dynamixel 상태 패킷(수십 바이트)마다 최대 16 ms를 기다려 라운드트립이 60 Hz
+근처에 묶인다 — [위 절](#the-serial-read-timeout-was-the-loop-rate)의 Windows
+10 ms 타임아웃과 정확히 같은 모양의, "성공을 보고하는 느린 루프"다.
+`IOSSDATALAT` ioctl(`_IOW('T', 3, unsigned long)`, µs 단위)이 이를 낮추는
+공식 경로이나 Apple 드라이버가 받는지는 재 봐야 안다.
+
+절차(U2D2 + XL330-M288-T, 1 Mbaud):
+
+```
+drlabs ports                                            # /dev/cu.usbserial-XXXX 확인
+drlabs probe -driver dynamixel -port /dev/cu.usbserial-XXXX -baud 1000000 -id 1
+                                                        # 식별되면 IOSSIOSPEED 증명
+cargo run --release -p drlabs-dynamixel --example dxl_diag -- \
+    /dev/cu.usbserial-XXXX 1000000 syncstress 1 8 20 hz=500 write fast
+                                                        # 라운드트립과 유지 레이트
+```
+
+비교 기준은 Windows COM7 3 Mbaud 15축의 `syncstress` 수치(위 2026-10-27 절)와
+Windows COM6 1 Mbaud 단축 1.12 ms/cycle. 라운드트립이 15 ms 근처면 레이턴시
+타이머다: `IOSSDATALAT`로 1000 µs를 걸어 다시 재고, 드라이버가 거부하면 FTDI의
+D2XX 대신 `IOSSDATALAT`을 받는 서드파티 VCP 드라이버가 유일한 길이다.
+
+| | per cycle | rate | 비고 |
+|---|---|---|---|
+| macOS, open 직후 | 미측정 | 미측정 | |
+| macOS, IOSSDATALAT 1 ms | 미측정 | 미측정 | 드라이버 수락 여부 포함 |
+
+fdcanusb(CDC-ACM)는 레이턴시 타이머가 없어 이 문제가 없다. 다만 STM32 CDC
+스택이 DTR을 요구하는 경우가 있어, `probe -driver moteus`가 Mac에서 침묵하면
+open 직후 `TIOCMBIS(TIOCM_DTR|TIOCM_RTS)`를 추가하는 것이 첫 시도다.
+

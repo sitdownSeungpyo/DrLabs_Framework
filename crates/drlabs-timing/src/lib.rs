@@ -189,6 +189,18 @@ pub fn summarise(samples: &[Duration]) -> Statistics {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::sync::Mutex;
+
+    /// Tests run in parallel, and on Windows the raised resolution is one
+    /// process-wide count. Every test that holds a `Resolution` takes this
+    /// first, so none of them sees another's hold in the count.
+    static HOLDING_RESOLUTION: Mutex<()> = Mutex::new(());
+
+    fn holding_resolution() -> std::sync::MutexGuard<'static, ()> {
+        HOLDING_RESOLUTION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn summarise_reports_the_tail_a_mean_would_hide() {
@@ -214,6 +226,7 @@ mod tests {
     /// late, and that is the finding, not a tolerance to widen.
     #[test]
     fn a_wait_lands_on_its_deadline() {
+        let _serial = holding_resolution();
         let _resolution = Resolution::raise();
         let deadline = Instant::now() + Duration::from_millis(20);
         assert_eq!(sleep_until(deadline, None, DEFAULT_SPIN), Woke::Deadline);
@@ -268,6 +281,7 @@ mod tests {
     /// whichever mechanism the OS uses.
     #[test]
     fn a_nested_raise_does_not_release_the_outer_one() {
+        let _serial = holding_resolution();
         std::thread::spawn(|| {
             let outer = Resolution::raise();
             {
@@ -298,6 +312,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_raised_thread_sleeps_accurately_on_macos() {
+        let _serial = holding_resolution();
         std::thread::spawn(|| {
             let resolution = Resolution::raise();
             assert!(resolution.raised());

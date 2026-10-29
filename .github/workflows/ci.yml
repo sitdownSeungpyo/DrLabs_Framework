@@ -12,6 +12,8 @@ on:
 jobs:
   test:
     strategy:
+      # One platform failing should not hide what the others would have said.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}

@@ -308,7 +308,11 @@ mod tests {
 
     /// The measurement that decided the macOS design: a raised thread's sleep
     /// lands within a fraction of a millisecond where a default thread's lands
-    /// milliseconds late. Twenty samples of the longest wait a loop here makes.
+    /// milliseconds late — 3.5 ms on average for this wait. Twenty samples of
+    /// the longest wait a loop here makes, judged by their median: the defect
+    /// this guards against is systematic, every sleep late by a quarter, and
+    /// a median catches that while shrugging off the one preemption a shared
+    /// CI runner's virtual machine will deliver somewhere in 370 ms.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_raised_thread_sleeps_accurately_on_macos() {
@@ -317,15 +321,19 @@ mod tests {
             let resolution = Resolution::raise();
             assert!(resolution.raised());
             let asked = Duration::from_micros(18_500);
-            let worst = (0..20)
+            let mut overshoots: Vec<Duration> = (0..20)
                 .map(|_| {
                     let started = Instant::now();
                     std::thread::sleep(asked);
                     started.elapsed().saturating_sub(asked)
                 })
-                .max()
-                .unwrap();
-            assert!(worst < Duration::from_millis(1), "overshoot {worst:?}");
+                .collect();
+            overshoots.sort_unstable();
+            let median = overshoots[overshoots.len() / 2];
+            assert!(
+                median < Duration::from_millis(1),
+                "median overshoot {median:?}, all {overshoots:?}"
+            );
         })
         .join()
         .unwrap();

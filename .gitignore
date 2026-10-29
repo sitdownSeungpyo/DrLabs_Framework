@@ -16,6 +16,9 @@
 .vscode/
 .idea/
 
+# macOS Finder metadata.
+.DS_Store
+
 # Claude
 .claude
 # Unrelated content that shares the framework root directory.

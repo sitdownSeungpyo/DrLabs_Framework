@@ -1,6 +1,8 @@
-# Host tests on the two development platforms, and a build for the robot
-# target. Nothing here touches hardware; the bench numbers in docs/ come from
-# a person at the bench.
+# Host tests on the three development platforms, and a build for the robot
+# target.  macos-latest is an Apple Silicon runner, so the aarch64-apple-darwin
+# serial and scheduling paths are exercised, not just type-checked. Nothing
+# here touches hardware; the bench numbers in docs/ come from a person at the
+# bench.
 name: ci
 
 on:
@@ -11,7 +13,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

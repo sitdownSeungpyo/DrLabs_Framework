@@ -45,7 +45,7 @@ pub struct Joint {
 pub struct JointState {
     pub name: String,
 
-    pub armed: bool,
+    pub operation_enabled: bool,
     pub mode: ControlMode,
     pub estop: bool,
     /// Empty unless the stop is latched.
@@ -68,7 +68,7 @@ pub struct JointState {
 
     pub rate_hz: f64,
 
-    /// The preflight reasons, while a joint is not armed.
+    /// The preflight reasons, while a joint is not operation-enabled.
     pub blocked: Vec<String>,
 }
 
@@ -140,8 +140,8 @@ impl Robot {
                 units: Some(Arc::new(JointUnits::new(mapping))),
                 rate_hz: rate,
                 // A robot's joints are commanded by a program: there is nobody
-                // to press Arm, and nobody to acknowledge an advisory.
-                auto_arm: true,
+                // to press Enable, and nobody to acknowledge an advisory.
+                auto_enable: true,
                 require_acknowledgement: false,
                 initial_mode: ControlMode::Position,
                 ..Default::default()
@@ -159,7 +159,7 @@ impl Robot {
             });
         }
 
-        // Arming is not instant and it is not free of the bus. Every joint has
+        // Enabling operation is not instant and it is not free of the bus. Every joint has
         // to see at least one telemetry cycle before its preflight can pass,
         // and on a shared chain those cycles are taken in turn — so the window
         // has to grow with the machine. Five seconds is right for a single axis
@@ -167,17 +167,17 @@ impl Robot {
         // failed with no joint able to say why: nothing was blocking, there had
         // simply not been time.
         let budget = Duration::from_millis(5_000 + 500 * self.config.joints.len() as u64);
-        self.wait_until_armed(budget)
+        self.wait_until_enabled(budget)
     }
 
     /// Waits for every joint to energise, and says which ones did not.
-    fn wait_until_armed(&self, budget: Duration) -> Result<()> {
+    fn wait_until_enabled(&self, budget: Duration) -> Result<()> {
         let deadline = Instant::now() + budget;
         loop {
             let blocked: Vec<String> = self
                 .joints
                 .iter()
-                .filter(|joint| !joint.session.status().armed)
+                .filter(|joint| !joint.session.status().operation_enabled)
                 .map(|joint| {
                     // A latched e-stop keeps a joint unarmed with nothing in
                     // its preflight to show for it; surface it, or a bring-up
@@ -573,7 +573,7 @@ impl Robot {
     ///
     /// This is what a bring-up is for: the machine becomes rigid in the shape
     /// it is already in, and whatever drives it afterwards — a panel, a
-    /// program — is the only thing that moves it. Arming already adopts the
+    /// program — is the only thing that moves it. Enabling operation already adopts the
     /// measured position as the target, so nothing travels; this only stops the
     /// loop from being the thing that decides where the joints should be.
     ///
@@ -582,11 +582,11 @@ impl Robot {
     /// against whatever goal the *previous* session left behind, and the joint
     /// would set off for it.
     pub fn hold_where_they_are(&self) -> Result<()> {
-        // Arming raises a flag; it is the control loop's next pass that acts on
-        // it — enabling torque and writing the goal the arm adopted. Switching
+        // Enabling operation raises a flag; it is the control loop's next pass that acts on
+        // it — enabling torque and writing the goal that enabling operation adopted. Switching
         // to Query before that pass has run would stop the loop from ever
         // getting there, and the machine would come up limp while reporting
-        // itself armed. So wait for the controller to say it is driving.
+        // itself operation-enabled. So wait for the controller to say it is driving.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let waiting: Vec<&str> = self
@@ -594,7 +594,7 @@ impl Robot {
                 .iter()
                 .filter(|joint| {
                     let status = joint.session.status();
-                    status.armed && status.telemetry.mode.unwrap_or(0) == 0
+                    status.operation_enabled && status.telemetry.mode.unwrap_or(0) == 0
                 })
                 .map(|joint| joint.name.as_str())
                 .collect();
@@ -603,7 +603,7 @@ impl Robot {
             }
             if Instant::now() >= deadline {
                 return Err(Error::Refused(format!(
-                    "these joints armed but never reported driving: {}",
+                    "these joints enabled operation but never reported driving: {}",
                     waiting.join(", ")
                 )));
             }
@@ -625,23 +625,25 @@ impl Robot {
 
     /// Releases every joint and keeps it released.
     ///
-    /// Disarming on its own does not do this. A robot's joints arm themselves —
+    /// Disabling operation on its own does not do this. A robot's joints enable operation themselves —
     /// there is nobody standing at an axis to press a button — so a joint told
     /// to stop is driving again on the next cycle. For anything that needs the
-    /// machine limp in the operator's hands, automatic arming has to be turned
+    /// machine limp in the operator's hands, automatic enabling has to be turned
     /// off first and the release made to stick.
     pub fn release_all(&self) {
         for joint in &self.joints {
-            joint.session.set_auto_arm(false);
-            joint.session.disarm("released for hand movement");
+            joint.session.set_auto_enable(false);
+            joint
+                .session
+                .disable_operation("released for hand movement");
         }
     }
 
-    /// Lets the joints arm themselves again. They adopt the position they are
+    /// Lets the joints enable operation themselves again. They adopt the position they are
     /// in, so whatever the machine was moved to is where it becomes rigid.
-    pub fn allow_arming(&self) {
+    pub fn allow_enabling(&self) {
         for joint in &self.joints {
-            joint.session.set_auto_arm(true);
+            joint.session.set_auto_enable(true);
         }
     }
 
@@ -651,7 +653,7 @@ impl Robot {
 
     pub fn stop(&self, name: &str) -> Result<()> {
         let joint = self.joint(name)?;
-        joint.session.disarm("stopped");
+        joint.session.disable_operation("stopped");
         Ok(())
     }
 
@@ -659,16 +661,18 @@ impl Robot {
     ///
     /// Every joint, whatever any of them says about it: a machine half stopped
     /// is not stopped.
-    pub fn estop(&self, reason: &str) {
+    pub fn quick_stop(&self, reason: &str) {
         for joint in &self.joints {
-            joint.session.estop("robot_estop", "Emergency stop", reason);
+            joint
+                .session
+                .quick_stop("robot_estop", "Emergency stop", reason);
         }
     }
 
-    pub fn reset_estop(&self) -> Result<()> {
+    pub fn fault_reset(&self) -> Result<()> {
         let mut failures = Vec::new();
         for joint in &self.joints {
-            if let Err(error) = joint.session.reset_estop() {
+            if let Err(error) = joint.session.fault_reset() {
                 failures.push(format!("{}: {error}", joint.name));
             }
         }
@@ -702,7 +706,7 @@ impl Robot {
 
                 JointState {
                     name: joint.name.clone(),
-                    armed: status.armed,
+                    operation_enabled: status.operation_enabled,
                     mode: status.mode,
                     estop: status.estop.is_some(),
                     // The message names the class of failure and the detail
@@ -746,7 +750,7 @@ impl Robot {
                     moving_to_rad: moving_to,
                     progress: status.trajectory.progress,
                     rate_hz: status.achieved_rate_hz,
-                    blocked: if status.armed {
+                    blocked: if status.operation_enabled {
                         Vec::new()
                     } else {
                         joint.session.preflight().blocking

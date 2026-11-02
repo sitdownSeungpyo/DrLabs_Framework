@@ -171,7 +171,7 @@ torque off, naming the joint and the reason.
 A humanoid with one dead shoulder is more dangerous than one that never came
 up: everything else will hold poses that assume the missing joint is holding
 too. Bring-up also waits until every joint has actually energised before
-reporting success — arming is not instant, and handing the upper layer a
+reporting success — enabling operation is not instant, and handing the upper layer a
 machine that is only partly live is the same failure in slower motion.
 
 ## How several motors share one bus
@@ -189,7 +189,7 @@ Each joint still runs its own control loop. The alternative — one loop per bus
 cycling every joint in turn — would couple joints on the same wire more
 tightly, and is the right shape if coordinated motion ever needs to be
 simultaneous to better than a cycle. What it costs is the whole of
-`runtime/session`: arming, the trips, the trajectory sequencer, the emergency
+`runtime/session`: enabling operation, the trips, the trajectory sequencer, the emergency
 stop, all written per axis. Sharing the bus keeps all of that and gives up only
 exact phase alignment, which at 100 Hz is a few milliseconds of skew between
 joints.
@@ -229,7 +229,7 @@ python test/client/robot.py estop | reset
 ```
 
 Motion commands wait for the joints to settle and report the error against
-what was asked. They refuse to command a joint that is not armed, and print the
+what was asked. They refuse to command a joint whose operation is not enabled, and print the
 preflight reasons instead.
 
 Start on `examples/robots/sim_arm.json`, which needs no hardware at all, then
@@ -254,7 +254,7 @@ Two things it deliberately does not do. It never snaps a slider to the measured
 position while somebody is holding it — the command and the measurement are
 separate readouts, because a control that chases the measurement hides exactly
 the disagreement worth seeing. And it never paints the machine as stopped
-because the operator pressed stop; `armed`, `e-stopped` and the fault come only
+because the operator pressed stop; `drive_state`, `e-stopped` and the fault come only
 from state the robot actually sent.
 
 ## Verified

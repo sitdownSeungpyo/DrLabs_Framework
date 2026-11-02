@@ -7,7 +7,7 @@
 //! Two sequencers live *inside* the loop rather than in an application on top of
 //! it — the A↔B shuttle and host-side trajectories. That is deliberate: their
 //! timing does not depend on a caller staying responsive, and they stop the
-//! instant the axis is disarmed or faulted, because the code that decides
+//! instant the axis is operation-disabled or faulted, because the code that decides
 //! whether to command anything at all is the code that steps them.
 
 pub mod control_loop;

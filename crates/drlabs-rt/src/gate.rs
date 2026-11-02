@@ -1,6 +1,6 @@
 //! Whether an axis may be driven right now.
 //!
-//! This is the session's arm/disarm/e-stop state machine, with the button
+//! This is the session's enable-operation / disable-operation / fault state machine, with the button
 //! replaced by the `mode` byte of the client's [`drlabs_core::MotorCmd`]:
 //!
 //! * `OFF` — the axis is observed and not driven.
@@ -83,7 +83,7 @@ impl AxisGate {
     /// Decides for this tick. `want_drive` is the client's `mode`, `known` the
     /// last readings from the axis, `estop` whether the robot is stopped.
     ///
-    /// Starting to drive resets the guard's trip timers, as arming did: time
+    /// Starting to drive resets the guard's trip timers, as enabling operation did: time
     /// spent off does not count towards a trip.
     pub fn decide(
         &mut self,

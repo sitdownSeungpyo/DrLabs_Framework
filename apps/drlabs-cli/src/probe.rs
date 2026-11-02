@@ -266,7 +266,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // The travel envelope is the operator's, not the driver's, so it has to be
     // sayable on the command line. A default of ±0.5 rev is right for a first
     // power-up and wrong for an axis that is parked anywhere else — and a
-    // motor that cannot be armed because of a default nobody chose is the sort
+    // motor that cannot enable operation because of a default nobody chose is the sort
     // of thing people work around by disabling the check.
     let mut safety = drlabs_safety::Config {
         max_torque: drlabs_core::units::Nm(flags.number("torque", 0.3)?),
@@ -289,7 +289,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let session = Session::new(Options {
         safety,
         rate_hz: rate,
-        auto_arm: true,
+        auto_enable: true,
         require_acknowledgement: false,
         ..Default::default()
     });
@@ -303,8 +303,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         ..Default::default()
     });
 
-    // Give the loop long enough to arm before anything is commanded.
-    wait_until_armed(&session, Duration::from_secs(5))?;
+    // Give the loop long enough to enable operation before anything is commanded.
+    wait_until_enabled(&session, Duration::from_secs(5))?;
 
     if !shuttle.is_empty() {
         let parts: Vec<&str> = shuttle.split(',').collect();
@@ -373,7 +373,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             status.transaction.mean.as_secs_f64() * 1e3,
             status.transaction.p95.as_secs_f64() * 1e3,
             status.transaction.max.as_secs_f64() * 1e3,
-            if status.armed { "armed" } else { "idle " }
+            if status.operation_enabled { "enabled" } else { "idle   " }
         );
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -392,13 +392,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_until_armed(session: &Arc<Session>, budget: Duration) -> Result<(), String> {
+fn wait_until_enabled(session: &Arc<Session>, budget: Duration) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     loop {
         let status = session.status();
-        if status.armed {
+        if status.operation_enabled {
             println!(
-                "armed · {} · {:.0} Hz",
+                "operation enabled · {} · {:.0} Hz",
                 status
                     .identity
                     .as_ref()

@@ -264,7 +264,8 @@ impl DynamixelLink {
         if let Some(chain) = &self.chain {
             chain.queue_torque(self.id, address, enabled);
         } else {
-            self.driver()?.write_u8(self.id, address, u8::from(enabled))?;
+            self.driver()?
+                .write_u8(self.id, address, u8::from(enabled))?;
         }
         self.torque_enabled = enabled;
         Ok(())
@@ -555,7 +556,7 @@ impl DynamixelLink {
              {}",
             self.id,
             match cleared {
-                Ok(()) => "The latch is cleared; re-arm to continue.".to_string(),
+                Ok(()) => "The latch is cleared; re-enable operation to continue.".to_string(),
                 Err(error) => format!("Clearing it failed: {error}"),
             }
         )))
@@ -637,8 +638,8 @@ impl DynamixelLink {
         // be handed either length on any given period.
         let voltage_offset =
             (self.profile.addr_present_voltage - self.profile.addr_present_current) as usize;
-        let temp_offset = (self.profile.addr_present_temperature
-            - self.profile.addr_present_current) as usize;
+        let temp_offset =
+            (self.profile.addr_present_temperature - self.profile.addr_present_current) as usize;
         if data.len() > temp_offset {
             let voltage = u16::from_le_bytes([data[voltage_offset], data[voltage_offset + 1]])
                 as f64
@@ -878,10 +879,8 @@ impl Link for DynamixelLink {
             // The servo's own limit when it told us one, the family's
             // documented no-load speed otherwise.
             velocity_max: Some(RevPerSec(match self.velocity_limit_counts {
-                Some(counts) => {
-                    (counts as f64 * self.profile.velocity_rpm_per_count / 60.0)
-                        .min(self.profile.max_velocity_rev_per_sec)
-                }
+                Some(counts) => (counts as f64 * self.profile.velocity_rpm_per_count / 60.0)
+                    .min(self.profile.max_velocity_rev_per_sec),
                 None => self.profile.max_velocity_rev_per_sec,
             })),
             peak_current: None,
@@ -1011,7 +1010,8 @@ mod tests {
         let mut link = link_on(&servo, XL330);
         let driver = link.driver().unwrap().clone();
 
-        link.normalise_return_delay(&driver).expect("writes answered");
+        link.normalise_return_delay(&driver)
+            .expect("writes answered");
 
         let written = servo.written.lock().unwrap().clone();
         // Pinned: a torque-enable write of zero, then a register 9 write of

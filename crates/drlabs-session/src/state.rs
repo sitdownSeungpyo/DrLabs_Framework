@@ -187,9 +187,9 @@ pub struct State {
     pub preset: Option<Preset>,
     pub units: Option<Arc<dyn Units>>,
 
-    pub armed: bool,
-    pub arm_blockers: Vec<String>,
-    pub arm_advisories: Vec<String>,
+    pub operation_enabled: bool,
+    pub enable_blockers: Vec<String>,
+    pub enable_advisories: Vec<String>,
     pub estop: Option<EStop>,
 
     pub mode: ControlMode,
@@ -207,11 +207,11 @@ pub struct State {
     pub last_reply_at: Option<Instant>,
 
     pub require_ack: bool,
-    pub auto_arm: bool,
+    pub auto_enable: bool,
     pub initial_mode: ControlMode,
-    /// Throttles the "cannot arm" log, so a blocked axis explains itself once
+    /// Throttles the "cannot enable operation" log, so a blocked axis explains itself once
     /// rather than at the control rate.
-    pub auto_arm_reported_at: Option<Instant>,
+    pub auto_enable_reported_at: Option<Instant>,
 
     pub stats: LoopStats,
     pub samples: SampleRing,
@@ -313,9 +313,9 @@ mod tests {
             monitor: Monitor::default(),
             preset: None,
             units: None,
-            armed: false,
-            arm_blockers: Vec::new(),
-            arm_advisories: Vec::new(),
+            operation_enabled: false,
+            enable_blockers: Vec::new(),
+            enable_advisories: Vec::new(),
             estop: None,
             mode: ControlMode::Stop,
             rate_hz: DEFAULT_RATE_HZ,
@@ -329,9 +329,9 @@ mod tests {
             latched_fault: None,
             last_reply_at: None,
             require_ack: true,
-            auto_arm: false,
+            auto_enable: false,
             initial_mode: ControlMode::Position,
-            auto_arm_reported_at: None,
+            auto_enable_reported_at: None,
             stats: LoopStats::default(),
             samples: SampleRing::new(100),
             events: EventLog::new(100),

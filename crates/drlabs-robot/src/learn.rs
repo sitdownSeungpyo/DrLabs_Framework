@@ -3,7 +3,7 @@
 //! A description has to state what each joint may do before anything can drive
 //! it, and on a machine nobody has characterised those numbers are a guess. The
 //! guess is not harmless: too wide and the envelope protects nothing, too
-//! narrow and a joint refuses to arm because it is resting outside limits
+//! narrow and a joint refuses to enable operation because it is resting outside limits
 //! somebody invented.
 //!
 //! So measure them. Torque off, move every joint through its travel by hand,
@@ -76,7 +76,7 @@ struct Inner {
     /// The machine this run released, kept so that ending the run can put it
     /// back however the run ended. Leaving that to the sampler thread meant a
     /// path — clearing the results — where the thread went away without ever
-    /// re-arming, and the machine stayed limp for good.
+    /// re-enabling, and the machine stayed limp for good.
     robot: Option<Arc<Robot>>,
 }
 
@@ -101,7 +101,7 @@ impl RangeLearner {
             return Err(format!("{seconds} is not a usable duration"));
         }
 
-        // Automatic arming goes off first. Disarming a joint that re-arms
+        // Automatic enabling goes off first. Disabling operation on a joint that re-enables
         // itself on the next cycle is not a release, and the operator would be
         // moving a machine that had quietly become rigid again.
         robot.release_all();
@@ -173,7 +173,7 @@ impl RangeLearner {
         }
     }
 
-    /// Ends a run, keeping everything recorded so far, and lets the joints arm
+    /// Ends a run, keeping everything recorded so far, and lets the joints enable operation
     /// themselves again.
     ///
     /// Every way a run can end goes through here, because every one of them has
@@ -191,7 +191,7 @@ impl RangeLearner {
             inner.robot.take()
         };
         if let Some(robot) = robot {
-            robot.allow_arming();
+            robot.allow_enabling();
         }
     }
 

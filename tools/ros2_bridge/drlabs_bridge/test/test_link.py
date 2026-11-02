@@ -116,7 +116,7 @@ def test_link_connects_and_reports_joints():
         assert abs(joints[0].position_rad - 0.1) < 1e-6
         assert joints[0].voltage_v == 12.0
         assert joints[0].torque_nm is None, "an unreported torque is None, not zero"
-        assert not joints[0].armed
+        assert not joints[0].operation_enabled
     finally:
         link.stop()
         runtime.stop()

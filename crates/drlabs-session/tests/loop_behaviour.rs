@@ -110,7 +110,7 @@ fn connected(rate_hz: u32) -> (Arc<Session>, FakeController) {
     let controller = FakeController::default();
     let session = Session::new(Options {
         rate_hz,
-        auto_arm: true,
+        auto_enable: true,
         require_acknowledgement: false,
         ..Default::default()
     });
@@ -209,7 +209,10 @@ fn an_auto_arming_session_energises_and_holds_where_it_is() {
     std::thread::sleep(Duration::from_millis(150));
 
     let status = session.status();
-    assert!(status.armed, "the session should have armed itself");
+    assert!(
+        status.operation_enabled,
+        "the session should have enabled operation itself"
+    );
     assert_eq!(status.mode, ControlMode::Position);
     assert_eq!(status.setpoint.position, Rev(0.0));
 }
@@ -220,22 +223,22 @@ fn an_auto_arming_session_energises_and_holds_where_it_is() {
 fn an_emergency_stop_latches_until_it_is_cleared() {
     let (session, _controller) = connected(100);
     std::thread::sleep(Duration::from_millis(150));
-    assert!(session.status().armed);
+    assert!(session.status().operation_enabled);
 
-    session.estop("test", "Stopped by the test", "");
+    session.quick_stop("test", "Stopped by the test", "");
     std::thread::sleep(Duration::from_millis(100));
 
     let status = session.status();
-    assert!(!status.armed);
+    assert!(!status.operation_enabled);
     assert!(status.estop.is_some());
-    // Auto-arm must not re-arm through it.
+    // Auto-enable must not re-enable through it.
     std::thread::sleep(Duration::from_millis(150));
     assert!(
-        !session.status().armed,
+        !session.status().operation_enabled,
         "a latched stop must not undo itself"
     );
 
-    session.reset_estop().expect("nothing is faulted");
+    session.fault_reset().expect("nothing is faulted");
     assert!(session.status().estop.is_none());
 }
 
@@ -307,7 +310,7 @@ fn the_status_reports_a_measured_rate() {
 /// a moteus still driving, a Dynamixel with a latched bus watchdog — and where
 /// it tunes the transport for a control loop.
 ///
-/// Skipping it looked harmless: the servo answered, armed, and held position.
+/// Skipping it looked harmless: the servo answered, enabled operation, and held position.
 /// It just did so at 44 Hz against a 100 Hz configuration, because an unopened
 /// port keeps its default ten-millisecond read timeout and the loop reads twice
 /// a cycle. Nothing reported an error. Opening it took the same loop to 100.
@@ -353,7 +356,11 @@ fn a_transport_error_tears_the_link_down() {
                 ..Identity::new("dead")
             }))
         }
-        fn cycle(&mut self, _command: &Command, _profile: QueryProfile) -> Result<Option<Telemetry>> {
+        fn cycle(
+            &mut self,
+            _command: &Command,
+            _profile: QueryProfile,
+        ) -> Result<Option<Telemetry>> {
             Err(drlabs_core::error::Error::transport(
                 "test transaction",
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply"),
@@ -370,7 +377,7 @@ fn a_transport_error_tears_the_link_down() {
     let controller = DeadController::default();
     let session = Session::new(Options {
         rate_hz: 100,
-        auto_arm: false,
+        auto_enable: false,
         require_acknowledgement: false,
         ..Default::default()
     });

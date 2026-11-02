@@ -95,7 +95,7 @@ impl Handle {
             .unwrap_or(0)
     }
 
-    pub fn estop(&self) -> &Estop {
+    pub fn quick_stop(&self) -> &Estop {
         &self.estop
     }
 

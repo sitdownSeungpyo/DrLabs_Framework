@@ -19,7 +19,7 @@ type Link interface {
 }
 ```
 
-Everything above it — the control loop, the safety monitor, the CLI, the arming
+Everything above it — the control loop, the safety monitor, the CLI, the enable
 checklist — is vendor-neutral. Everything below it is one vendor's problem.
 
 `Cycle` is a single method rather than a set of `SetPosition`/`ReadState` calls
@@ -141,8 +141,9 @@ electrical trip requires its condition to hold continuously for a configured
 time. A single-sample trip produces a machine that stops constantly for no
 reason, and operators who learn to disable it.
 
-**Some conditions only trip while armed.** Being outside the position envelope
-is a reason to refuse arming, but not a reason to latch while disarmed — with
+**Some conditions only trip while operation is enabled.** Being outside the
+position envelope is a reason to refuse enabling operation, but not a reason to
+latch while operation is disabled — with
 the drive off, the operator's only way back inside is to move the axis by hand,
 and latching on that would make the condition unrecoverable.
 
@@ -152,16 +153,35 @@ every observation as a blocker teaches people to click through it.
 
 The emergency stop is orthogonal to the state machine: it latches from any
 state, forces a stop on every subsequent cycle, and must be cleared explicitly.
-Clearing it leaves the axis disarmed, so a reset can never by itself put a
-machine back in motion.
+Clearing it leaves the axis switched on with operation disabled, so a reset can
+never by itself put a machine back in motion.
 
 ## The state machine
 
+The states and the verbs are CiA 402's, so that somebody who knows servo
+drives reads them without a glossary (`drlabs_core::DriveState`):
+
 ```
-disconnected ──connect──▶ connected/disarmed ──arm──▶ connected/armed ──▶ mode
-                              ▲                            │
-                              └──────────disarm────────────┘
+switch on disabled ──connect──▶ switched on ──enable_operation──▶ operation enabled ──▶ mode
+                                     ▲                                   │
+                                     └─────────disable_operation─────────┘
+
+        any state ──trip / quick_stop──▶ fault ──fault_reset──▶ switched on
 ```
+
+| CiA 402 | here |
+|---|---|
+| Switch on disabled | no link, or one still being opened |
+| Switched on | connected, torque off, the axis is read |
+| Operation enabled | torque on, setpoints followed |
+| Fault | a trip or a quick stop is latched; only `fault_reset` clears it |
+
+Two of the profile's states are left out on purpose. *Ready to switch on* has
+no separate meaning when the high-level power is the controller's own, and
+*Quick stop active* is not a resting state here: a quick stop latches a fault,
+because a stop that undid itself would be worse than no stop at all. On the
+wire the state travels as one word, `drive_state`, spelled `switch_on_disabled`,
+`switched_on`, `operation_enabled` or `fault`.
 
 Two details worth calling out.
 
@@ -186,7 +206,7 @@ They are mutually exclusive because both own the position setpoint, and each
 one stops the other on start.
 
 That is deliberate. Its timing does not depend on a UI staying responsive, and
-it stops the instant the axis is disarmed, faulted or emergency-stopped, because
+it stops the instant operation is disabled or a fault latches, because
 it is evaluated by the same code that decides whether to command anything at
 all. A sequencer that lives outside the loop has to be told to stop, and every
 path that fails to tell it is a machine that keeps moving after the operator

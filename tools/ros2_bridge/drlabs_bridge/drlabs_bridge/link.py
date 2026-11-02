@@ -55,7 +55,7 @@ class JointState:
     """
 
     name: str
-    armed: bool = False
+    operation_enabled: bool = False
     estop: bool = False
     mode: str = ""
     position_rad: Optional[float] = None
@@ -312,7 +312,7 @@ class RobotLink:
             m = state.state[joint.index]
             out.append(JointState(
                 name=joint.name,
-                armed=m.driving,
+                operation_enabled=m.driving,
                 estop=estop,
                 mode=STATUS_NAMES.get(m.status, str(m.status)),
                 position_rad=_opt(m.q),

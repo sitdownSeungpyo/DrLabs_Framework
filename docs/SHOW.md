@@ -99,9 +99,9 @@ base로 프로파일 복귀 → 끊긴 act 재시작. 강제 `/api/estop`으로 
 
 ## 종료
 
-Ctrl+C 또는 모니터의 Quit 버튼(`POST /api/quit`): base 복귀 → `/api/estop` → armed 0 확인
-→ 1 s → panel 종료. `/api/stop`은 쓰지 않는다: panel이 auto-arm이라 다음 사이클에 다시
-arm되어 토크가 안 풀린다(실측). e-stop은 latch되어 stop burst가 토크 off를 실어 나간다
+Ctrl+C 또는 모니터의 Quit 버튼(`POST /api/quit`): base 복귀 → `/api/estop` → operation_enabled 0 확인
+→ 1 s → panel 종료. `/api/stop`은 쓰지 않는다: panel이 auto-enable이라 다음 사이클에 다시
+operation enabled가 되어 토크가 안 풀린다(실측). e-stop은 latch되어 stop burst가 토크 off를 실어 나간다
 (종료 후 dump에서 torque 0 확인). panel 자체는 Ctrl+C 핸들러가 없어 그냥 죽으므로 이
 순서가 유일한 깨끗한 해제다. 강제로 죽였다면 `dxl_diag COM7 3000000 release <ids>`.
 

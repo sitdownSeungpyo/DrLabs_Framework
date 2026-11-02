@@ -40,7 +40,7 @@ that reason.
 It owns no control logic and no limits. The envelope, the trips, the
 trajectory generator and the controller's own watchdog all stay on the far side
 of the socket. The node translates, and is careful about what it claims:
-`armed` and `estop` are published only from state lines the robot actually
+`operation_enabled` and `estop` are published only from state lines the robot actually
 sent, never from what was commanded.
 
 | | |

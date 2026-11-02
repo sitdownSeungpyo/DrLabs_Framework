@@ -459,7 +459,7 @@ class Supervisor:
         self.wait_ready(args.bringup_timeout)
 
     def wait_ready(self, timeout):
-        """Until every joint is armed, or the panel has given up."""
+        """Until every joint has operation enabled, or the panel has given up."""
         deadline = time.time() + timeout
         last = ""
         while time.time() < deadline:
@@ -471,13 +471,13 @@ class Supervisor:
                 time.sleep(0.5)
                 continue
             joints = state["joints"]
-            armed = sum(1 for j in joints if j["armed"] and not j["estop"])
-            if state.get("connected") and armed == len(joints):
-                log(f"panel ready: {armed} joints armed")
+            enabled = sum(1 for j in joints if j["drive_state"] == "operation_enabled" and not j["estop"])
+            if state.get("connected") and enabled == len(joints):
+                log(f"panel ready: {enabled} joints with operation enabled")
                 return
             stopped = stopped_joints({j["name"]: j for j in joints})
             blocked = {j["name"]: j["blocked"] for j in joints if j["blocked"]}
-            line = f"waiting: {armed}/{len(joints)} armed"
+            line = f"waiting: {enabled}/{len(joints)} operation enabled"
             if stopped:
                 line += "; e-stop " + "; ".join(stopped[:3])
             if blocked:
@@ -487,14 +487,14 @@ class Supervisor:
                 log(line)
                 last = line
             time.sleep(0.5)
-        raise Interrupted(f"the panel did not arm every joint within {timeout:.0f} s")
+        raise Interrupted(f"the panel did not enable operation on every joint within {timeout:.0f} s")
 
     def stop_panel(self, release=True):
         """Torque off through the panel, then end the process.
 
         The release is an e-stop, not /api/stop: the panel brings its joints
-        up with auto-arm, so a plain stop is re-armed on the next cycle and
-        the torque never goes off (measured: 15 joints armed 2 s after
+        up with auto-enable, so a plain stop is re-enabled on the next cycle and
+        the torque never goes off (measured: 15 joints enabled 2 s after
         /api/stop, torque still 1 on the servos). An e-stop latches, and its
         stop burst carries the torque-off write (measured: torque 0 on every
         servo after the panel was ended). The panel process has no Ctrl+C
@@ -506,7 +506,7 @@ class Supervisor:
                 deadline = time.time() + 3.0
                 while time.time() < deadline:
                     joints = self.panel.get("/api/state")["joints"]
-                    if not any(j["armed"] for j in joints):
+                    if not any(j["drive_state"] == "operation_enabled" for j in joints):
                         break
                     time.sleep(0.2)
                 time.sleep(1.0)  # a few control cycles, so the torque-off phase goes out
@@ -527,7 +527,7 @@ class Supervisor:
         self.wait_ready(self.args.reset_timeout)
 
     def recover(self, reason):
-        """Keeps trying until the machine is armed again. Returns the number
+        """Keeps trying until the machine has operation enabled again. Returns the number
         of attempts it took."""
         note("estop", reason)
         attempt = 0
@@ -682,7 +682,7 @@ class HeadOverlay:
 
     def resync(self, panel):
         """Adopt the head's actual position (after a restart the servos have
-        been re-armed wherever they were)."""
+        been re-enabled wherever they were)."""
         try:
             joints = panel.joints()
             yaw = joints[self.yaw_joint]["position_rad"]
@@ -1183,7 +1183,7 @@ def main():
             try:
                 supervisor.wait_ready(5.0)
             except Interrupted as error:
-                raise SystemExit(f"no armed panel at {args.panel}: {error}")
+                raise SystemExit(f"no live panel at {args.panel}: {error}")
         if faces is not None:
             faces.resync(supervisor.panel)
         if args.calibrate_head:

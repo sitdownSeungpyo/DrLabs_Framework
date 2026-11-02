@@ -69,7 +69,7 @@ impl Response {
     ///
     /// 409 rather than 400: the request was well formed, the machine said no.
     /// A UI that cannot tell those apart shows "bad request" when the real
-    /// answer is "that joint is not armed".
+    /// answer is "that joint operation is not enabled".
     pub fn refused(reason: &str) -> Self {
         Self {
             status: 409,
@@ -465,12 +465,12 @@ mod tests {
 
     /// A well-formed request the machine says no to is a conflict, not a bad
     /// request. A UI that cannot tell those apart shows "bad request" when the
-    /// real answer is "that joint is not armed".
+    /// real answer is "that joint operation is not enabled".
     #[test]
     fn a_refusal_carries_its_reason_and_the_right_status() {
-        let response = Response::refused("the axis is not armed");
+        let response = Response::refused("operation is not enabled");
         assert_eq!(response.status, 409);
         let body = String::from_utf8(response.body).unwrap();
-        assert!(body.contains("the axis is not armed"), "{body}");
+        assert!(body.contains("operation is not enabled"), "{body}");
     }
 }

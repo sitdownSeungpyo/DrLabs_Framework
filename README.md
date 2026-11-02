@@ -45,7 +45,7 @@ envelope nothing above it can exceed. That role is `drlabs serve`, and
 `docs/SERVO.md` describes it.
 
 The operator-facing paths — `drlabs run`, the web UI — are the same runtime
-with a human in the loop instead: they start disarmed and make someone read the
+with a human in the loop instead: they start with operation disabled and make someone read the
 preflight checklist first.
 
 The starting point was a Dynamixel SDK. A framework needs three things the SDK
@@ -99,7 +99,7 @@ did not have:
 | `transport/serial/` | Per-platform serial ports and port enumeration |
 | `transport/can/` | CAN and CAN-FD frame types and the `Bus` interface |
 | `transport/fdcanusb/` | mjbots fdcanusb adapter, including its optional line checksums |
-| `runtime/session/` | Connection lifecycle, control loop, arming, emergency stop, A↔B shuttle |
+| `runtime/session/` | Connection lifecycle, control loop, enable/disable operation, fault latch, A↔B shuttle |
 | `runtime/safety/` | Operator envelope, command clamps, trip evaluation, sensitivity presets |
 | `runtime/robot/` | A whole machine from one JSON description: joints, gearing, shared buses |
 | `runtime/timing/` | High-resolution scheduling and loop statistics |
@@ -180,9 +180,9 @@ safety.PositionMin, safety.PositionMax = -0.6, 0.6
 s.SetSafety(safety)
 
 if blocking, _ := s.Preflight(); len(blocking) > 0 {
-    return fmt.Errorf("cannot arm: %s", blocking[0])
+    return fmt.Errorf("cannot enable operation: %s", blocking[0])
 }
-s.Arm(true)
+s.EnableOperation(true)
 s.SetMode(motor.CtrlPosition)
 s.SetPosition(0.25)
 ```
@@ -286,7 +286,7 @@ Three things about how these are designed are worth knowing:
 - **Trips need duration, not a single sample.** A momentary current spike is
   what acceleration looks like. Every motion and electrical trip requires the
   condition to hold continuously.
-- **The position envelope only trips while armed.** With the drive off, the
+- **The position envelope only trips while operation is enabled.** With the drive off, the
   operator's only way back inside is to move the axis by hand — latching on
   that would make the condition unrecoverable.
 - **"Limiting" is not a fault.** Codes that say the output is being capped are
@@ -339,7 +339,7 @@ func init() {
 ```
 
 The rest of the framework — the control loop, the safety monitor, the CLI, the
-arming checklist — works without modification. Report honestly through
+enable checklist — works without modification. Report honestly through
 `Capabilities` and `Envelope`: a mode you claim and cannot deliver fails at
 command time, and a rating you do not publish simply leaves the operator's
 declared limits in force.
@@ -364,7 +364,7 @@ Nothing in the suite needs hardware. The interesting parts:
 - `drivers/robstride/protocol_test.go` — addressing against the manuals' own
   worked example, both byte orders, the per-model scaling table, fault bits
 - `runtime/session/session_test.go` — the whole stack against the simulator:
-  arming, emergency stop, fault handling, the shuttle, the deadman
+  enabling operation, quick stop, fault handling, the shuttle, the deadman
 
 Describing a machine is `docs/ROBOT.md`; bringing up a new axis is
 `docs/BRINGUP.md`; the testing layers are in

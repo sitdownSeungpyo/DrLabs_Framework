@@ -52,7 +52,7 @@ impl Persistence {
 /// What a preflight check found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preflight {
-    /// Reasons that must be cleared before arming.
+    /// Reasons that must be cleared before enabling operation.
     pub blocking: Vec<String>,
     /// Observations the operator should read but may proceed past.
     ///
@@ -62,7 +62,7 @@ pub struct Preflight {
 }
 
 impl Preflight {
-    pub fn may_arm(&self) -> bool {
+    pub fn may_enable(&self) -> bool {
         self.blocking.is_empty()
     }
 }
@@ -114,7 +114,7 @@ impl Monitor {
 
     /// Clears the trip timers.
     ///
-    /// Called on arm and after an emergency stop is cleared, so time spent
+    /// Called on enable_operation and after an emergency stop is cleared, so time spent
     /// stopped does not count towards a trip.
     pub fn reset(&mut self) {
         self.current = Persistence::default();
@@ -123,7 +123,7 @@ impl Monitor {
         self.warnings.clear();
     }
 
-    /// The check performed once, before the operator may arm.
+    /// The check performed once, before the operator may enable operation.
     pub fn preflight(
         &self,
         identity: Option<&Identity>,
@@ -197,15 +197,15 @@ impl Monitor {
             ),
             Some(position) if config.position_limit_enabled => {
                 // The same margin the running check allows, so the two agree:
-                // an axis may be armed wherever it would be allowed to keep
+                // an axis may be operation-enabled wherever it would be allowed to keep
                 // running.
                 //
-                // Without it the arm check is stricter than the trip check, and
+                // Without it the enable check is stricter than the trip check, and
                 // the gap is not theoretical — a target clamped to the envelope
                 // limit is commanded exactly at the bound, and the axis settles
                 // a fraction of a degree outside it through ordinary tracking
                 // error. That is a position this layer itself asked for, and it
-                // left the axis unable to re-arm while the running check would
+                // left the axis unable to re-enable while the running check would
                 // only have warned.
                 let margin = config.position_trip_margin;
                 if position < config.position_min - margin
@@ -246,16 +246,16 @@ impl Monitor {
     /// Examines one cycle's telemetry and returns a [`Trip`] when the machine
     /// must be stopped. It also refreshes [`Monitor::warnings`].
     ///
-    /// The `armed` flag matters more than it looks. Several conditions — being
+    /// The `operation_enabled` flag matters more than it looks. Several conditions — being
     /// outside the position envelope in particular — are a reason to refuse
-    /// arming but not a reason to latch while disarmed: with the drive off, the
+    /// enabling operation but not a reason to latch while operation-disabled: with the drive off, the
     /// operator's only way to fix it is to move the axis by hand, and tripping
     /// on that would make the fault unrecoverable.
     pub fn evaluate(
         &mut self,
         telemetry: &Telemetry,
         commanded: &Command,
-        armed: bool,
+        operation_enabled: bool,
         now: Instant,
     ) -> Option<Trip> {
         let config = self.config;
@@ -303,7 +303,7 @@ impl Monitor {
                     ),
                     "Regeneration with no battery on the bus is the usual cause.".into()
                 );
-            } else if voltage < config.bus_voltage_min && armed {
+            } else if voltage < config.bus_voltage_min && operation_enabled {
                 set_trip!(
                     "under_voltage",
                     format!(
@@ -375,7 +375,7 @@ impl Monitor {
             let margin = config.position_trip_margin;
             let outside =
                 position > config.position_max + margin || position < config.position_min - margin;
-            if outside && !armed {
+            if outside && !operation_enabled {
                 warnings.push("outside soft position limits".into());
             } else if outside {
                 set_trip!(
@@ -396,7 +396,7 @@ impl Monitor {
             }
         }
 
-        if armed {
+        if operation_enabled {
             if let Some(velocity) = telemetry.velocity {
                 let ceiling = RevPerSec(
                     (config.max_velocity.value() * config.runaway_velocity_factor).max(0.05),
@@ -654,7 +654,7 @@ mod tests {
 
         let trip = monitor
             .evaluate(&telemetry, &armed_command(), true, Instant::now())
-            .expect("armed, it trips");
+            .expect("operation enabled, it trips");
         assert_eq!(trip.code, "position_envelope");
     }
 
@@ -765,7 +765,7 @@ mod tests {
         };
 
         let result = monitor.preflight(Some(&identity), &healthy(), true);
-        assert!(result.may_arm(), "{:?}", result.blocking);
+        assert!(result.may_enable(), "{:?}", result.blocking);
 
         // An unidentified board is worth saying, and not worth blocking on.
         let unknown = Identity {
@@ -774,7 +774,7 @@ mod tests {
             ..Identity::new("moteus")
         };
         let result = monitor.preflight(Some(&unknown), &healthy(), true);
-        assert!(result.may_arm());
+        assert!(result.may_enable());
         assert!(result.advisory.iter().any(|a| a.contains("not positively")));
     }
 
@@ -788,12 +788,12 @@ mod tests {
             ..Identity::new("moteus")
         };
         let result = monitor.preflight(Some(&identity), &healthy(), true);
-        assert!(!result.may_arm());
+        assert!(!result.may_enable());
     }
 
-    /// The asymmetry that stopped an axis re-arming: the arm check has to allow
+    /// The asymmetry that stopped an axis re-enabling: the enable check has to allow
     /// the same margin the running check does, or the layer's own clamped
-    /// target leaves the axis unable to arm.
+    /// target leaves the axis unable to enable operation.
     #[test]
     fn arming_allows_the_same_margin_the_trip_check_does() {
         let monitor = Monitor::default(); // ±0.5 rev, 0.05 margin
@@ -803,7 +803,7 @@ mod tests {
         };
         let result = monitor.preflight(None, &just_outside, true);
         assert!(
-            result.may_arm(),
+            result.may_enable(),
             "inside the margin, so it must be armable: {:?}",
             result.blocking
         );
@@ -813,7 +813,7 @@ mod tests {
             ..healthy()
         };
         let result = monitor.preflight(None, &well_outside, true);
-        assert!(!result.may_arm());
+        assert!(!result.may_enable());
         assert!(result.blocking[0].contains("the shaft is free"));
     }
 
@@ -865,7 +865,7 @@ mod tests {
     }
 
     /// Resetting clears the timers, so time spent stopped does not count
-    /// towards a trip when the axis is armed again.
+    /// towards a trip when the axis is operation-enabled again.
     #[test]
     fn resetting_forgets_how_long_a_condition_has_held() {
         let mut monitor = Monitor::default();

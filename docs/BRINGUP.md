@@ -102,7 +102,7 @@ webui -driver moteus -port COM5 -id 1
 ```
 
 Then, in the page: set the torque ceiling and position envelope from stage 3 in
-the **Safety** panel, read the arming checklist, arm, and command a small
+the **Safety** panel, read the preflight checklist, enable operation, and command a small
 position step — 0.02 rev.
 
 Three outcomes, all of them informative:
@@ -133,7 +133,7 @@ Now the numbers are measurements rather than guesses.
 - **Position envelope:** the travel you actually want, plus the overshoot you
   observed. The trip margin (`PositionTripMargin`, 0.05 rev by default) absorbs
   normal overshoot; the envelope should not have to.
-- **Zero reference:** with the axis disarmed, put it where zero should be and
+- **Zero reference:** with operation disabled, put it where zero should be and
   press *Set position = 0*. On a moteus this is runtime only — it does not
   survive a power cycle unless written to the controller's configuration.
 - **Current trip:** above the current you saw at working torque, below anything
@@ -188,7 +188,7 @@ python test/client/drive.py pos 0.05
 | Board not recognised | genuinely unknown hardware, or a firmware this build cannot read the record from |
 | Accepts commands, does not move | torque ceiling too low — the controller reports "limiting: max torque" |
 | Moves, then trips immediately | position envelope narrower than the move, or a runaway/stall trip set too tight |
-| Cannot re-arm after a trip | the axis coasted outside the envelope; move it back by hand while disarmed, or widen the envelope |
+| Cannot re-enable operation after a trip | the axis coasted outside the envelope; move it back by hand while operation is disabled, or widen the envelope |
 | Loop runs slower than requested | the transport cannot complete a transaction that fast; lower `-rate` |
 
 ## What is verified, and what is not

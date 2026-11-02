@@ -7,7 +7,7 @@
 // drawn separately. They are never the same widget, because a control that
 // snaps to the measurement hides exactly the disagreement worth seeing.
 //
-// The second is that nothing safety-related is drawn optimistically. Armed,
+// The second is that nothing safety-related is drawn optimistically. Operation enabled,
 // e-stopped and faulted are rendered only from state the robot sent. Pressing
 // E-STOP does not paint the machine as stopped; the robot saying it is stopped
 // does.
@@ -36,7 +36,7 @@ async function post(path, payload) {
       say("");
       return true;
     }
-    // A refusal is an answer. "the axis is not armed" is the machine telling
+    // A refusal is an answer. "operation is not enabled" is the machine telling
     // the operator something true, and burying it would be the bug.
     const reply = await response.json().catch(() => ({}));
     say(reply.error || "the robot refused the command", "bad");
@@ -196,9 +196,10 @@ function render(state) {
       node.querySelector(".joint-command").textContent =
         number(joint.position_rad, 3, "rad");
     }
-    slider.disabled = !joint.armed || joint.estop;
+    const enabled = joint.drive_state === "operation_enabled";
+    slider.disabled = !enabled || joint.estop;
 
-    const commandable = joint.armed && !joint.estop;
+    const commandable = enabled && !joint.estop;
     const goal = entry.goal;
     goal.disabled = !commandable;
     node.querySelector(".joint-go").disabled = !commandable;
@@ -221,15 +222,15 @@ function render(state) {
     // render works, the second cannot find it, and the panel freezes on stale
     // numbers while still looking alive. Found in a browser, because that is
     // the only place it exists.
-    const armed = node.querySelector(".joint-armed");
-    armed.textContent = joint.estop ? "e-stopped" : joint.armed ? "armed" : "disarmed";
-    armed.className =
-      "joint-armed pill " +
-      (joint.estop ? "pill-bad" : joint.armed ? "pill-ok" : "pill-off");
+    const drive = node.querySelector(".joint-drive");
+    drive.textContent = joint.estop ? "fault" : enabled ? "operation enabled" : "switched on";
+    drive.className =
+      "joint-drive pill " +
+      (joint.estop ? "pill-bad" : enabled ? "pill-ok" : "pill-off");
 
     const mode = node.querySelector(".joint-mode");
     mode.textContent = joint.mode;
-    mode.className = "joint-mode pill " + (joint.armed ? "pill-ok" : "pill-off");
+    mode.className = "joint-mode pill " + (enabled ? "pill-ok" : "pill-off");
 
     node.querySelector(".joint-position").textContent =
       number(joint.position_rad, 4, "rad");
@@ -478,31 +479,31 @@ async function applyLimits() {
 // twice. Deliberately not a native browser dialog: those block the page, and a
 // panel whose whole job is to keep showing a live machine must not stop
 // rendering because a dialog is open.
-let releaseArmed = null;
+let releasePending = null;
 
 document.getElementById("learn-start").addEventListener("click", async () => {
   const button = document.getElementById("learn-start");
-  if (!releaseArmed) {
+  if (!releasePending) {
     button.textContent = "Press again — the machine goes limp";
-    button.classList.add("btn-arming");
+    button.classList.add("btn-confirming");
     say(
       "This releases every joint. The machine goes limp and will fall under " +
       "its own weight if it is not supported.",
       "bad"
     );
-    releaseArmed = setTimeout(() => {
-      releaseArmed = null;
+    releasePending = setTimeout(() => {
+      releasePending = null;
       button.textContent = "Release & record";
-      button.classList.remove("btn-arming");
+      button.classList.remove("btn-confirming");
       say("");
     }, 5000);
     return;
   }
 
-  clearTimeout(releaseArmed);
-  releaseArmed = null;
+  clearTimeout(releasePending);
+  releasePending = null;
   button.textContent = "Release & record";
-  button.classList.remove("btn-arming");
+  button.classList.remove("btn-confirming");
 
   teachRows.clear();
   teachBuilt = false;

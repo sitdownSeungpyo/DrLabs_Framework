@@ -22,7 +22,7 @@ The parts worth knowing about:
 | `drivers/dynamixel` | control-table unit conversions, per-family current units, watchdog rounding |
 | `transport/fdcanusb` | line framing, DLC padding, the optional CRC-8 checksum mode |
 | `runtime/safety` | every trip, including the cases that must *not* fire |
-| `runtime/session` | the whole stack against the simulator: arming, emergency stop, fault handling, trajectory, shuttle, deadman, auto-arm |
+| `runtime/session` | the whole stack against the simulator: enable operation, quick stop, fault handling, trajectory, shuttle, deadman, auto-enable |
 
 Useful subsets:
 

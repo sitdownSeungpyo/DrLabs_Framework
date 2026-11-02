@@ -253,7 +253,7 @@ fn print_state(robot: &Robot) {
     println!();
     println!(
         "{:<12}{:<8}{:<12}{:<12}{:<10}{:<8}NOTE",
-        "JOINT", "ARMED", "POSITION", "TARGET", "TORQUE", "RATE"
+        "JOINT", "ENABLED", "POSITION", "TARGET", "TORQUE", "RATE"
     );
     for joint in robot.state() {
         let position = joint
@@ -276,7 +276,7 @@ fn print_state(robot: &Robot) {
         println!(
             "{:<12}{:<8}{position:<12}{target:<12}{torque:<10}{rate:<8}{note}",
             joint.name,
-            if joint.armed { "yes" } else { "no" }
+            if joint.operation_enabled { "yes" } else { "no" }
         );
     }
 }

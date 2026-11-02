@@ -64,7 +64,7 @@ const SERVE_FLAGS: &[(&str, Kind)] = &[
     ("position-max", Kind::Value),
     ("command-timeout", Kind::Value),
     ("deadman", Kind::Value),
-    ("no-auto-arm", Kind::Switch),
+    ("no-auto-enable", Kind::Switch),
     ("allow-unknown-board", Kind::Switch),
 ];
 
@@ -87,7 +87,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     let velocity_limit: f64 = flags.number("velocity-limit", 1.0)?;
     let accel_limit: f64 = flags.number("accel-limit", 5.0)?;
     let command_timeout: f64 = flags.number("command-timeout", 1.0)?;
-    let auto_arm = !flags.switch("no-auto-arm");
+    let auto_enable = !flags.switch("no-auto-enable");
     let allow_unknown = flags.switch("allow-unknown-board");
 
     let safety = SafetyConfig {
@@ -104,7 +104,7 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     let session = Session::new(Options {
         safety,
         rate_hz: rate,
-        auto_arm,
+        auto_enable,
         require_acknowledgement: false,
         initial_mode: ControlMode::Position,
         ..Default::default()
@@ -139,10 +139,10 @@ pub fn serve(args: &[String]) -> Result<(), String> {
             format!(" · {}", target.port)
         }
     );
-    if auto_arm {
+    if auto_enable {
         println!("  energising and waiting for commands");
     } else {
-        println!("  auto-arm disabled — send {{\"cmd\":\"arm\"}} to energise");
+        println!("  auto-enable off — send {{\"cmd\":\"enable_operation\"}} to energise");
     }
     println!("  Ctrl+C to stop");
 
@@ -314,7 +314,7 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
             Ok(ok())
         }
         "stop" => {
-            session.disarm("a client asked it to stop");
+            session.disable_operation("a client asked it to stop");
             note_motion(motion, false);
             Ok(ok())
         }
@@ -388,20 +388,20 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
             session.set_params(params);
             Ok(ok())
         }
-        "arm" => session
-            .arm(true)
+        "enable_operation" => session
+            .enable_operation(true)
             .map(|()| ok())
             .map_err(|error| error.to_string()),
-        "disarm" => {
-            session.disarm("a client asked it to disarm");
+        "disable_operation" => {
+            session.disable_operation("a client asked it to disable operation");
             Ok(ok())
         }
-        "estop" => {
-            session.estop("client", "A client raised an emergency stop", "");
+        "quick_stop" => {
+            session.quick_stop("client", "A client raised an emergency stop", "");
             Ok(ok())
         }
-        "reset" => session
-            .reset_estop()
+        "fault_reset" => session
+            .fault_reset()
             .map(|()| ok())
             .map_err(|error| error.to_string()),
         "zero" => {
@@ -434,10 +434,10 @@ fn state_line(session: &Arc<Session>) -> String {
     };
 
     format!(
-        "{{\"state\":true,\"armed\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
+        "{{\"state\":true,\"drive_state\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
           \"position\":{},\"velocity\":{},\"torque\":{},\"current\":{},\"voltage\":{},\
           \"temperature\":{},\"target\":{},\"rate_hz\":{},\"fault\":{},\"cycles\":{}}}",
-        status.armed,
+        serde_json::to_string(status.drive_state.as_str()).unwrap_or_else(|_| "\"\"".into()),
         status.estop.is_some(),
         serde_json::to_string(
             &status
@@ -506,10 +506,10 @@ mod tests {
     /// mangling it on the way out would be the bug.
     #[test]
     fn a_refusal_carries_its_reason_as_valid_json() {
-        let reply = refusal(r#"joint "j1" is not armed"#);
+        let reply = refusal(r#"joint "j1": operation is not enabled"#);
         let parsed: serde_json::Value = serde_json::from_str(&reply).expect("valid JSON");
         assert_eq!(parsed["ok"], false);
-        assert_eq!(parsed["error"], r#"joint "j1" is not armed"#);
+        assert_eq!(parsed["error"], r#"joint "j1": operation is not enabled"#);
     }
 
     /// Whether a command leaves motion standing decides whether the watchdog

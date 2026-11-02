@@ -330,7 +330,7 @@ p { margin: 0.25rem 0 0; }
 
 /* The release button, once it has been pressed and is waiting for the second
    press. It has to look like a different button from the one just pressed. */
-.btn-arming {
+.btn-confirming {
   border-color: #c2554a;
   color: #f0a49b;
 }

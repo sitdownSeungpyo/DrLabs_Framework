@@ -49,7 +49,7 @@ the joint's declared limits every tick, whatever the client sends.
 
 ## The gate
 
-The session's arm/disarm/e-stop state machine, driven by `mode`:
+The session's enable-operation / disable-operation / fault state machine (CiA 402 names, see [ARCHITECTURE.md](ARCHITECTURE.md)), driven by `mode`:
 
 - `OFF` → the axis is read, not driven.
 - `DRIVE` → honoured once the axis passes preflight (telemetry received,

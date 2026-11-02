@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use drlabs_api::{Client, Description};
 use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
-use drlabs_core::AxisStatus;
+use drlabs_core::{AxisStatus, DriveState};
 use drlabs_rt::Config;
 use drlabs_safety::{Blocked, TripCode};
 use drlabs_session::trajectory::Trapezoidal;
@@ -521,10 +521,17 @@ fn state_json(ctx: &Panel) -> String {
             .as_ref()
             .and_then(|state| (joint.index < state.n as usize).then(|| state.state[joint.index]));
         let status = motor.and_then(|m| AxisStatus::from_u8(m.status));
-        let armed = matches!(
+        let operation_enabled = matches!(
             status,
             Some(AxisStatus::Ok | AxisStatus::Alert | AxisStatus::Refused)
         );
+        let drive_state = if !estop_reason.is_empty() {
+            DriveState::Fault
+        } else if motor.is_none() {
+            DriveState::SwitchOnDisabled
+        } else {
+            DriveState::of(true, operation_enabled, false)
+        };
         let position = motor.map(|m| m.q as f64).unwrap_or(f64::NAN);
         // The target is what the panel last asked for, or where the joint
         // is: a tool waiting for "position near target" must not see null.
@@ -548,7 +555,7 @@ fn state_json(ctx: &Panel) -> String {
         joints.push(format!(
             "{{\"name\":{},\"driver\":{},\"bus\":{},\"id\":{},\
               \"min_rad\":{},\"max_rad\":{},\
-              \"armed\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
+              \"drive_state\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
               \"position_rad\":{},\"target_rad\":{},\"torque_nm\":{},\
               \"velocity_rad_s\":{},\"current_a\":{},\"temperature_c\":{},\
               \"voltage_v\":{},\"rate_hz\":{},\"fault_name\":{},\
@@ -559,7 +566,7 @@ fn state_json(ctx: &Panel) -> String {
             joint.id,
             joint.min_rad,
             joint.max_rad,
-            armed,
+            quote(drive_state.as_str()),
             !estop_reason.is_empty(),
             quote(&estop_reason),
             quote(status.map(|s| s.as_str()).unwrap_or("silent")),
@@ -739,7 +746,7 @@ mod tests {
     #[test]
     fn releasing_the_machine_is_confirmed_first() {
         assert!(
-            APP_JS.contains("releaseArmed"),
+            APP_JS.contains("releasePending"),
             "teach mode must ask twice before it releases every joint"
         );
         assert!(
@@ -759,7 +766,7 @@ mod tests {
             "moving_to_rad",
             "position_rad",
             "target_rad",
-            "armed",
+            "operation_enabled",
             "estop",
             "poses",
         ] {
@@ -778,7 +785,7 @@ mod tests {
 
     #[test]
     fn restyling_an_element_keeps_the_class_it_was_found_by() {
-        for marker in ["joint-armed", "joint-mode"] {
+        for marker in ["joint-drive", "joint-mode"] {
             assert!(
                 APP_JS.contains(&format!(".{marker}")),
                 "{marker} is never looked up"

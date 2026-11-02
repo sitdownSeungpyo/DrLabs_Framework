@@ -195,15 +195,17 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
                     check_active_limits(&mut state, &telemetry, period);
                 }
 
-                let armed = state.armed;
+                let operation_enabled = state.operation_enabled;
                 let now = Instant::now();
                 let state = &mut *state;
-                trip = state.monitor.evaluate(&state.telemetry, &command, armed, now);
+                trip = state
+                    .monitor
+                    .evaluate(&state.telemetry, &command, operation_enabled, now);
             }
         }
 
         // Deadman: the supervising client has to keep talking to us.
-        if estop.is_none() && state.armed && state.safety.deadman_timeout > 0.0 {
+        if estop.is_none() && state.operation_enabled && state.safety.deadman_timeout > 0.0 {
             let idle = state.heartbeat_at.elapsed().as_secs_f64();
             if idle > state.safety.deadman_timeout {
                 estop = Some(EStop {
@@ -214,11 +216,11 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
             }
         }
 
-        try_auto_arm(&mut state);
+        try_auto_enable(&mut state);
 
         // Re-assert the full parameter set periodically, so a controller that
         // restarted does not keep running on defaults we never chose.
-        if state.armed && !state.params_dirty {
+        if state.operation_enabled && !state.params_dirty {
             let stale = state
                 .params_sent_at
                 .map(|at| started.duration_since(at) > PARAM_REFRESH)
@@ -262,7 +264,7 @@ pub fn cycle(shared: &Arc<Shared>, period: Duration) {
             let _ = link.close();
         }
         let mut state = shared.state();
-        state.armed = false;
+        state.operation_enabled = false;
         state.connection = Connection::Disconnected;
         state.connect_error = "the link failed mid-cycle and was closed".into();
         state.shuttle.stop("link error");
@@ -283,7 +285,7 @@ pub fn latch_estop(shared: &Arc<Shared>, reason: EStop) {
     }
     state.log(Level::Error, &reason.message, &reason.detail);
     state.estop = Some(reason);
-    state.armed = false;
+    state.operation_enabled = false;
     // Several stop frames rather than one: a single frame can be the one that
     // is lost, and this is the frame that must not be.
     state.stop_burst = 5;
@@ -304,7 +306,7 @@ fn build_command(state: &mut State, period: Duration) -> Command {
         state.stop_burst = state.stop_burst.saturating_sub(1);
         return Command::new(Mode::Stop);
     }
-    if !state.armed {
+    if !state.operation_enabled {
         // Disarmed: watch the axis, do not drive it.
         return Command::new(Mode::Query);
     }
@@ -468,7 +470,7 @@ fn check_active_limits(
     telemetry: &drlabs_core::telemetry::Telemetry,
     period: Duration,
 ) {
-    if !state.armed {
+    if !state.operation_enabled {
         return;
     }
     if !matches!(
@@ -575,16 +577,16 @@ fn check_achieved_rate(
 /// standing in the way.
 ///
 /// Called every cycle rather than once at connect, because the reasons an axis
-/// cannot arm are usually transient — a supply still settling, a controller
+/// cannot enable operation are usually transient — a supply still settling, a controller
 /// still reporting the fault it powered up with — and a servo that gave up on
 /// the first attempt would need a human to notice, which is the thing this role
 /// exists to avoid.
 ///
 /// The one condition it will not wait out is a latched emergency stop. That has
 /// to be cleared deliberately, by whatever decided to raise it.
-fn try_auto_arm(state: &mut State) {
-    if !state.auto_arm
-        || state.armed
+fn try_auto_enable(state: &mut State) {
+    if !state.auto_enable
+        || state.operation_enabled
         || state.estop.is_some()
         || state.connection != Connection::Connected
     {
@@ -600,25 +602,25 @@ fn try_auto_arm(state: &mut State) {
         .monitor
         .preflight(state.identity.as_ref(), &state.telemetry, true);
 
-    if !preflight.may_arm() {
+    if !preflight.may_enable() {
         // Say why, but once a second rather than at the control rate.
         let due = state
-            .auto_arm_reported_at
+            .auto_enable_reported_at
             .map(|at| at.elapsed() > Duration::from_secs(1))
             .unwrap_or(true);
         if due {
-            state.auto_arm_reported_at = Some(Instant::now());
+            state.auto_enable_reported_at = Some(Instant::now());
             let detail = preflight.blocking.join(" ");
-            state.log(Level::Warn, "Waiting to arm", &detail);
+            state.log(Level::Warn, "Waiting to enable operation", &detail);
         }
         return;
     }
 
     state.monitor.reset();
-    state.armed = true;
+    state.operation_enabled = true;
     state.heartbeat_at = Instant::now();
     state.params_dirty = true;
-    state.auto_arm_reported_at = None;
+    state.auto_enable_reported_at = None;
     state.mode = state.initial_mode;
 
     // Adopt the position the axis is already at, so energising is not itself a
@@ -651,7 +653,7 @@ fn try_auto_arm(state: &mut State) {
             units.torque(torque)
         )
     };
-    state.log(Level::Ok, "Armed automatically", &detail);
+    state.log(Level::Ok, "Operation enabled automatically", &detail);
 }
 
 /// Smallest of two, so a session limit never exceeds the safety ceiling.

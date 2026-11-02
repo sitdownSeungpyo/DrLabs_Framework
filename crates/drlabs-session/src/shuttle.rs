@@ -3,7 +3,7 @@
 //!
 //! The sequencer runs inside the control loop rather than in an application on
 //! top of it. That is the whole point: its timing does not depend on a UI
-//! staying responsive, and it stops the instant the axis is disarmed, faulted
+//! staying responsive, and it stops the instant the axis is operation-disabled, faulted
 //! or emergency-stopped, because it is evaluated by the same code that decides
 //! whether to command anything at all.
 //!

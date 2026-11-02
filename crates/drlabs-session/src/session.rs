@@ -12,6 +12,7 @@ use drlabs_core::link::Link;
 use drlabs_core::render::{render, Units};
 use drlabs_core::telemetry::Telemetry;
 use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
+use drlabs_core::DriveState;
 use drlabs_safety::{Config as SafetyConfig, Monitor, Preflight, Preset};
 
 use crate::control_loop::{self, Shared};
@@ -41,11 +42,11 @@ pub struct Options {
     pub sample_buffer: usize,
     pub event_buffer: usize,
 
-    /// Makes [`Session::arm`] refuse until the caller confirms it has shown the
+    /// Makes [`Session::enable_operation`] refuse until the caller confirms it has shown the
     /// operator the preflight advisories.
     ///
-    /// On by default: an arm that cannot be refused is not a checklist.
-    /// [`Options::auto_arm`] turns it off implicitly — there is nobody to
+    /// On by default: an enable that cannot be refused is not a checklist.
+    /// [`Options::auto_enable`] turns it off implicitly — there is nobody to
     /// acknowledge.
     pub require_acknowledgement: bool,
 
@@ -54,16 +55,16 @@ pub struct Options {
     ///
     /// This is the servo role rather than the operator role: the framework is
     /// the low level, something above it decides what the machine does, and an
-    /// axis that needs a human to press Arm first cannot serve that. With it
-    /// set, the loop arms the moment preflight is clear and re-arms if it later
+    /// axis that needs a human to press Enable first cannot serve that. With it
+    /// set, the loop enables operation the moment preflight is clear and re-enables if it later
     /// becomes clear — a supply that was still settling at start-up should not
     /// leave the axis dead until someone notices.
     ///
-    /// It never re-arms through a latched emergency stop. A stop that undid
+    /// It never re-enables through a latched emergency stop. A stop that undid
     /// itself would be worse than no stop at all.
-    pub auto_arm: bool,
+    pub auto_enable: bool,
 
-    /// What an auto-armed session commands once armed. Position holds where the
+    /// What an auto-enabled session commands once operation-enabled. Position holds where the
     /// axis already was: torque on, standing still, waiting.
     pub initial_mode: ControlMode,
 }
@@ -77,7 +78,7 @@ impl Default for Options {
             sample_buffer: 12_000,
             event_buffer: 500,
             require_acknowledgement: true,
-            auto_arm: false,
+            auto_enable: false,
             initial_mode: ControlMode::Position,
         }
     }
@@ -91,7 +92,9 @@ pub struct Status {
     pub link: Vec<(String, String)>,
     pub identity: Option<drlabs_core::link::Identity>,
 
-    pub armed: bool,
+    pub operation_enabled: bool,
+    /// The CiA 402 state the flags below amount to.
+    pub drive_state: DriveState,
     pub estop: Option<EStop>,
     pub mode: ControlMode,
     pub rate_hz: u32,
@@ -149,9 +152,9 @@ impl Session {
             monitor,
             preset: None,
             units: options.units.clone(),
-            armed: false,
-            arm_blockers: Vec::new(),
-            arm_advisories: Vec::new(),
+            operation_enabled: false,
+            enable_blockers: Vec::new(),
+            enable_advisories: Vec::new(),
             estop: None,
             mode: ControlMode::Stop,
             rate_hz: options.rate_hz.clamp(MIN_RATE_HZ, MAX_RATE_HZ),
@@ -164,12 +167,12 @@ impl Session {
             telemetry: Telemetry::default(),
             latched_fault: None,
             last_reply_at: None,
-            // Auto-arm turns acknowledgement off implicitly: there is nobody to
+            // Auto-enable turns acknowledgement off implicitly: there is nobody to
             // acknowledge.
-            require_ack: options.require_acknowledgement && !options.auto_arm,
-            auto_arm: options.auto_arm,
+            require_ack: options.require_acknowledgement && !options.auto_enable,
+            auto_enable: options.auto_enable,
             initial_mode: options.initial_mode,
-            auto_arm_reported_at: None,
+            auto_enable_reported_at: None,
             stats: LoopStats::default(),
             samples: SampleRing::new(options.sample_buffer),
             events,
@@ -281,7 +284,7 @@ impl Session {
             state.link_description = description;
             state.identity = identity;
             state.connection = Connection::Connected;
-            state.armed = false;
+            state.operation_enabled = false;
             state.estop = None;
             state.mode = ControlMode::Stop;
             state.params_dirty = true;
@@ -300,7 +303,7 @@ impl Session {
     pub fn disconnect(&self) -> Result<()> {
         {
             let mut state = self.shared.state();
-            state.armed = false;
+            state.operation_enabled = false;
             state.connection = Connection::Disconnected;
             state.shuttle.stop("disconnected");
             state.trajectory.running = false;
@@ -314,7 +317,7 @@ impl Session {
         Ok(())
     }
 
-    /// What stands between the axis and being armed.
+    /// What stands between the axis and being operation-enabled.
     pub fn preflight(&self) -> Preflight {
         let state = self.shared.state();
         let connected = state.connection == Connection::Connected;
@@ -327,20 +330,20 @@ impl Session {
     ///
     /// `acknowledged` says the caller has shown the operator the preflight
     /// advisories. Without it, and with acknowledgement required, this refuses —
-    /// an arm that cannot be refused is not a checklist.
-    pub fn arm(&self, acknowledged: bool) -> Result<()> {
+    /// an enable that cannot be refused is not a checklist.
+    pub fn enable_operation(&self, acknowledged: bool) -> Result<()> {
         let preflight = self.preflight();
         let mut state = self.shared.state();
 
         if state.estop.is_some() {
             return Err(Error::Refused(
-                "clear the emergency stop before arming".into(),
+                "reset the fault before enabling operation".into(),
             ));
         }
-        state.arm_blockers = preflight.blocking.clone();
-        state.arm_advisories = preflight.advisory.clone();
+        state.enable_blockers = preflight.blocking.clone();
+        state.enable_advisories = preflight.advisory.clone();
 
-        if !preflight.may_arm() {
+        if !preflight.may_enable() {
             return Err(Error::Refused(preflight.blocking.join(" ")));
         }
         if state.require_ack && !acknowledged && !preflight.advisory.is_empty() {
@@ -350,7 +353,7 @@ impl Session {
         }
 
         state.monitor.reset();
-        state.armed = true;
+        state.operation_enabled = true;
         state.heartbeat_at = Instant::now();
         state.params_dirty = true;
         state.mode = state.initial_mode;
@@ -370,52 +373,52 @@ impl Session {
             let units = render(state.units.as_deref());
             format!("holding at {}", units.position(state.setpoint.position))
         };
-        state.log(Level::Ok, "Armed", &detail);
+        state.log(Level::Ok, "Operation enabled", &detail);
         drop(state);
         self.signal();
         Ok(())
     }
 
     /// Releases the axis without latching anything.
-    /// Turns automatic arming on or off while the session is running.
+    /// Turns automatic enabling on or off while the session is running.
     ///
-    /// A robot's joints arm themselves, because there is nobody at the axis to
+    /// A robot's joints enable operation themselves, because there is nobody at the axis to
     /// press a button. That is right for driving and wrong for anything that
-    /// needs the machine to *stay* released: disarming a joint that arms itself
+    /// needs the machine to *stay* released: disabling operation on a joint that enables itself
     /// again on the next cycle is not releasing it, and an operator who was
     /// told the machine is limp would be leaning on a live one.
-    pub fn set_auto_arm(&self, enabled: bool) {
+    pub fn set_auto_enable(&self, enabled: bool) {
         let mut state = self.shared.state();
-        if state.auto_arm == enabled {
+        if state.auto_enable == enabled {
             return;
         }
-        state.auto_arm = enabled;
-        state.auto_arm_reported_at = None;
+        state.auto_enable = enabled;
+        state.auto_enable_reported_at = None;
         drop(state);
         self.signal();
     }
 
-    pub fn auto_arm(&self) -> bool {
-        self.shared.state().auto_arm
+    pub fn auto_enable(&self) -> bool {
+        self.shared.state().auto_enable
     }
 
-    pub fn disarm(&self, reason: &str) {
+    pub fn disable_operation(&self, reason: &str) {
         let mut state = self.shared.state();
-        if !state.armed {
+        if !state.operation_enabled {
             return;
         }
-        state.armed = false;
+        state.operation_enabled = false;
         state.stop_burst = 3;
         state.shuttle.stop("disarmed");
         state.trajectory.running = false;
         state.profile = None;
-        state.log(Level::Info, "Disarmed", reason);
+        state.log(Level::Info, "Operation disabled", reason);
         drop(state);
         self.signal();
     }
 
     /// Latches an emergency stop.
-    pub fn estop(&self, code: &str, message: &str, detail: &str) {
+    pub fn quick_stop(&self, code: &str, message: &str, detail: &str) {
         control_loop::latch_estop(
             &self.shared,
             EStop {
@@ -430,9 +433,9 @@ impl Session {
     /// Clears a latched emergency stop.
     ///
     /// Deliberately explicit: a stop that undid itself would be worse than no
-    /// stop at all. The axis comes back disarmed, so somebody has to arm it
+    /// stop at all. The axis comes back operation-disabled, so somebody has to enable operation
     /// again as well.
-    pub fn reset_estop(&self) -> Result<()> {
+    pub fn fault_reset(&self) -> Result<()> {
         let mut state = self.shared.state();
         if state.estop.is_none() {
             return Ok(());
@@ -449,9 +452,9 @@ impl Session {
         }
         state.estop = None;
         state.latched_fault = None;
-        state.armed = false;
+        state.operation_enabled = false;
         state.monitor.reset();
-        state.log(Level::Ok, "Emergency stop cleared", "the axis is disarmed");
+        state.log(Level::Ok, "Fault reset", "operation is disabled");
         drop(state);
         self.signal();
         Ok(())
@@ -464,10 +467,10 @@ impl Session {
             return Err(Error::Closed);
         }
         if state.estop.is_some() {
-            return Err(Error::Refused("emergency stop is latched".into()));
+            return Err(Error::Refused("a fault is latched; reset it first".into()));
         }
-        if !state.armed && !matches!(mode, ControlMode::Stop | ControlMode::Query) {
-            return Err(Error::Refused("the axis is not armed".into()));
+        if !state.operation_enabled && !matches!(mode, ControlMode::Stop | ControlMode::Query) {
+            return Err(Error::Refused("operation is not enabled".into()));
         }
         Ok(())
     }
@@ -600,16 +603,16 @@ impl Session {
     /// Re-references the output so the axis's current place is called
     /// `position`.
     ///
-    /// Refused while armed: the axis would jump to wherever the old setpoint
+    /// Refused while operation-enabled: the axis would jump to wherever the old setpoint
     /// now points, which is a move nobody asked for.
     pub fn zero_output(&self, position: Rev) -> Result<()> {
         let mut state = self.shared.state();
         if state.connection != Connection::Connected {
             return Err(Error::Closed);
         }
-        if state.armed {
+        if state.operation_enabled {
             return Err(Error::Refused(
-                "disarm before re-referencing the output".into(),
+                "disable operation before re-referencing the output".into(),
             ));
         }
         state.pending_special = Some(Command::new(Mode::SetOutput { position }));
@@ -643,8 +646,8 @@ impl Session {
         self.set_mode(ControlMode::Position)?;
         let mut state = self.shared.state();
 
-        if !state.armed {
-            return Err(Error::Refused("arm the axis first".into()));
+        if !state.operation_enabled {
+            return Err(Error::Refused("enable operation first".into()));
         }
         let start = state
             .telemetry
@@ -713,8 +716,8 @@ impl Session {
     pub fn start_shuttle(&self) -> Result<()> {
         self.set_mode(ControlMode::Position)?;
         let mut state = self.shared.state();
-        if !state.armed {
-            return Err(Error::Refused("arm the axis first".into()));
+        if !state.operation_enabled {
+            return Err(Error::Refused("enable operation first".into()));
         }
         // A profiled move and the shuttle both own the setpoint.
         state.trajectory.running = false;
@@ -762,7 +765,12 @@ impl Session {
             connect_error: state.connect_error.clone(),
             link: state.link_description.clone(),
             identity: state.identity.clone(),
-            armed: state.armed,
+            operation_enabled: state.operation_enabled,
+            drive_state: DriveState::of(
+                state.connection == Connection::Connected,
+                state.operation_enabled,
+                state.estop.is_some(),
+            ),
             estop: state.estop.clone(),
             mode: state.mode,
             rate_hz: state.rate_hz,

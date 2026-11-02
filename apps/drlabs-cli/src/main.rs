@@ -142,7 +142,7 @@ serve flags:
   -command-timeout  seconds of silence after which a velocity or torque
                     command reverts to holding position (default 1, 0 disables)
   -deadman          seconds without a client before stopping (0 disables)
-  -no-auto-arm      connect but do not energise until told to
+  -no-auto-enable   connect but do not energise until told to
 
 panel flags:
   -addr     address to listen on (default 127.0.0.1:8080)

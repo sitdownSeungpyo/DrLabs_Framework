@@ -16,24 +16,24 @@ already was, and listens on `127.0.0.1:7777` for commands.
 drlabs servo on 127.0.0.1:7777
   driver moteus · id 1 · COM5 · 200 Hz
   energising and waiting for commands
-OK    Armed automatically
+OK    Operation enabled automatically
       holding position at 0.0000 rev · torque limit 0.20 Nm
 ```
 
 ## What "running" means here
 
-The operator-facing paths — `drlabs run`, the web UI — start disarmed and make
-someone read a checklist and press Arm. That is right when a human is standing
+The operator-facing paths — `drlabs run`, the web UI — start switched on with torque off, and make
+someone read a checklist and enable operation. That is right when a human is standing
 at a bench. It is wrong for a subordinate layer: an axis that needs a person
 before it will hold position cannot serve anything.
 
-So `serve` sets `session.Options.AutoArm`, and the control loop energises as
+So `serve` sets `Options::auto_enable`, and the control loop energises as
 soon as preflight is clear. Three details make that safe rather than merely
 convenient:
 
-- **Energising is not a move.** On arming, the setpoint adopts the position the
+- **Energising is not a move.** On enabling operation, the setpoint adopts the position the
   axis is already at. Torque comes on and the shaft stays where it is.
-- **It keeps trying.** The reasons an axis cannot arm — a supply still
+- **It keeps trying.** The reasons an axis cannot enable operation — a supply still
   settling, a fault left over from power-up — are usually transient, so the
   loop retries every cycle and says why once a second. A servo that gave up on
   the first attempt would need a human to notice, which is the thing this role
@@ -66,20 +66,20 @@ shell, with no dependency on either side.
 | `{"cmd":"shuttle","a":-0.2,"b":0.2,"dwell":0.5,"cycles":10}` | A↔B run |
 | `{"cmd":"shuttle_stop"}` | end it |
 | `{"cmd":"params","max_torque":0.4,"kp_scale":0.8}` | per-cycle parameters; omitted fields keep their value |
-| `{"cmd":"arm"}` / `{"cmd":"disarm"}` | energise / release |
-| `{"cmd":"estop"}` / `{"cmd":"reset"}` | latch / clear the stop |
-| `{"cmd":"zero"}` | re-reference the output to zero (disarmed only) |
+| `{"cmd":"enable_operation"}` / `{"cmd":"disable_operation"}` | torque on / torque off (CiA 402 *Operation enabled* / *Switched on*) |
+| `{"cmd":"quick_stop"}` / `{"cmd":"fault_reset"}` | latch a fault / clear it; clearing leaves operation disabled |
+| `{"cmd":"zero"}` | re-reference the output to zero (operation disabled only) |
 | `{"cmd":"state"}` | one state line, on demand |
 | `{"cmd":"ping"}` | liveness |
 
 Every reply is `{"type":"reply","ok":true}` or
 `{"type":"reply","ok":false,"error":"…"}`. A refusal is an answer, not a
-failure: `arm the axis first` and `emergency stop is latched` arrive this way.
+failure: `enable operation first` and `a fault is latched; reset it first` arrive this way.
 
 ### State lines
 
 ```json
-{"type":"state","connection":"connected","armed":true,"mode":"position",
+{"type":"state","connection":"connected","drive_state":"operation_enabled","mode":"position",
  "estop":false,"position":0.2501,"velocity":0.0,"torque":0.02,
  "current":-1.6,"voltage":24.0,"temperature":30.5,"fault":0,
  "setpoint_position":0.25,"trajectory_running":false,"rate_hz":199.8}
@@ -89,7 +89,7 @@ Optional measurements are `null` when the driver did not read them, never `0`.
 JSON cannot carry NaN, and a caller that reads a missing temperature as 0 °C
 will draw the wrong conclusion from it.
 
-While disarmed, a `blocked` array carries the preflight reasons — that is where
+While operation is disabled, a `blocked` array carries the preflight reasons — that is where
 a client looks to find out why the axis is not live.
 
 ### A test client
@@ -107,7 +107,7 @@ python test/client/drive.py stop | estop | reset
 
 Every motion command waits for the axis to stop and prints the error against
 what was asked, so a first bench test is one line and a readable answer. It
-refuses to command motion into an axis that is not armed, and says why.
+refuses to command motion into an axis whose operation is not enabled, and says why.
 
 ### A client, in full
 
@@ -168,10 +168,10 @@ Against the simulator at 200 Hz:
 
 | Behaviour | Result |
 |---|---|
-| Energise on start | armed automatically, holding 0.0000 rev |
+| Energise on start | operation enabled automatically, holding 0.0000 rev |
 | `position 0.3`, then `-0.2` | arrived 0.3000, then −0.2000 rev |
 | `velocity 0.4` then silence | reverted to position hold 1.0 s later, at 0.4001 rev |
-| `estop`, wait, `reset` | stayed disarmed under the latch; re-armed unaided after the reset |
+| `quick_stop`, wait, `fault_reset` | stayed in *Fault* under the latch; re-enabled operation unaided after the reset |
 | `trajectory 0.35 @ 0.4 rev/s` | arrived 0.3501 rev, peak 0.396 rev/s |
 | velocity command run into the envelope | tripped `position_envelope` and stopped, as declared |
 

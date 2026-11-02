@@ -15,6 +15,7 @@
 
 pub mod bus;
 pub mod command;
+pub mod drive;
 pub mod error;
 pub mod link;
 pub mod lowlevel;
@@ -24,6 +25,7 @@ pub mod units;
 
 pub use bus::{AxisCmd, AxisFault, AxisReply, AxisStatus, Bus};
 pub use command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
+pub use drive::DriveState;
 pub use error::{Error, Result};
 pub use link::{BoardStatus, Capabilities, Envelope, Identity, Link};
 pub use lowlevel::{LowCmd, LowState, MotorCmd, MotorState, MAX_AXES, PROTOCOL_VERSION};

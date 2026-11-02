@@ -78,7 +78,7 @@ class Monitor:
                     "err": None if pos is None or tgt is None else abs(pos - tgt),
                     "v": j.get("voltage_v"),
                     "estop": bool(j.get("estop")),
-                    "armed": bool(j.get("armed")),
+                    "operation_enabled": j.get("drive_state") == "operation_enabled",
                 }
             self.samples.append(row)
 
@@ -102,7 +102,7 @@ class Monitor:
                         "position": pos, "target": tgt,
                         "err": None if pos is None or tgt is None else abs(pos - tgt),
                         "voltage": j.get("voltage_v"), "rate": j.get("rate_hz"),
-                        "armed": j.get("armed"), "estop": j.get("estop"),
+                        "operation_enabled": j.get("drive_state") == "operation_enabled", "estop": j.get("estop"),
                         "estop_reason": j.get("estop_reason", ""), "fault": j.get("fault_name", ""),
                         "blocked": j.get("blocked", []), "mode": j.get("mode"),
                     })
@@ -286,7 +286,7 @@ async function snapshot() {
   window.quitNeedsToken = !!s.quit_needs_token;
   const tb = $("joints").querySelector("tbody");
   tb.innerHTML = s.joints.map(j => {
-    const state = j.estop ? "e-stop" : j.armed ? "armed" : "disarmed";
+    const state = j.estop ? "fault" : j.operation_enabled ? "operation enabled" : "switched on";
     const errCls = j.err != null && j.err > 0.2 ? "warn" : "";
     const vCls = j.voltage != null && j.voltage > 8 && j.voltage < 11.0 ? "warn" : (j.voltage != null && j.voltage > 8 && j.voltage < 10.3 ? "bad" : "");
     const note = j.estop ? j.estop_reason : (j.blocked && j.blocked.length ? j.blocked.join(" ") : (j.fault && j.fault !== "No fault" ? j.fault : ""));

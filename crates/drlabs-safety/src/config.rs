@@ -209,7 +209,7 @@ impl Config {
     /// that excludes the motor's own rated voltage catches neither, it just
     /// trips the instant the machine is powered. A 5 V servo against a band
     /// inherited from a 12 V controller is not a protected machine, it is one
-    /// that cannot be armed — and an operator who meets that on every connect
+    /// that cannot enable operation — and an operator who meets that on every connect
     /// learns to widen the band by hand, past where they would have stopped.
     ///
     /// A band that already contains the rated supply is left exactly as
@@ -420,7 +420,7 @@ mod tests {
     /// With nothing declared, the motor's own rated range becomes the band.
     ///
     /// The XL330 case this started with: a healthy servo reporting 4.8 V
-    /// against a band inherited from a 12 V bus could not be armed at all.
+    /// against a band inherited from a 12 V bus could not enable operation at all.
     #[test]
     fn an_undeclared_band_is_taken_from_the_hardware() {
         let mut config = Config::default(); // 11..42 V, nobody's choice

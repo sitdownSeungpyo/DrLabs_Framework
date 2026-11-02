@@ -6,7 +6,7 @@
 //! and an allocation is a lock shared with every other thread in the process.
 //!
 //! `Guard` makes the same decisions from the same [`Config`] and reports them
-//! as codes. The thresholds, the debounce timers and the armed/disarmed
+//! as codes. The thresholds, the debounce timers and the enabled/disabled
 //! asymmetry are the ones in `Monitor`, and the tests at the bottom are the
 //! `Monitor` tests re-run against this type so the two cannot drift apart
 //! quietly. The words are put back by whoever reads the code, off the
@@ -101,7 +101,7 @@ pub enum Blocked {
     /// Outside the envelope plus margin: move it back by hand, the drive is
     /// off.
     OutsideEnvelope = 6,
-    /// An emergency stop is latched robot-wide.
+    /// An a fault is latched; reset it first robot-wide.
     Estop = 7,
 }
 
@@ -115,7 +115,7 @@ impl Blocked {
             Blocked::ControllerFault => "controller reports a hard fault",
             Blocked::NoPosition => "output position is invalid",
             Blocked::OutsideEnvelope => "outside the safety envelope; move the axis back by hand",
-            Blocked::Estop => "emergency stop is latched",
+            Blocked::Estop => "a fault is latched; reset it first",
         }
     }
 }
@@ -224,7 +224,7 @@ impl Guard {
     /// Examines one cycle's reply and returns the reason to stop, if there
     /// is one. Refreshes [`Guard::warnings`].
     ///
-    /// `driving` is [`crate::Monitor::evaluate`]'s `armed`: several
+    /// `driving` is [`crate::Monitor::evaluate`]'s `operation_enabled`: several
     /// conditions — being outside the position envelope in particular — are
     /// a reason to refuse driving but not a reason to latch while the drive
     /// is off, because with the drive off the operator's only way to fix it
@@ -539,7 +539,7 @@ mod tests {
         );
     }
 
-    /// The asymmetry that stopped an axis re-arming: the preflight has to
+    /// The asymmetry that stopped an axis re-enabling: the preflight has to
     /// allow the same margin the trip check does, or the layer's own clamped
     /// target leaves the axis unable to drive.
     #[test]

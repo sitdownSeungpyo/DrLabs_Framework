@@ -217,7 +217,7 @@ XL330-M288-T at COM6.
 | both joints at once, per-bus rates | CAN 200 Hz **and** serial 100 Hz, together |
 | flood: poses as fast as a thread can send them | both rates unchanged, nothing tripped |
 | position clamping, both directions | ±5.0 rev commanded → ±0.199 rev against a ±0.2 ceiling |
-| hard kill while armed, then reconnect | re-arms; the latched bus watchdog is cleared |
+| hard kill with operation enabled, then reconnect | re-enables operation; the latched bus watchdog is cleared |
 | the panel, in a browser | both joints driven from sliders, E-STOP and recovery |
 
 The flood row is the one worth reading. In the Go version that exact scenario
@@ -239,7 +239,7 @@ looked broken: the axis held, the loop kept 100 Hz, and the log filled with a
 mismatch that was not one. `nanify` existed; the reader simply never called it.
 
 **A restyled element lost the class it was found by.** Only a browser has this
-one. `render` looked up `.joint-armed`, then assigned `className = "pill
+one. `render` looked up `.joint-armed` (today `.joint-drive`), then assigned `className = "pill
 pill-ok"` — throwing the marker away. The first render worked; every one after
 it hit a null and threw halfway through, so the panel sat on stale numbers with
 its connection pill flickering to "disconnected" while the machine was
@@ -249,7 +249,7 @@ perfectly alive and the server was answering every request with a 200.
 identified the link but never called `open`, which is where a driver takes
 control of what the last session left — a moteus still driving, a Dynamixel
 with a latched watchdog — and where it tunes the transport. The servo answered,
-armed and held position, so nothing reported an error. It just ran at 44 Hz
+enabled operation and held position, so nothing reported an error. It just ran at 44 Hz
 against a 100 Hz configuration, because an unopened port keeps its default
 ten-millisecond read timeout and the loop reads twice a cycle. Opening it took
 the same loop to exactly 100.

@@ -33,7 +33,7 @@ the show does not end. With --launch the panel is stopped and started again
 — after a communication loss the session tears its link down and only a
 fresh bring-up reopens it (crates/drlabs-session/src/control_loop.rs,
 "Reconnecting is the operator's move"). Without --launch the show can only
-POST /api/reset, which is enough for an e-stop the link survived. Either way
+POST /api/fault_reset, which is enough for a stop the link survived. Either way
 the machine is then brought back to the base pose under a profile and the
 interrupted act starts over. Attempts back off 5 → 60 s, so a bus that has
 lost power waits quietly until it is powered again.
@@ -502,7 +502,7 @@ class Supervisor:
         energised."""
         if release:
             try:
-                self.panel.post("/api/estop", {})
+                self.panel.post("/api/quick_stop", {})
                 deadline = time.time() + 3.0
                 while time.time() < deadline:
                     joints = self.panel.get("/api/state")["joints"]
@@ -521,7 +521,7 @@ class Supervisor:
         self.proc = None
 
     def reset_existing(self):
-        r = self.panel.post("/api/reset", {})
+        r = self.panel.post("/api/fault_reset", {})
         if "error" in r:
             raise Interrupted(f"reset refused: {r['error']}")
         self.wait_ready(self.args.reset_timeout)
@@ -535,7 +535,7 @@ class Supervisor:
             attempt += 1
             delay = min(60.0, 5.0 * 2 ** (attempt - 1))
             note("recovery", f"attempt {attempt}: waiting {delay:.0f} s, then "
-                             + ("restarting the panel" if self.owns_panel else "POST /api/reset"))
+                             + ("restarting the panel" if self.owns_panel else "POST /api/fault_reset"))
             time.sleep(delay)
             try:
                 if self.owns_panel:

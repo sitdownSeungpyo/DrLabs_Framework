@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>drlabs_msgs</name>
+  <version>0.1.0</version>
+  <description>
+    The records the DrLabs real-time runtime (`drlabs rt`) exchanges over
+    CycloneDDS. A node using rmw_cyclonedds on the runtime's domain publishes
+    LowCmd on /drlabs/lowcmd and subscribes to LowState on /drlabs/lowstate
+    with these types and no bridge; the runtime hand-writes the same CDR the
+    generated code produces (crates/drlabs-api/src/cdr.rs).
+  </description>
+  <maintainer email="kwj051611@gmail.com">Seungpyo Sun</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

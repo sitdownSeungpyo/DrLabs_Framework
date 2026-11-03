@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The runtime's wire interface: LowCmd/LowState frames over UDP, and a description for clients"
+description = "The runtime's wire interface: LowCmd/LowState as CycloneDDS samples under ROS 2 names, and a description for clients"
 
 [dependencies]
 drlabs-core = { workspace = true }
@@ -13,3 +13,4 @@ drlabs-rt = { workspace = true }
 drlabs-timing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+cyclors = "0.4"

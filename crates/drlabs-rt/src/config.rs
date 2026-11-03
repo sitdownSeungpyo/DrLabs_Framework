@@ -69,9 +69,9 @@ pub struct RtConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
-    /// Where the UDP endpoint listens.
-    #[serde(default = "default_udp")]
-    pub udp: String,
+    /// The DDS domain and topic prefix the runtime serves on.
+    #[serde(default)]
+    pub dds: DdsConfig,
     /// Publish a state record every this many ticks.
     #[serde(default = "default_state_div")]
     pub state_div: u32,
@@ -83,9 +83,29 @@ pub struct ApiConfig {
     pub on_cmd_timeout: String,
 }
 
-fn default_udp() -> String {
-    "127.0.0.1:7700".into()
+/// Where on DDS the records are: `rt/<prefix>/lowcmd`, `…/lowstate`,
+/// `…/describe` on `domain`. A ROS 2 node sees them as `/<prefix>/lowcmd`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DdsConfig {
+    #[serde(default)]
+    pub domain: u32,
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
 }
+
+fn default_prefix() -> String {
+    "drlabs".into()
+}
+
+impl Default for DdsConfig {
+    fn default() -> Self {
+        Self {
+            domain: 0,
+            prefix: default_prefix(),
+        }
+    }
+}
+
 fn default_state_div() -> u32 {
     1
 }
@@ -99,7 +119,7 @@ fn default_on_cmd_timeout() -> String {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            udp: default_udp(),
+            dds: DdsConfig::default(),
             state_div: default_state_div(),
             cmd_timeout_ms: default_cmd_timeout_ms(),
             on_cmd_timeout: default_on_cmd_timeout(),
@@ -983,7 +1003,8 @@ mod tests {
         let config = Config::parse(SHOULDER_PAIR).unwrap();
         assert_eq!(config.rt.deadline_miss_trip, DEFAULT_DEADLINE_MISS_TRIP);
         assert_eq!(config.rt.priority, 0);
-        assert_eq!(config.api.udp, "127.0.0.1:7700");
+        assert_eq!(config.api.dds.domain, 0);
+        assert_eq!(config.api.dds.prefix, "drlabs");
         assert_eq!(config.api.on_cmd_timeout, "hold");
         assert_eq!(config.api.cmd_timeout_ms, 100);
     }

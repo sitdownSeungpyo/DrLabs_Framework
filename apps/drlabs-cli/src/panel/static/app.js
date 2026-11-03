@@ -301,8 +301,8 @@ document.getElementById("go-zero").addEventListener("click", () => {
 });
 
 document.getElementById("estop").addEventListener("click", () =>
-  post("/api/estop", { reason: "the panel's E-STOP was pressed" }));
-document.getElementById("reset").addEventListener("click", () => post("/api/reset"));
+  post("/api/quick_stop", { reason: "the panel's E-STOP was pressed" }));
+document.getElementById("reset").addEventListener("click", () => post("/api/fault_reset"));
 document.getElementById("hold").addEventListener("click", () => post("/api/hold"));
 document.getElementById("stop").addEventListener("click", () => post("/api/stop"));
 

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use drlabs_api::{describe::describe_json, UdpServer};
+use drlabs_api::{describe::describe_json, DdsServer};
 use drlabs_core::lowlevel::{mode, LowCmd, MotorCmd};
 use drlabs_core::AxisStatus;
 use drlabs_rt::{Config, Daemon};
@@ -55,17 +55,19 @@ pub fn rt(args: &[String]) -> Result<(), String> {
     }
 
     let handle = Arc::new(Mutex::new(Daemon::start(&config, &factory)?));
-    let state_period = Duration::from_secs_f64(config.api.state_div.max(1) as f64 / config.rate_hz as f64);
-    let server = UdpServer::start(
-        &config.api.udp,
+    let state_period =
+        Duration::from_secs_f64(config.api.state_div.max(1) as f64 / config.rate_hz as f64);
+    let server = DdsServer::start(
+        config.api.dds.domain,
+        &config.api.dds.prefix,
         Arc::clone(&handle),
         describe_json(&config),
         state_period,
     )
-    .map_err(|error| format!("cannot bind the UDP endpoint {}: {error}", config.api.udp))?;
+    .map_err(|error| format!("cannot start the DDS endpoint: {error}"))?;
     println!(
-        "LowCmd/LowState on udp://{} (state every {:.1} ms)",
-        server.local_addr(),
+        "LowCmd/LowState on {} (state every {:.1} ms)",
+        server.endpoint(),
         state_period.as_secs_f64() * 1e3
     );
     let started = Instant::now();
@@ -149,7 +151,7 @@ pub fn rt(args: &[String]) -> Result<(), String> {
 
     server.stop();
     let handle = Arc::try_unwrap(handle)
-        .map_err(|_| "the UDP server still holds the runtime".to_string())?
+        .map_err(|_| "the DDS server still holds the runtime".to_string())?
         .into_inner()
         .map_err(|_| "the runtime handle was poisoned".to_string())?;
     let mut handle = handle;
@@ -192,10 +194,9 @@ fn factory(
             let mut servos = Vec::with_capacity(joints.len());
             for joint in joints {
                 let profile = match joint.options.get("profile") {
-                    Some(name) => Some(
-                        drlabs_dynamixel::profile::profile_named(name)
-                            .ok_or_else(|| format!("joint {:?}: unknown profile {name:?}", joint.name))?,
-                    ),
+                    Some(name) => Some(drlabs_dynamixel::profile::profile_named(name).ok_or_else(
+                        || format!("joint {:?}: unknown profile {name:?}", joint.name),
+                    )?),
                     None => None,
                 };
                 servos.push((joint.id as u8, profile));

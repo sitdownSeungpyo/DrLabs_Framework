@@ -1,13 +1,12 @@
 //! A Rust client of the runtime, for the tools in this repository that sit
-//! above it (the panel, a bridge). Mirrors `tools/drlabs_client`.
+//! above it (the panel). Mirrors `tools/drlabs_client`.
 //!
-//! States arrive on a reader thread and the latest is kept. The command
-//! record is sticky: [`Client::set`] changes entries, [`Client::send`] ships
-//! the whole record, and a background keep-alive re-sends it so the runtime
-//! never sees the command go stale while the client is alive.
+//! States arrive on Cyclone's receive thread and the latest is kept. The
+//! command record is sticky: [`Client::set`] changes entries, [`Client::send`]
+//! ships the whole record, and a background keep-alive re-sends it so the
+//! runtime never sees the command go stale while the client is alive.
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -16,7 +15,8 @@ use std::time::{Duration, Instant};
 use drlabs_core::lowlevel::{flags, mode, LowCmd, LowState, MotorCmd, MAX_AXES};
 use serde::Deserialize;
 
-use crate::frame::{decode, encode_cmd, encode_describe, Frame};
+use crate::cdr::{decode_describe, decode_state, encode_cmd, names};
+use crate::dds::{DdsError, Participant, Qos, Reader, Topic, Writer};
 
 /// One joint, as the runtime describes it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -72,26 +72,37 @@ struct Shared {
 }
 
 pub struct Client {
-    socket: UdpSocket,
-    server: SocketAddr,
     shared: Arc<Shared>,
-    threads: Vec<JoinHandle<()>>,
+    keeper: Option<JoinHandle<()>>,
+    // Drop order: readers stop first, then the writer, then the participant.
+    _state_reader: Reader,
+    _describe_reader: Reader,
+    cmd_writer: Arc<Writer>,
+    _participant: Participant,
+    endpoint: String,
 }
 
 impl Client {
-    /// Opens a socket to the runtime at `server` and starts listening. Does
-    /// not wait for the runtime to answer; [`Client::describe`] does that.
-    pub fn connect(server: impl ToSocketAddrs, keepalive: Duration) -> std::io::Result<Self> {
-        let server = server
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address"))?;
-        let socket = UdpSocket::bind(if server.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })?;
-        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    /// Joins `domain` and listens under `rt/<prefix>/…`. Does not wait for
+    /// the runtime to be there; [`Client::describe`] does that.
+    pub fn connect(domain: u32, prefix: &str, keepalive: Duration) -> Result<Self, DdsError> {
+        let participant = Participant::new(domain)?;
+        let cmd_topic = Topic::blob(
+            &participant,
+            &names::topic(prefix, "lowcmd"),
+            names::TYPE_LOWCMD,
+        )?;
+        let state_topic = Topic::blob(
+            &participant,
+            &names::topic(prefix, "lowstate"),
+            names::TYPE_LOWSTATE,
+        )?;
+        let describe_topic = Topic::blob(
+            &participant,
+            &names::topic(prefix, "describe"),
+            names::TYPE_DESCRIBE,
+        )?;
+
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
             description: Mutex::new(None),
@@ -100,36 +111,39 @@ impl Client {
             seq: AtomicU32::new(0),
         });
 
-        let reader = {
-            let socket = socket.try_clone()?;
+        let state_reader = {
             let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("drlabs-client-rx".into())
-                .spawn(move || {
-                    let mut buf = vec![0u8; 65536];
-                    while shared.running.load(Ordering::Relaxed) {
-                        let n = match socket.recv_from(&mut buf) {
-                            Ok((n, _)) => n,
-                            Err(_) => continue,
-                        };
-                        match decode(&buf[..n]) {
-                            Ok(Frame::State(state)) => {
-                                *shared.latest.lock().unwrap() = Some((state, Instant::now()));
-                            }
-                            Ok(Frame::DescribeReply(json)) => {
-                                if let Ok(description) = serde_json::from_str::<Description>(json) {
-                                    *shared.description.lock().unwrap() = Some(description);
-                                }
-                            }
-                            _ => {}
+            Reader::new(
+                &participant,
+                &state_topic,
+                &Qos::best_effort(1),
+                Arc::new(move |bytes: &[u8]| {
+                    if let Ok(state) = decode_state(bytes) {
+                        *shared.latest.lock().unwrap() = Some((state, Instant::now()));
+                    }
+                }),
+            )?
+        };
+        let describe_reader = {
+            let shared = Arc::clone(&shared);
+            Reader::new(
+                &participant,
+                &describe_topic,
+                &Qos::latched(),
+                Arc::new(move |bytes: &[u8]| {
+                    if let Ok(json) = decode_describe(bytes) {
+                        if let Ok(description) = serde_json::from_str::<Description>(&json) {
+                            *shared.description.lock().unwrap() = Some(description);
                         }
                     }
-                })?
+                }),
+            )?
         };
+        let cmd_writer = Arc::new(Writer::new(&participant, &cmd_topic, &Qos::best_effort(1))?);
 
         let keeper = {
-            let socket = socket.try_clone()?;
             let shared = Arc::clone(&shared);
+            let writer = Arc::clone(&cmd_writer);
             std::thread::Builder::new()
                 .name("drlabs-client-keepalive".into())
                 .spawn(move || {
@@ -139,10 +153,7 @@ impl Client {
                         let cmd = {
                             let mut cmd = shared.cmd.lock().unwrap();
                             if cmd.n == 0 {
-                                // Nothing commanded yet: just keep the states
-                                // coming.
-                                encode_describe(&mut out);
-                                let _ = socket.send_to(&out, server);
+                                // Nothing commanded yet: nothing to keep fresh.
                                 continue;
                             }
                             cmd.seq = next_seq(&shared.seq);
@@ -150,35 +161,35 @@ impl Client {
                             *cmd
                         };
                         encode_cmd(&cmd, &mut out);
-                        let _ = socket.send_to(&out, server);
+                        let _ = writer.write(&out);
                     }
-                })?
+                })
+                .map_err(|error| DdsError(format!("keepalive thread: {error}")))?
         };
 
         Ok(Self {
-            socket,
-            server,
             shared,
-            threads: vec![reader, keeper],
+            keeper: Some(keeper),
+            _state_reader: state_reader,
+            _describe_reader: describe_reader,
+            cmd_writer,
+            _participant: participant,
+            endpoint: format!("dds domain {domain}, rt/{prefix}"),
         })
     }
 
-    /// Asks for, and waits for, the description.
+    /// Waits for the latched description.
     pub fn describe(&self, timeout: Duration) -> Result<Description, String> {
-        if let Some(description) = self.shared.description.lock().unwrap().clone() {
-            return Ok(description);
-        }
         let deadline = Instant::now() + timeout;
-        let mut out = Vec::new();
-        encode_describe(&mut out);
-        while Instant::now() < deadline {
-            let _ = self.socket.send_to(&out, self.server);
-            std::thread::sleep(Duration::from_millis(100));
+        loop {
             if let Some(description) = self.shared.description.lock().unwrap().clone() {
                 return Ok(description);
             }
+            if Instant::now() >= deadline {
+                return Err(format!("no description on {}", self.endpoint));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        Err(format!("no description from {}", self.server))
     }
 
     /// The latest state and how old it is.
@@ -238,7 +249,7 @@ impl Client {
     }
 
     /// Ships the record with `flags`.
-    pub fn send(&self, flags: u32) -> std::io::Result<()> {
+    pub fn send(&self, flags: u32) -> Result<(), DdsError> {
         let cmd = {
             let mut cmd = self.shared.cmd.lock().unwrap();
             cmd.seq = next_seq(&self.shared.seq);
@@ -247,21 +258,33 @@ impl Client {
         };
         let mut out = Vec::new();
         encode_cmd(&cmd, &mut out);
-        self.socket.send_to(&out, self.server).map(|_| ())
+        self.cmd_writer.write(&out)
     }
 
-    pub fn estop(&self) -> std::io::Result<()> {
-        self.send(flags::ESTOP)
+    /// Latches the robot-wide stop (CiA 402: a quick stop that lands in
+    /// Fault).
+    pub fn quick_stop(&self) -> Result<(), DdsError> {
+        self.send(flags::QUICK_STOP)
     }
 
     /// Clears a latched stop. Every joint is off afterwards.
-    pub fn reset_estop(&self) -> std::io::Result<()> {
+    pub fn fault_reset(&self) -> Result<(), DdsError> {
         self.release_all();
-        self.send(flags::RESET_ESTOP)
+        self.send(flags::FAULT_RESET)
     }
 
-    pub fn server(&self) -> SocketAddr {
-        self.server
+    /// Where this client is listening, for a log line.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.shared.running.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.keeper.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -271,14 +294,5 @@ fn next_seq(seq: &AtomicU32) -> u32 {
         1
     } else {
         next
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.shared.running.store(false, Ordering::Relaxed);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
     }
 }

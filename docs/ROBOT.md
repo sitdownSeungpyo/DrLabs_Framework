@@ -279,7 +279,7 @@ neither has met a real adapter with two controllers on it.
 
 `drlabs rt <robot.json>` (crate `drlabs-rt`, `docs/RT.md`) runs one thread
 per bus and exchanges fixed-size LowCmd/LowState records with clients over
-UDP. `drlabs panel` is now a client of it, with the same HTTP API as before.
+CycloneDDS (UDP until 2026-11-03). `drlabs panel` is now a client of it, with the same HTTP API as before.
 `drlabs bringup` and the per-joint `Session` path remain for single-axis
 tools and are not developed further. The JSON-lines protocol described above
 has no Rust server.

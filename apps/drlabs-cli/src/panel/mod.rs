@@ -35,7 +35,8 @@ const STYLE: &str = include_str!("static/style.css");
 
 const PANEL_FLAGS: &[(&str, Kind)] = &[
     ("addr", Kind::Value),
-    ("rt", Kind::Value),
+    ("domain", Kind::Value),
+    ("prefix", Kind::Value),
     ("check", Kind::Switch),
 ];
 
@@ -48,7 +49,8 @@ pub fn panel(args: &[String]) -> Result<(), String> {
     // authentication, and a machine that can be driven by anything that can
     // reach a port should not be reachable from a network by accident.
     let addr = flags.string("addr", "127.0.0.1:8080");
-    let runtime = flags.string("rt", "127.0.0.1:7700");
+    let domain: u32 = flags.number("domain", 0u32)?;
+    let prefix = flags.string("prefix", "drlabs");
     // The description is optional: it is only needed to write edited limits
     // back. Everything else comes from the runtime.
     let path = flags.positional.first().map(std::path::PathBuf::from);
@@ -60,8 +62,8 @@ pub fn panel(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = Client::connect(runtime.as_str(), Duration::from_millis(50))
-        .map_err(|error| format!("cannot open a socket to {runtime}: {error}"))?;
+    let client = Client::connect(domain, prefix.as_str(), Duration::from_millis(50))
+        .map_err(|error| format!("cannot join DDS domain {domain}: {error}"))?;
     let description = client
         .describe(Duration::from_secs(3))
         .map_err(|error| format!("{error}: is `drlabs rt` running?"))?;
@@ -71,7 +73,7 @@ pub fn panel(args: &[String]) -> Result<(), String> {
         description.robot,
         description.joints.len(),
         description.rate_hz,
-        client.server()
+        client.endpoint()
     );
 
     let listener = TcpListener::bind(&addr).map_err(|error| {
@@ -445,19 +447,19 @@ fn handle(ctx: &Panel, request: &Request) -> Response {
             },
         },
 
-        ("POST", "/api/estop") => {
+        ("POST", "/api/quick_stop") => {
             *ctx.mover.lock().unwrap() = None;
-            match ctx.client.estop() {
+            match ctx.client.quick_stop() {
                 Ok(()) => Response::json("{\"ok\":true}".into()),
                 Err(error) => Response::refused(&error.to_string()),
             }
         }
-        ("POST", "/api/reset") => {
+        ("POST", "/api/fault_reset") => {
             *ctx.mover.lock().unwrap() = None;
             for target in ctx.targets.lock().unwrap().iter_mut() {
                 *target = f64::NAN;
             }
-            match ctx.client.reset_estop() {
+            match ctx.client.fault_reset() {
                 Ok(()) => Response::json("{\"ok\":true}".into()),
                 Err(error) => Response::refused(&error.to_string()),
             }

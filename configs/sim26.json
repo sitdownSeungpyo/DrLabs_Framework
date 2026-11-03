@@ -2,7 +2,7 @@
   "robot": "sim26",
   "rate_hz": 500,
   "rt": { "deadline_miss_trip": 50 },
-  "api": { "udp": "127.0.0.1:7700", "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" },
+  "api": { "dds": { "domain": 0, "prefix": "drlabs" }, "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" },
   "buses": [
     { "name": "simA", "transport": "sim" },
     { "name": "simB", "transport": "sim" }

@@ -60,7 +60,8 @@ apps/
   drlabs-cli/                  probe / run / serve / bringup
   drlabs-panel/                web panel, assets embedded
 configs/                       robot descriptions
-tools/ros2_bridge/             ROS 2 package, stays Python
+tools/ros2/drlabs_msgs/        ROS 2 interface package (.msg only)
+tools/drlabs_client/           Python client on the Eclipse cyclonedds package
 docs/
 ```
 
@@ -254,12 +255,17 @@ against a 100 Hz configuration, because an unopened port keeps its default
 ten-millisecond read timeout and the loop reads twice a cycle. Opening it took
 the same loop to exactly 100.
 
-### One binary, 0.7 MB
+### One binary, 2.1 MB
 
-`cargo build --release` produces a single `drlabs.exe` of 0.7 MB: four drivers,
+`cargo build --release` produces a single `drlabs` executable: four drivers,
 serial and CAN transports for three platforms, the safety layer, the control
-loop, the robot layer, the command line and the web panel with its assets
-compiled in. Nothing else has to be on the target — which was the point.
+loop, the robot layer, the command line, the web panel with its assets
+compiled in, and — since 2026-11-03 — CycloneDDS, statically linked. That
+took the binary from 0.7 MB to 2.1 MB (aarch64 Linux, `rt` profile) and
+added CMake and a C compiler to the build requirements; `cargo zigbuild`
+still cross-builds it from a Mac in about a minute, zig acting as the C
+compiler for Cyclone's CMake step. Nothing else has to be on the target —
+which was the point.
 
 The release binary was run against the live pair, not just built.
 

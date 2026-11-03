@@ -242,10 +242,10 @@ impl BusWorker {
         // Robot-wide flags act once per command, not once per tick.
         if cmd.seq != self.last_cmd_seq {
             self.last_cmd_seq = cmd.seq;
-            if cmd.flags & flags::ESTOP != 0 {
+            if cmd.flags & flags::QUICK_STOP != 0 {
                 self.estop.latch(TripCode::Requested);
             }
-            if cmd.flags & flags::RESET_ESTOP != 0 {
+            if cmd.flags & flags::FAULT_RESET != 0 {
                 self.reset_requested = true;
             }
         }
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(worker.driving(), vec![true; 2]);
 
         let mut stop = drive_all(2, 0.0, 2);
-        stop.flags = flags::ESTOP;
+        stop.flags = flags::QUICK_STOP;
         cmd_tx.publish(Stamped {
             value: stop,
             at: start,
@@ -577,7 +577,7 @@ mod tests {
 
         // Reset, then ask again: the axes come back through the preflight.
         let mut reset = drive_all(2, 0.0, 4);
-        reset.flags = flags::RESET_ESTOP;
+        reset.flags = flags::FAULT_RESET;
         cmd_tx.publish(Stamped {
             value: reset,
             at: start,

@@ -57,9 +57,9 @@ The session's enable-operation / disable-operation / fault state machine (CiA 40
   Until then it stays off and `blocked` says why.
 - A guard trip, `max_consecutive_timeouts` silent ticks on a driven axis,
   `deadline_miss_trip` consecutive late ticks, a transport failure, or the
-  client's ESTOP flag latches a robot-wide stop: every axis gets Stop,
+  client's QUICK_STOP flag latches a robot-wide fault: every axis gets Stop,
   `LowState.estop = 1`, `estop_code` is the `TripCode`.
-- RESET_ESTOP clears the latch. Every axis is then OFF and has to be asked
+- FAULT_RESET clears the latch. Every axis is then OFF and has to be asked
   for again — clearing a stop drives nothing.
 - A `LowCmd` older than `api.cmd_timeout_ms` is stale: `on_cmd_timeout:
   hold` keeps the last `q` with `dq`/`tau` zeroed, `release` turns every
@@ -71,7 +71,7 @@ The robot description from `drlabs-robot` plus two sections, both optional:
 
 ```json
 "rt":  { "cpus": [], "priority": 0, "deadline_miss_trip": 5 },
-"api": { "udp": "127.0.0.1:7700", "state_div": 1, "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" }
+"api": { "dds": { "domain": 0, "prefix": "drlabs" }, "state_div": 1, "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" }
 ```
 
 `buses[].transport` may be `sim`. `rate_hz` up to 1000. At most 64 joints.
@@ -110,42 +110,50 @@ the last two is within what one run shows.
 
 ## The wire
 
-Frames over UDP; `crates/drlabs-api` is the Rust side, `tools/drlabs_client`
-the Python reference. Both pin the same byte-exact test vectors.
+CycloneDDS, under ROS 2 names (since 2026-11-03; before that, UDP frames of
+this crate's own design). `crates/drlabs-api` is the Rust side,
+`tools/drlabs_client` the Python reference, `tools/ros2/drlabs_msgs` the
+ROS 2 interface package whose generated types match these byte for byte.
 
-```
-0   "DLRT"          magic
-4   u16 version     PROTOCOL_VERSION (1)
-6   u16 kind        1 CMD, 2 STATE, 3 DESCRIBE, 4 DESCRIBE_REPLY
-8   payload         CMD: LowCmd header (24 B) + n × MotorCmd (24 B)
-                    STATE: LowState header (40 B) + n × MotorState (28 B)
-                    DESCRIBE: empty
-                    DESCRIBE_REPLY: UTF-8 JSON (joints in record order, limits, poses)
--4  u32 crc32       IEEE (zlib's), over everything before it
-```
+| ROS 2 topic | DDS type | QoS |
+|---|---|---|
+| `/<prefix>/lowcmd` | `drlabs_msgs::msg::dds_::LowCmd_` | best effort, volatile, keep last 4 |
+| `/<prefix>/lowstate` | `drlabs_msgs::msg::dds_::LowState_` | best effort, volatile, keep last 1 |
+| `/<prefix>/describe` | `drlabs_msgs::msg::dds_::Describe_` | reliable, transient local, keep last 1 |
 
-Only the `n` entries in use travel: 26 joints is a 660-byte command and a
-776-byte state. The runtime sends a STATE to every address it has heard a
-frame from in the last two seconds, every `api.state_div` ticks. A client
-with nothing to command keeps the states coming by sending a DESCRIBE now
-and then; `Client` in both languages does this.
+`prefix` is `api.dds.prefix` (`drlabs` by default) and the runtime joins
+`api.dds.domain` (0). On the DDS wire the topic names carry ROS 2's `rt/`
+in front; a ROS 2 node never sees it. The sample body is XCDR1,
+little-endian, with the 4-byte `00 01 00 00` encapsulation header, fields in
+`.msg` order, each primitive aligned to its size from the start of the body
+and fixed arrays laid out whole — so a command is always 1556 bytes and a
+state 1848, whatever `n` says. `crates/drlabs-api/src/cdr.rs` writes that
+by hand; `tools/drlabs_client/tests/test_cdr.py` pins its bytes against the
+Eclipse `cyclonedds` Python package, the same way the moteus frames are
+pinned against the official `moteus` package.
 
-`drlabs rt <robot.json>` serves `api.udp` (default `127.0.0.1:7700`).
+Late samples are dropped, not retried: a command older than the one after
+it is worthless, which is what best-effort QoS says. The description is
+written once and latched, so a client that arrives later still receives it
+without asking. States go out every `api.state_div` ticks.
+
+A ROS 2 node with `rmw_cyclonedds` on the same domain reads and writes these
+directly — see [ROS2.md](ROS2.md). The transport is a client of the daemon's
+handle, not part of it: the bus threads never see DDS.
 
 ## Clients that exist
 
-- `tools/drlabs_client` — Python: `Client`, `move_to` (trapezoid, client side),
-  `hold`, `release`, `estop`/`reset_estop`. `tests/live_sim.py` drives a
+- `tools/drlabs_client` — Python on the Eclipse `cyclonedds` package:
+  `Client(domain, prefix)`, `move_to` (trapezoid, client side), `hold`,
+  `release`, `quick_stop`/`fault_reset`. `tests/live_sim.py` drives a
   simulated runtime end to end.
-- `drlabs panel [-rt host:port] [robot.json]` — the browser panel, now a
-  client of the runtime. Same HTTP API as before (`/api/state`, `/api/pose`,
-  `/api/move`, `/api/hold`, `/api/stop`, `/api/estop`, `/api/reset`,
-  `/api/learn/*`, `/api/limits`), so `tools/demo_*.py` and
-  `tools/show_monitor.py` run unchanged against it. Moves are planned in the
-  panel; `robot.json` is needed only to write edited limits back.
-- `tools/ros2_bridge` — `link.py` speaks the frames through `drlabs_client`;
-  the node's `port` parameter now defaults to 7700. `test/test_link.py`
-  stands up a fake runtime on loopback.
+- `drlabs panel [-domain N] [-prefix name] [robot.json]` — the browser
+  panel, a DDS client of the runtime. HTTP API: `/api/state`, `/api/pose`,
+  `/api/move`, `/api/hold`, `/api/stop`, `/api/quick_stop`,
+  `/api/fault_reset`, `/api/learn/*`, `/api/limits`; `tools/demo_*.py` and
+  `tools/show_monitor.py` use it. Moves are planned in the panel;
+  `robot.json` is needed only to write edited limits back.
+- Any ROS 2 node with `rmw_cyclonedds` and `drlabs_msgs` — no bridge.
 
 ## Real-time scheduling
 

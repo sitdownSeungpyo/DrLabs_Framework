@@ -1,7 +1,7 @@
 """Drives a running ``drlabs rt`` through the client, end to end.
 
     drlabs rt configs/sim26.json          # in one terminal
-    python tools/drlabs_client/tests/live_sim.py [host] [port]
+    python tools/drlabs_client/tests/live_sim.py [domain] [prefix]
 
 Not a unit test: it needs the runtime.  It exercises describe, a profiled
 move, a hold, a release, an e-stop and its reset, and prints what it saw.
@@ -18,9 +18,9 @@ from drlabs_client import Client  # noqa: E402
 
 
 def main() -> int:
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 7700
-    with Client(host, port) as robot:
+    domain = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    prefix = sys.argv[2] if len(sys.argv) > 2 else "drlabs"
+    with Client(domain, prefix) as robot:
         d = robot.describe()
         print(f"{d.robot}: {len(d.joints)} joints at {d.rate_hz} Hz, "
               f"cmd timeout {d.cmd_timeout_ms} ms ({d.on_cmd_timeout})")
@@ -49,13 +49,13 @@ def main() -> int:
 
         robot.command({names[0]: 0.0})
         time.sleep(0.5)
-        robot.estop()
+        robot.quick_stop()
         time.sleep(0.2)
         state = robot.state()
         print(f"e-stop: stopped={state.stopped} ({state.estop_name})")
-        assert state.stopped and state.estop_name == "estop_requested"
+        assert state.stopped and state.estop_name == "quick_stop_requested"
 
-        robot.reset_estop()
+        robot.fault_reset()
         time.sleep(0.2)
         state = robot.state()
         print(f"reset: stopped={state.stopped}, {names[0]} is "

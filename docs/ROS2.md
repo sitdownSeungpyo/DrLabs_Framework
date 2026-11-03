@@ -1,134 +1,89 @@
-# The ROS 2 bridge
+# ROS 2
 
-`ros2/drlabs_bridge` is a ROS 2 package that fronts a running `drlabs bringup`
-server:
+Since 2026-11-03 there is no bridge. `drlabs rt` speaks CycloneDDS under
+ROS 2's own names, so a node built with `rmw_cyclonedds` on the runtime's
+domain publishes and subscribes to the runtime's records directly:
 
 ```
-ROS 2                                   drlabs bringup
-joint_commands  ──┐                  ┌──  JSON lines
-                  ├─> bridge_node ──>┤     over TCP
-joint_states    <─┘                  └──  robot + safety envelope
+ROS 2 node (rmw_cyclonedds)                 drlabs rt
+  /drlabs/lowcmd    ── drlabs_msgs/LowCmd ──▶  bus threads
+  /drlabs/lowstate  ◀─ drlabs_msgs/LowState ─  every api.state_div ticks
+  /drlabs/describe  ◀─ drlabs_msgs/Describe ─  once, latched (JSON)
 ```
 
-```bash
-drlabs bringup examples/robots/humanoid_arm.json &
-ros2 launch drlabs_bridge bridge.launch.py host:=127.0.0.1 port:=7777
-ros2 topic echo /joint_states
-```
+`drlabs` is `api.dds.prefix` in the robot description; the domain is
+`api.dds.domain` (0). The runtime does not run ROS 2 and does not need it
+installed: it hand-writes the same CDR the generated types produce
+(`crates/drlabs-api/src/cdr.rs`, pinned byte for byte in tests).
 
-## Why it is not gRPC
+## The interface package
 
-The design note this replaced planned a gRPC service with a generated proto and
-a Python node on the far side. That would have worked, and it would have cost
-the property the framework is otherwise careful about: `go.mod` has no
-dependencies, and `docs/SERVO.md` describes the command interface as
-"deliberately plain… callable from Python, ROS 2, C++ or a shell, with no
-dependency on either side."
+`tools/ros2/drlabs_msgs` holds the five `.msg` files and nothing else:
 
-gRPC would have added a protobuf toolchain and a runtime to both halves in
-order to expose a command surface that already exists. The bridge speaks the
-protocol that is already there, so the Go side needed no code at all and the
-ROS 2 side needs nothing beyond `rclpy` and the standard message packages.
-
-## What the node is, and is not
-
-It is a **lifecycle node**, because it manages hardware. An axis that is live
-should be live because somebody activated it, and deactivating releases it
-rather than leaving it holding — `release_on_deactivate` is on by default for
-that reason.
-
-It owns no control logic and no limits. The envelope, the trips, the
-trajectory generator and the controller's own watchdog all stay on the far side
-of the socket. The node translates, and is careful about what it claims:
-`operation_enabled` and `estop` are published only from state lines the robot actually
-sent, never from what was commanded.
-
-| | |
+| message | fields |
 |---|---|
-| `joint_states` | `sensor_msgs/JointState`, sensor QoS |
-| `joint_commands` | `sensor_msgs/JointState`, reliable, depth 10 |
-| `~/connection` | `std_msgs/String`, latched — `disconnected`/`connecting`/`ready`/`lost` |
-| `~/estop`, `~/reset` | `std_srvs/Trigger` |
+| `MotorCmd` | `uint8 mode` (0 OFF, 1 DRIVE), `float32 q, dq, kp, kd, tau` |
+| `MotorState` | `float32 q, dq, tau, current, voltage, temp`, `uint16 fault`, `uint8 status, blocked` |
+| `LowCmd` | `uint32 seq, flags`, `uint64 t_ns`, `uint16 n`, `MotorCmd[64] cmd` |
+| `LowState` | `uint32 seq, cmd_seq`, `uint64 tick, t_ns`, `uint32 period_ns, deadline_miss`, `uint16 estop_code`, `uint8 estop`, `uint16 n`, `MotorState[64] state` |
+| `Describe` | `string json` |
 
-A command carrying `position` becomes one `pose` — the whole set of joints in a
-single message, so they are commanded together rather than one per round trip.
-A command carrying only `velocity` becomes one velocity command per joint.
-`NaN` entries are skipped, which is how a command addresses a subset.
-
-Position targets are absolute, so a resend is harmless. That is what makes
-retrying safe on a link that may have dropped mid-write.
-
-State lines are buffered and flushed by a timer at `publish_rate`, not
-republished as they arrive. A 200 Hz robot does not need to wake every ROS
-subscriber 200 times a second.
-
-## Missing measurements stay missing
-
-A driver that did not read a temperature reports `null`, and the bridge
-publishes `NaN` — never zero. `JointState` has no way to say "this joint
-reports no effort", and a consumer that reads a missing torque as zero torque
-draws exactly the wrong conclusion. This is the same rule the JSON protocol
-follows.
-
-## The link is a state machine, because it will drop
-
-`link.py` knows nothing about ROS. It is a supervised connection: connecting →
-ready → lost → connecting, with exponential backoff and jitter, and it
-publishes every transition to `~/connection`. Commands issued while the link is
-down raise rather than being silently dropped.
-
-Two things that only showed up on the bench:
-
-**Closing a socket's file object from another thread deadlocks.**
-`socket.makefile()` returns a buffered reader that holds its own lock while it
-waits for bytes. Closing *it* from the thread that wants to shut the link down
-blocks behind the reader thread sitting inside it — and the reader is waiting
-for data that is never coming, so it blocks forever. `_close_socket` shuts down
-the socket instead, which is what makes the parked read return. Measured
-before: a `stop()` that never returned. After: 0.71 s.
-
-**Asking for the joint roster from the supervisor deadlocks too.** The first
-version sent `{"cmd":"joints"}` right after connecting, from the same thread
-that was about to start reading replies — so nothing was reading, and it timed
-out on every connection. The roster is in every state line anyway, so the
-request is gone and the names come from the stream.
-
-## Verified
-
-`ros2/drlabs_bridge/test/test_link.py` runs on a host with no ROS and no
-hardware: nine tests against a fake bringup server covering the wire format,
-refusals, the disconnect path and reconnection.
+Units are joint space: radians at the output, rad/s, newton-metres at the
+mechanism. `NaN` means not reported. `LowCmd.flags` bit 0 is `QUICK_STOP`
+(latch the robot-wide fault), bit 1 `FAULT_RESET` (clear it; every axis is
+then OFF). The meaning of every field is in [RT.md](RT.md).
 
 ```bash
-cd ros2/drlabs_bridge && pytest test
-```
-
-The link was also driven against a real `drlabs bringup` — connect, roster from
-the stream, `pose` moving two joints, envelope clamping a 99 rad request,
-e-stop and reset, reconnection after the server was killed and restarted, and a
-clean `stop()` with the server gone.
-
-**The node itself is unverified.** No machine with `rclpy` was available, so
-`bridge_node.py` and `bridge.launch.py` have not been run: they are written to
-the ROS 2 conventions but nothing has confirmed the lifecycle transitions, the
-QoS settings or the launch file on a real distro. That is the first thing to do
-on a machine with ROS 2 installed:
-
-```bash
-colcon build --symlink-install --packages-select drlabs_bridge
+cd <your_ws>/src && ln -s <this repo>/tools/ros2/drlabs_msgs .
+cd <your_ws> && colcon build --packages-select drlabs_msgs
 source install/setup.bash
-ros2 launch drlabs_bridge bridge.launch.py
-ros2 topic hz /joint_states        # should match publish_rate
-ros2 topic info -v /joint_states   # QoS endpoints agree
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ```
 
-## 2026-10-27: the bridge now fronts `drlabs rt`
+## Driving it from the command line
 
-The JSON-lines server this document describes was the Go `bringup`; the
-Rust tree never implemented it. The bridge's `link.py` now speaks the
-runtime's LowCmd/LowState frames through `tools/drlabs_client` (see
-`docs/RT.md`), and the node's `port` parameter defaults to 7700. The ROS
-surface — `joint_states`, `joint_commands`, `~/estop`, `~/reset`,
-`~/connection` — is unchanged. Velocity commands are refused: the runtime
-drives position servos in this version. `test/test_link.py` stands up a fake
-runtime on loopback and needs no ROS.
+With `drlabs rt configs/sim26.json` running on the same machine:
+
+```bash
+ros2 topic echo /drlabs/describe --once          # the JSON description
+ros2 topic hz   /drlabs/lowstate                 # the state cadence
+ros2 topic pub -r 100 /drlabs/lowcmd drlabs_msgs/msg/LowCmd \
+  "{seq: 1, n: 1, cmd: [{mode: 1, q: 0.3}]}"    # drive joint 0 to 0.3 rad
+```
+
+The runtime treats a command older than `api.cmd_timeout_ms` as stale (hold
+or release, as configured), so a node has to keep publishing while it wants
+a joint driven — `-r 100` above is not decoration.
+
+## QoS
+
+Match these or the reader will not see the writer:
+
+| topic | reliability | durability | history |
+|---|---|---|---|
+| `lowcmd` | best effort | volatile | keep last |
+| `lowstate` | best effort | volatile | keep last 1 |
+| `describe` | reliable | transient local | keep last 1 |
+
+`lowstate` is what `rclpy.qos.qos_profile_sensor_data` gives. For
+`describe` use `QoSProfile(reliability=RELIABLE, durability=TRANSIENT_LOCAL,
+depth=1)`.
+
+## What has been verified
+
+- A Rust client and the Python client, both on CycloneDDS, against a
+  simulated runtime on this repository's test suite and `live_sim.py`.
+- Not yet: a ROS 2 node. No machine with ROS 2 installed has been pointed at
+  the runtime. The type names and the CDR are what `rmw_cyclonedds` expects,
+  and the Python `cyclonedds` package agrees byte for byte, but until a
+  `ros2 topic echo` has shown a state this section describes an intent.
+
+## Why not a bridge any more
+
+The bridge translated the runtime's UDP frames into `sensor_msgs/JointState`
+and back. It had to be kept in step with two protocols and ran as a third
+process between the controller and the robot. Speaking DDS from the runtime
+removes the process and one of the protocols; the cost is CycloneDDS in the
+binary (2.1 MB instead of 0.7) and CMake in the build. ROS 2's own naming
+was chosen over a private one so that the interop needs no configuration
+beyond the domain id.

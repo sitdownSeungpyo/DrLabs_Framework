@@ -39,12 +39,14 @@ pub mod mode {
 
 /// Robot-wide requests that ride on a [`LowCmd`].
 pub mod flags {
-    /// Latch an emergency stop on every axis now.
-    pub const ESTOP: u32 = 1 << 0;
-    /// Clear a latched emergency stop, if every axis is back inside its
-    /// envelope. Cleared by the runtime once acted on; a client that keeps
-    /// sending it does not keep resetting anything.
-    pub const RESET_ESTOP: u32 = 1 << 1;
+    /// Quick stop: latch the robot-wide fault on every axis now (CiA 402
+    /// *Quick stop*, landing in *Fault* because a stop that undid itself
+    /// would be worse than no stop at all).
+    pub const QUICK_STOP: u32 = 1 << 0;
+    /// Fault reset: clear the latch. Every axis is then OFF and has to be
+    /// asked for again. Acted on once per command sequence number; a client
+    /// that keeps sending it does not keep resetting anything.
+    pub const FAULT_RESET: u32 = 1 << 1;
 }
 
 /// One motor's command for one cycle, in joint space.

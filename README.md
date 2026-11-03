@@ -21,11 +21,15 @@ for brushless controllers and smart servos alike.
 > That brings a two-joint machine up from its description and serves a browser
 > panel to drive it, with nothing installed on the target but the binary.
 
-**No C. No DLLs. No vendor SDKs.** Every protocol — Dynamixel Protocol 2.0, the
-mjlib multiplex register protocol, the RobStride CAN 2.0B protocol, ODrive's
-CANSimple, CAN and CAN-FD framing, the fdcanusb line protocol, and the platform
-serial ports underneath them — is implemented in this repository in safe Rust,
-with the Win32 and termios calls each behind one audited module.
+**No vendor SDKs, and no C on the motor side.** Every protocol — Dynamixel
+Protocol 2.0, the mjlib multiplex register protocol, the RobStride CAN 2.0B
+protocol, ODrive's CANSimple, CAN and CAN-FD framing, the fdcanusb line
+protocol, and the platform serial ports underneath them — is implemented in
+this repository in safe Rust, with the Win32 and termios calls each behind one
+audited module. The one C library in the binary is Eclipse CycloneDDS, which
+carries the runtime's records to clients and to ROS 2; `cyclors` builds it
+from source as part of `cargo build` (CMake and a C compiler are needed for
+that, nothing else).
 
 ```
 cargo build --release
@@ -108,7 +112,7 @@ did not have:
 | `test/webui/` | Browser control panel built on the runtime — see its own README |
 | `examples/` | Runnable programs, `examples/framework` first; `examples/robots/` holds robot descriptions |
 | `legacy/dxl/` | The original single-package Dynamixel SDK, kept working |
-| `ros2/drlabs_bridge/` | ROS 2 bridge — joint_states and joint_commands over the servo protocol |
+| `tools/ros2/drlabs_msgs/` | ROS 2 interface package: the runtime's LowCmd/LowState/Describe as `.msg` files, so a `rmw_cyclonedds` node talks to `drlabs rt` with no bridge |
 | `test/robotui/` | Browser panel with a slider per joint, for driving a robot by hand |
 
 ## Units
@@ -373,7 +377,9 @@ in `docs/MOTEUS.md` and `docs/ROBSTRIDE.md`.
 
 ## Requirements
 
-- Rust 1.75+ (`rustup`); no C toolchain, no vendor SDK
+- Rust 1.75+ (`rustup`), CMake 3.16+ and a C compiler (for CycloneDDS,
+  built from source by the `cyclors` crate); no vendor SDK. Cross-building for
+  the robot PC with `cargo zigbuild` works as before: zig is the C compiler
 - Windows 10/11, Linux (x86_64, aarch64) or macOS (Apple Silicon). All three
   run the test suite in CI; the hardware has so far been exercised from
   Windows only

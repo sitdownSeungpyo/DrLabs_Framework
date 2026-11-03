@@ -1,34 +1,39 @@
-"""The socket, and the things every client needs above it.
+"""The DDS participant, and the things every client needs above it.
 
-The runtime sends a state to whoever has spoken in the last two seconds, so a
-client that only watches still has to say something now and then; ``Client``
-does that with a DESCRIBE when it has nothing else to send.
+The runtime publishes its description once, latched, so a client gets it
+without asking; states arrive on Cyclone's own thread and the latest is
+kept.  The command record is sticky: ``set`` changes some joints and
+``send`` ships the whole record, so a joint not mentioned keeps what it was
+last given.
 """
 
 from __future__ import annotations
 
 import json
-import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
 
+from cyclonedds.core import Listener, Policy, Qos
+from cyclonedds.domain import DomainParticipant
+from cyclonedds.pub import DataWriter
+from cyclonedds.sub import DataReader
+from cyclonedds.topic import Topic
+from cyclonedds.util import duration
+
 from . import motion
-from .codec import (
-    DESCRIBE_REPLY,
+from .types import (
     DRIVE,
-    ESTOP,
+    FAULT_RESET,
     OFF,
-    RESET_ESTOP,
-    STATE,
+    QUICK_STOP,
+    Describe,
     LowCmd,
     LowState,
     MotorCmd,
     MotorState,
-    decode,
-    encode_cmd,
-    encode_describe,
+    topic_name,
 )
 
 
@@ -83,20 +88,26 @@ class Description:
         return [joint.name for joint in self.joints]
 
 
-class Client:
-    """A UDP client of ``drlabs rt``.
+#: Latest wins, as the runtime's own QoS says.
+BEST_EFFORT = Qos(Policy.Reliability.BestEffort, Policy.Durability.Volatile,
+                  Policy.History.KeepLast(1))
+#: The description: written once, kept for whoever turns up later.
+LATCHED = Qos(Policy.Reliability.Reliable(duration(seconds=10)),
+              Policy.Durability.TransientLocal, Policy.History.KeepLast(1))
 
-    States arrive on a reader thread and the latest is kept; commands go out
-    when a method is called.  The command record is sticky: ``set`` changes
-    some joints and ``send`` ships the whole record, so a joint not mentioned
-    keeps what it was last given.
+
+class Client:
+    """A CycloneDDS client of ``drlabs rt``.
+
+    ``domain`` and ``prefix`` are the runtime's ``api.dds`` settings (0 and
+    ``drlabs`` by default): the topics are ``rt/<prefix>/lowcmd``,
+    ``…/lowstate`` and ``…/describe``.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7700,
+    def __init__(self, domain: int = 0, prefix: str = "drlabs",
                  timeout: float = 2.0) -> None:
-        self.address = (host, port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.settimeout(0.2)
+        self.domain = domain
+        self.prefix = prefix
         self._timeout = timeout
         self._lock = threading.Lock()
         self._cmd = LowCmd()
@@ -105,19 +116,28 @@ class Client:
         self._latest_at = 0.0
         self._description: Optional[Description] = None
         self._described = threading.Event()
-        self._running = threading.Event()
-        self._running.set()
-        self._reader = threading.Thread(target=self._read, name="drlabs-client", daemon=True)
-        self._reader.start()
+
+        self._participant = DomainParticipant(domain)
+        self._cmd_topic = Topic(self._participant, topic_name(prefix, "lowcmd"), LowCmd)
+        self._state_topic = Topic(self._participant, topic_name(prefix, "lowstate"), LowState)
+        self._describe_topic = Topic(self._participant, topic_name(prefix, "describe"), Describe)
+        self._writer = DataWriter(self._participant, self._cmd_topic, qos=BEST_EFFORT)
+        self._state_reader = DataReader(
+            self._participant, self._state_topic, qos=BEST_EFFORT,
+            listener=Listener(on_data_available=self._on_state))
+        self._describe_reader = DataReader(
+            self._participant, self._describe_topic, qos=LATCHED,
+            listener=Listener(on_data_available=self._on_describe))
 
     # --- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
-        self._running.clear()
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+        for entity in (self._state_reader, self._describe_reader, self._writer):
+            try:
+                del entity
+            except Exception:  # noqa: BLE001 — closing is best effort
+                pass
+        self._participant = None  # type: ignore[assignment]
 
     def __enter__(self) -> "Client":
         return self
@@ -128,15 +148,14 @@ class Client:
     # --- description ------------------------------------------------------
 
     def describe(self, timeout: Optional[float] = None) -> Description:
-        """Asks the runtime what it is driving.  Cached after the first answer."""
+        """The machine's description.  Latched by the runtime, so it arrives
+        on its own; this only waits for it."""
         if self._description is not None:
             return self._description
-        deadline = time.monotonic() + (timeout or self._timeout)
-        while time.monotonic() < deadline:
-            self._sock.sendto(encode_describe(), self.address)
-            if self._described.wait(0.25) and self._description is not None:
-                return self._description
-        raise TimeoutError(f"no description from {self.address[0]}:{self.address[1]}")
+        if self._described.wait(timeout or self._timeout) and self._description is not None:
+            return self._description
+        raise TimeoutError(f"no description on domain {self.domain}, rt/{self.prefix}: "
+                           "is `drlabs rt` running?")
 
     @property
     def description(self) -> Description:
@@ -154,7 +173,6 @@ class Client:
         while time.monotonic() < deadline:
             if self._latest is not None and time.monotonic() - self._latest_at <= max_age:
                 return self._latest
-            self._keepalive()
             time.sleep(0.002)
         raise TimeoutError("no fresh state from the runtime")
 
@@ -163,7 +181,6 @@ class Client:
         while time.monotonic() < deadline:
             if self._latest is not None:
                 return self._latest
-            self._keepalive()
             time.sleep(0.02)
         raise TimeoutError("no state from the runtime")
 
@@ -187,7 +204,7 @@ class Client:
         """Changes some joints' entries in the command record without sending it."""
         description = self.describe()
         with self._lock:
-            self._ensure_entries(len(description.joints))
+            self._cmd.n = max(self._cmd.n, len(description.joints))
             for name, q in targets.items():
                 entry = self._cmd.cmd[description.index(name)]
                 entry.mode = mode
@@ -202,8 +219,9 @@ class Client:
             self._cmd.seq = self._seq
             self._cmd.flags = flags
             self._cmd.t_ns = time.monotonic_ns()
-            data = encode_cmd(self._cmd)
-        self._sock.sendto(data, self.address)
+            sample = LowCmd(seq=self._cmd.seq, flags=flags, t_ns=self._cmd.t_ns,
+                            n=self._cmd.n, cmd=[MotorCmd(**vars(e)) for e in self._cmd.cmd])
+        self._writer.write(sample)
 
     def command(self, targets: Dict[str, float], **kw) -> None:
         """``set`` then ``send``."""
@@ -215,7 +233,7 @@ class Client:
         description = self.describe()
         names = list(names) if names is not None else description.names
         with self._lock:
-            self._ensure_entries(len(description.joints))
+            self._cmd.n = max(self._cmd.n, len(description.joints))
             for name in names:
                 self._cmd.cmd[description.index(name)].mode = OFF
         self.send()
@@ -227,15 +245,16 @@ class Client:
         self.command({name: current[name] for name in names
                       if current[name] == current[name]})  # not NaN
 
-    def estop(self) -> None:
-        self.send(flags=ESTOP)
+    def quick_stop(self) -> None:
+        """Latches the robot-wide fault (CiA 402 quick stop)."""
+        self.send(flags=QUICK_STOP)
 
-    def reset_estop(self) -> None:
-        """Clears a latched stop.  Every joint is off afterwards."""
+    def fault_reset(self) -> None:
+        """Clears a latched fault.  Every joint is off afterwards."""
         with self._lock:
             for entry in self._cmd.cmd:
                 entry.mode = OFF
-        self.send(flags=RESET_ESTOP)
+        self.send(flags=FAULT_RESET)
 
     # --- motion -----------------------------------------------------------
 
@@ -243,49 +262,26 @@ class Client:
                 accel: float = 1.0, rate_hz: float = 200.0,
                 settle_tolerance: float = 0.03, settle_timeout: float = 5.0) -> None:
         """A profiled move: streams trapezoidal setpoints until every joint
-        arrives.  Raises on an e-stop."""
+        arrives.  Raises on a latched fault."""
         motion.move_to(self, targets, max_velocity, accel, rate_hz,
                        settle_tolerance, settle_timeout)
 
     def move_to_pose(self, name: str, **kw) -> None:
         self.move_to(self.describe().poses[name], **kw)
 
-    # --- internals --------------------------------------------------------
+    # --- internals (Cyclone's thread) -------------------------------------
 
-    def _ensure_entries(self, n: int) -> None:
-        while len(self._cmd.cmd) < n:
-            self._cmd.cmd.append(MotorCmd())
-
-    def _keepalive(self) -> None:
-        """Say something so the runtime keeps sending states."""
-        self._sock.sendto(encode_describe(), self.address)
-
-    def _read(self) -> None:
-        # A description for sixty-four joints is well over 4 kB; a datagram
-        # larger than the buffer is an error on Windows, not a truncation.
-        buf = bytearray(65536)
-        while self._running.is_set():
-            try:
-                n, _ = self._sock.recvfrom_into(buf)
-            except socket.timeout:
-                continue
-            except OSError:
-                # Windows reports an ICMP "port unreachable" from an earlier
-                # send as an error on the next receive. The socket is fine.
-                if not self._running.is_set():
-                    return
-                time.sleep(0.01)
-                continue
-            try:
-                kind, payload = decode(bytes(buf[:n]))
-            except ValueError:
-                continue
-            if kind == STATE:
-                self._latest = payload
+    def _on_state(self, reader: DataReader) -> None:
+        for sample in reader.take(1):
+            if isinstance(sample, LowState):
+                self._latest = sample
                 self._latest_at = time.monotonic()
-            elif kind == DESCRIBE_REPLY:
+
+    def _on_describe(self, reader: DataReader) -> None:
+        for sample in reader.take(1):
+            if isinstance(sample, Describe):
                 try:
-                    self._description = Description.from_json(payload)
+                    self._description = Description.from_json(sample.json)
                     self._described.set()
                 except (ValueError, KeyError, TypeError):
                     continue

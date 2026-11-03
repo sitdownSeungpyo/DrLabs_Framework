@@ -10,7 +10,7 @@
 //!
 //! An emergency stop is robot-wide. Any bus thread may latch it; every bus
 //! thread reads it each tick and stops its axes. It clears only on a client's
-//! explicit `RESET_ESTOP`, and clearing it does not drive anything: every
+//! explicit `FAULT_RESET`, and clearing it does not drive anything: every
 //! axis is back to `OFF` and has to be asked for again.
 
 use std::sync::atomic::{AtomicU8, Ordering};

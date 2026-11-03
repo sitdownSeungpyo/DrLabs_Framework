@@ -104,7 +104,7 @@ Usage:
   drlabs bringup [flags] <robot.json>
                                      Bring a whole machine up from a
                                      description and hold it there
-  drlabs panel   [-addr host:port] [-rt host:port] [robot.json]
+  drlabs panel   [-addr host:port] [-domain N] [-prefix name] [robot.json]
                                      A browser panel on a running `drlabs rt`;
                                      robot.json only for writing edited limits
   drlabs serve   [flags]             The servo role: energise one axis and take

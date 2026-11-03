@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DrLabs Framework 아키텍처</title>
+<meta name="description" content="DrLabs Framework의 크레이트 계층, 관절/모터 공간 변환, Session과 rt 두 실행 경로, bring-up 워크플로우, 안전 계층, 드라이버 검증 상태와 타임라인. docs/ARCHITECTURE.md의 시각 자료판.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  html { color-scheme: light; }
+  body { margin: 0; font-size: 14px; }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+  /* Layout: one reading column of figures and short tables; every figure scrolls sideways on a phone. */
+  :root {
+    --bg: #f7f8f6;
+    --surface: #ffffff;
+    --fg: #1d2520;
+    --muted: #5d6862;
+    --line: #cfd6d1;
+    --accent: #1f6f78;
+    --accent-soft: #d9ecee;
+    --warm: #8a5a1c;
+    --warm-soft: #f3e7d3;
+    --danger: #b3392c;
+    --danger-soft: #f6e0dc;
+    --font-body: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Noto Sans KR", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151a18; --surface: #1d2422; --fg: #e3e8e4; --muted: #99a59e; --line: #37423d;
+      --accent: #5fb7c0; --accent-soft: #1b3a3e; --warm: #d9a45c; --warm-soft: #3a2e1c;
+      --danger: #e5786a; --danger-soft: #42231f;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151a18; --surface: #1d2422; --fg: #e3e8e4; --muted: #99a59e; --line: #37423d;
+    --accent: #5fb7c0; --accent-soft: #1b3a3e; --warm: #d9a45c; --warm-soft: #3a2e1c;
+    --danger: #e5786a; --danger-soft: #42231f;
+    color-scheme: dark;
+  }
+  body {
+    background: var(--bg); color: var(--fg); font-family: var(--font-body);
+    font-size: 15px; line-height: 1.65;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 32px 64px;
+  }
+  main { max-width: 940px; margin: 0 auto; display: grid; gap: 44px; }
+  header { display: grid; gap: 10px; }
+  .eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-size: 30px; font-weight: 600; margin: 0; line-height: 1.25; text-wrap: balance; }
+  h2 { font-size: 20px; font-weight: 600; margin: 0; text-wrap: balance; }
+  h3 { font-size: 15px; font-weight: 600; margin: 0; }
+  p { margin: 0; max-width: 70ch; }
+  p.lead { color: var(--muted); font-size: 16px; }
+  section { display: grid; gap: 14px; }
+  figure { margin: 0; display: grid; gap: 10px; }
+  .frame { overflow-x: auto; border: 1px solid var(--line); background: var(--surface); border-radius: 6px; padding: 14px; }
+  .frame svg { display: block; width: 100%; height: auto; min-width: 600px; max-width: 100%; }
+  figcaption { font-size: 13.5px; color: var(--muted); max-width: 74ch; }
+  code { font-family: var(--font-mono); font-size: .9em; background: var(--accent-soft); padding: 1px 5px; border-radius: 3px; }
+  pre { font-family: var(--font-mono); font-size: 13px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; margin: 0; line-height: 1.5; }
+  .mono { font-family: var(--font-mono); font-size: .92em; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: 12.5px; letter-spacing: .04em; }
+  td.num { text-align: right; }
+  .tbl-wrap { overflow-x: auto; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 20px; }
+  .cols > div { min-width: 0; display: grid; gap: 8px; align-content: start; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .fact { border-top: 2px solid var(--accent); padding-top: 8px; display: grid; gap: 2px; }
+  .fact b { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .fact span { font-size: 12.5px; color: var(--muted); }
+  .pill { display: inline-block; font-family: var(--font-mono); font-size: 11.5px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); white-space: nowrap; }
+  .pill.ok { color: var(--accent); border-color: var(--accent); }
+  .pill.warn { color: var(--warm); border-color: var(--warm); }
+  .pill.bad { color: var(--danger); border-color: var(--danger); }
+  ul { margin: 0; padding-left: 20px; max-width: 72ch; }
+  li { margin: 3px 0; }
+  /* SVG */
+  svg text { font-family: var(--font-body); font-size: 12.5px; fill: currentColor; }
+  svg text.m { font-family: var(--font-mono); font-size: 11.5px; }
+  svg text.s { font-size: 11px; fill: var(--muted); }
+  svg text.t { font-weight: 600; }
+  svg text.acc { fill: var(--accent); }
+  svg text.warm { fill: var(--warm); }
+  svg text.bad { fill: var(--danger); }
+  svg .box { fill: var(--surface); stroke: currentColor; stroke-width: 1.2; }
+  svg .band { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+  svg .soft { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+  svg .hot { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  svg .warmbox { fill: var(--warm-soft); stroke: var(--warm); stroke-width: 1.2; }
+  svg .badbox { fill: var(--danger-soft); stroke: var(--danger); stroke-width: 1.4; }
+  svg .edge { stroke: currentColor; stroke-width: 1.2; fill: none; }
+  svg .edge.acc { stroke: var(--accent); stroke-width: 1.6; }
+  svg .edge.bad { stroke: var(--danger); }
+  svg .edge.dash { stroke-dasharray: 4 3; }
+  svg .dot { fill: var(--accent); }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">DrLabs_Framework · develop @ 9aea469 · 2026-11-02</div>
+    <h1>DrLabs Framework: 구조와 워크플로우</h1>
+    <p class="lead">여러 제조사의 모터를 하나의 API로 다루는 순수 Rust 모터 제어 프레임워크입니다. 로봇은 JSON 설명서 한 장과 실행 파일 하나입니다. 이 페이지는 현재 구현된 것을 계층, 데이터 흐름, 실행 경로, 작업 순서, 검증 상태 순으로 보여줍니다.</p>
+    <div class="facts">
+      <div class="fact"><b>14</b><span>워크스페이스 크레이트</span></div>
+      <div class="fact"><b>527</b><span>통과 테스트 (하드웨어 없이)</span></div>
+      <div class="fact"><b>4 + 1</b><span>드라이버 (moteus, Dynamixel, RobStride, ODrive) + 시뮬레이터</span></div>
+      <div class="fact"><b>3</b><span>호스트 OS: Windows, Linux, macOS</span></div>
+      <div class="fact"><b>0</b><span>C 코드, DLL, 벤더 SDK</span></div>
+    </div>
+  </header>
+
+  <section>
+    <h2>1. 계층 — 크레이트가 쌓인 모양</h2>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 940 560" role="img" aria-label="위에서 아래로 외부 클라이언트, CLI 앱, 런타임 크레이트(session, robot, rt, api), safety와 timing, 벤더 중립 이음새인 core, 드라이버 다섯, transport, 하드웨어 순으로 쌓인 계층 그림. core 위는 관절 공간, 아래는 모터 공간이며 변환은 robot과 rt의 Mapping에서만 일어난다.">
+          <defs>
+            <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+
+          <!-- row 0: outside the binary -->
+          <rect class="band" x="20" y="16" width="820" height="54" rx="4"/>
+          <text class="s" x="30" y="34">바이너리 밖 · 클라이언트</text>
+          <rect class="box" x="180" y="26" width="150" height="34" rx="3"/>
+          <text x="255" y="48" text-anchor="middle">tools/drlabs_client (Py)</text>
+          <rect class="box" x="345" y="26" width="120" height="34" rx="3"/>
+          <text x="405" y="48" text-anchor="middle">브라우저 panel</text>
+          <rect class="box" x="480" y="26" width="140" height="34" rx="3"/>
+          <text x="550" y="48" text-anchor="middle">ROS 2 노드 (drlabs_msgs)</text>
+          <rect class="box" x="635" y="26" width="190" height="34" rx="3"/>
+          <text x="730" y="48" text-anchor="middle">demo_show · demo_circle</text>
+
+          <!-- row 1: apps -->
+          <rect class="band" x="20" y="84" width="820" height="54" rx="4"/>
+          <text class="s" x="30" y="102">apps/drlabs-cli</text>
+          <text class="s" x="30" y="118">3 160 줄</text>
+          <rect class="box" x="180" y="94" width="645" height="34" rx="3"/>
+          <text class="m" x="502" y="116" text-anchor="middle">ports · drivers · probe · run · serve · bringup · rt · panel</text>
+
+          <!-- row 2: runtime -->
+          <rect class="band" x="20" y="152" width="820" height="72" rx="4"/>
+          <text class="s" x="30" y="170">런타임</text>
+          <rect class="box" x="180" y="162" width="150" height="52" rx="3"/>
+          <text class="t" x="255" y="182" text-anchor="middle">drlabs-session</text>
+          <text class="s" x="255" y="200" text-anchor="middle">단일 축 루프 · 궤적 · 셔틀</text>
+          <rect class="box" x="345" y="162" width="150" height="52" rx="3"/>
+          <text class="t" x="420" y="182" text-anchor="middle">drlabs-robot</text>
+          <text class="s" x="420" y="200" text-anchor="middle">JSON → 기계 · Mapping</text>
+          <rect class="hot" x="510" y="162" width="150" height="52" rx="3"/>
+          <text class="t" x="585" y="182" text-anchor="middle">drlabs-rt</text>
+          <text class="s" x="585" y="200" text-anchor="middle">버스당 RT 스레드 · 게이트</text>
+          <rect class="box" x="675" y="162" width="150" height="52" rx="3"/>
+          <text class="t" x="750" y="182" text-anchor="middle">drlabs-api</text>
+          <text class="s" x="750" y="200" text-anchor="middle">CycloneDDS · CDR · 클라이언트</text>
+
+          <!-- row 3: safety / timing -->
+          <rect class="band" x="20" y="238" width="820" height="54" rx="4"/>
+          <text class="s" x="30" y="256">횡단 관심사</text>
+          <rect class="box" x="180" y="248" width="315" height="34" rx="3"/>
+          <text x="337" y="270" text-anchor="middle"><tspan class="t">drlabs-safety</tspan>  envelope clamp · Guard 트립 · preflight</text>
+          <rect class="box" x="510" y="248" width="315" height="34" rx="3"/>
+          <text x="667" y="270" text-anchor="middle"><tspan class="t">drlabs-timing</tspan>  sleep_until · Resolution · rt::promote</text>
+
+          <!-- row 4: core seam -->
+          <rect class="hot" x="20" y="306" width="820" height="54" rx="4"/>
+          <text class="t acc" x="30" y="326">drlabs-core</text>
+          <text class="s" x="30" y="344">유일한 벤더 중립 이음새</text>
+          <text class="m" x="502" y="328" text-anchor="middle">Link (1축)  ·  Bus (N축)  ·  Command · Telemetry  ·  LowCmd · LowState</text>
+          <text class="m" x="502" y="346" text-anchor="middle">Rev / Rad / Nm / RevPerSec 타입  ·  Option 대신 NaN 없음  ·  Field::Unchanged</text>
+
+          <!-- row 5: drivers -->
+          <rect class="band" x="20" y="374" width="820" height="72" rx="4"/>
+          <text class="s" x="30" y="392">crates/drivers</text>
+          <rect class="box" x="180" y="384" width="118" height="52" rx="3"/>
+          <text class="t" x="239" y="404" text-anchor="middle">moteus</text>
+          <text class="s" x="239" y="422" text-anchor="middle">multiplex · CAN-FD</text>
+          <rect class="box" x="310" y="384" width="118" height="52" rx="3"/>
+          <text class="t" x="369" y="404" text-anchor="middle">dynamixel</text>
+          <text class="s" x="369" y="422" text-anchor="middle">Protocol 2.0 · 6 461 줄</text>
+          <rect class="box" x="440" y="384" width="118" height="52" rx="3"/>
+          <text class="t" x="499" y="404" text-anchor="middle">robstride</text>
+          <text class="s" x="499" y="422" text-anchor="middle">CAN 2.0B · RS00–06</text>
+          <rect class="box" x="570" y="384" width="118" height="52" rx="3"/>
+          <text class="t" x="629" y="404" text-anchor="middle">odrive</text>
+          <text class="s" x="629" y="422" text-anchor="middle">CANSimple · 미검증</text>
+          <rect class="soft" x="700" y="384" width="125" height="52" rx="3"/>
+          <text class="t" x="762" y="404" text-anchor="middle">drlabs-sim</text>
+          <text class="s" x="762" y="422" text-anchor="middle">PD + 관성 · 2 kHz 적분</text>
+
+          <!-- row 6: transport -->
+          <rect class="band" x="20" y="460" width="820" height="54" rx="4"/>
+          <text class="s" x="30" y="478">drlabs-transport</text>
+          <rect class="box" x="180" y="470" width="250" height="34" rx="3"/>
+          <text x="305" y="492" text-anchor="middle">serial: Win32 · termios · IOSSIOSPEED</text>
+          <rect class="box" x="445" y="470" width="120" height="34" rx="3"/>
+          <text x="505" y="492" text-anchor="middle">can (CAN / FD)</text>
+          <rect class="box" x="580" y="470" width="245" height="34" rx="3"/>
+          <text x="702" y="492" text-anchor="middle">fdcanusb 라인 프로토콜 · 체크섬</text>
+
+          <!-- row 7: hardware -->
+          <text class="s" x="30" y="544">하드웨어</text>
+          <text class="m" x="305" y="544" text-anchor="middle">U2D2 → XL330 / MX / P 시리즈</text>
+          <text class="m" x="505" y="544" text-anchor="middle">RobStride 액추에이터</text>
+          <text class="m" x="702" y="544" text-anchor="middle">fdcanusb → moteus r4.11 (qdd100)</text>
+
+          <!-- space bracket on the right -->
+          <line class="edge acc" x1="870" y1="20" x2="870" y2="222"/>
+          <line class="edge acc" x1="862" y1="20" x2="878" y2="20"/>
+          <text class="s acc" x="880" y="110">관절 공간</text>
+          <text class="s acc" x="880" y="126">rad · 기구 Nm</text>
+          <line class="edge" x1="870" y1="306" x2="870" y2="546"/>
+          <line class="edge" x1="862" y1="546" x2="878" y2="546"/>
+          <text class="s" x="880" y="420">모터 공간</text>
+          <text class="s" x="880" y="436">rev · 로터 Nm</text>
+          <rect class="warmbox" x="848" y="240" width="88" height="52" rx="3"/>
+          <text class="s warm" x="892" y="260" text-anchor="middle">변환점 1곳</text>
+          <text class="s warm" x="892" y="276" text-anchor="middle">Mapping</text>
+          <line class="edge dash" x1="848" y1="266" x2="662" y2="266" marker-end="url(#a1)"/>
+        </svg>
+      </div>
+      <figcaption>core 위는 관절 공간, 아래는 모터 공간입니다. 변환은 robot과 rt가 공유하는 <code>Mapping</code> 한 곳에서만 일어나고, 단위는 <code>Rev</code>·<code>Rad</code>·<code>Nm</code> 타입이라 컴파일 시점에 섞이지 않습니다. 드라이버는 core와 transport에만 의존하고, 런타임은 드라이버 안을 모릅니다.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>2. 두 공간, 한 변환점 — 숫자 하나가 어떻게 바뀌는가</h2>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 920 300" role="img" aria-label="관절 명령 0.5 rad, 6 Nm가 Mapping(기어비 6, 방향 -1, 오프셋 0.1 rad)을 지나 모터 명령 -0.382 rev, 1 Nm가 되고, 드라이버가 이를 와이어 인코딩으로 바꾼다. 텔레메트리는 반대 방향으로 같은 Mapping을 지난다.">
+          <defs>
+            <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <!-- joint command -->
+          <rect class="box" x="20" y="50" width="200" height="96" rx="4"/>
+          <text class="t" x="120" y="72" text-anchor="middle">관절 명령 (클라이언트)</text>
+          <text class="m" x="120" y="94" text-anchor="middle">r_sh_p</text>
+          <text class="m" x="120" y="112" text-anchor="middle">q = 0.500 rad</text>
+          <text class="m" x="120" y="130" text-anchor="middle">tau ≤ 6.0 Nm (기구)</text>
+          <line class="edge" x1="220" y1="98" x2="290" y2="98" marker-end="url(#a2)"/>
+
+          <!-- mapping -->
+          <rect class="warmbox" x="290" y="30" width="300" height="136" rx="4"/>
+          <text class="t warm" x="440" y="52" text-anchor="middle">Mapping (robot.json 세 숫자)</text>
+          <text class="m" x="310" y="76">gear_ratio 6.0 · direction −1 · offset_rad 0.1</text>
+          <text class="s" x="310" y="98">위치: (q − offset) × dir × gear ÷ 2π</text>
+          <text class="s" x="310" y="116">속도: dq × dir × gear ÷ 2π  (오프셋 없이)</text>
+          <text class="s" x="310" y="134">토크: tau ÷ gear  (반대 방향으로)</text>
+          <text class="s" x="310" y="152">한계도 같은 식으로 모터 공간 Guard 설정이 됨</text>
+          <line class="edge" x1="590" y1="98" x2="660" y2="98" marker-end="url(#a2)"/>
+
+          <!-- motor command -->
+          <rect class="box" x="660" y="50" width="200" height="96" rx="4"/>
+          <text class="t" x="760" y="72" text-anchor="middle">모터 명령 (드라이버 입력)</text>
+          <text class="m" x="760" y="94" text-anchor="middle">position −0.382 rev</text>
+          <text class="m" x="760" y="112" text-anchor="middle">torque ≤ 1.0 Nm (로터)</text>
+          <text class="s" x="760" y="130" text-anchor="middle">드라이버가 레지스터 값으로 인코딩</text>
+
+          <!-- telemetry back -->
+          <line class="edge dash" x1="660" y1="200" x2="590" y2="200" marker-end="url(#a2)"/>
+          <line class="edge dash" x1="290" y1="200" x2="220" y2="200" marker-end="url(#a2)"/>
+          <rect class="box" x="660" y="176" width="200" height="48" rx="4"/>
+          <text class="m" x="760" y="196" text-anchor="middle">Telemetry: rev, rev/s, Nm, A, V, °C</text>
+          <text class="s" x="760" y="214" text-anchor="middle">없는 값은 Option::None, 0이 아님</text>
+          <rect class="warmbox" x="290" y="176" width="300" height="48" rx="4"/>
+          <text class="s warm" x="440" y="196" text-anchor="middle">같은 Mapping, 역방향</text>
+          <text class="s warm" x="440" y="214" text-anchor="middle">rev → rad, 로터 Nm → 기구 Nm</text>
+          <rect class="box" x="20" y="176" width="200" height="48" rx="4"/>
+          <text class="m" x="120" y="196" text-anchor="middle">MotorState q, dq, tau …</text>
+          <text class="s" x="120" y="214" text-anchor="middle">관절 라디안으로 보고</text>
+
+          <text class="s" x="20" y="262">같은 축이 같은 순간에 0.477 rev이면서 3.000 rad일 수 있습니다. 공간이 빠진 숫자는 사실이 아닙니다.</text>
+          <text class="s" x="20" y="282">토크를 거꾸로 곱하면 한계가 36배 느슨해지므로, 이 방향에는 전용 테스트가 있습니다.</text>
+        </svg>
+      </div>
+      <figcaption>기어비, 방향, 영점 오프셋은 모두 bring-up이 측정해서 설명서에 적는 값입니다. 상위 계층은 <code>r_sh_p</code>가 어느 포트의 어떤 모터인지 모른 채 라디안으로 말합니다.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>3. 두 실행 경로 — Session과 rt</h2>
+    <p>같은 core, 같은 드라이버 위에 실행 경로가 둘 있습니다. 하나는 축 하나를 사람이 또는 상위 프로그램이 다루는 Session 경로, 다른 하나는 기계 전체를 고정 주기로 도는 rt 런타임입니다. 2026-10-27부터 다관절은 rt가 맡고, Session 경로는 단일 축 도구용으로 남아 있습니다.</p>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 940 400" role="img" aria-label="왼쪽 Session 경로: 클라이언트가 TCP JSON 라인으로 서버에 명령하고, 관절마다 Session 스레드가 상태 기계와 궤적을 품은 채 Link.cycle로 와이어에 나간다. 오른쪽 rt 경로: 클라이언트가 UDP로 LowCmd 바이너리 레코드를 보내고, 버스마다 BusWorker 스레드 하나가 게이트와 가드를 거쳐 Bus.cycle로 와이어에 나가며, 궤적은 클라이언트가 만든다.">
+          <defs>
+            <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <!-- column headers -->
+          <text class="t" x="230" y="26" text-anchor="middle">Session 경로 · drlabs run / serve / bringup</text>
+          <text class="t acc" x="710" y="26" text-anchor="middle">rt 경로 · drlabs rt + panel</text>
+          <line class="edge dash" x1="470" y1="10" x2="470" y2="390"/>
+
+          <!-- left column -->
+          <rect class="box" x="130" y="44" width="200" height="40" rx="4"/>
+          <text x="230" y="68" text-anchor="middle">클라이언트 (사람 · Python · ROS 2)</text>
+          <line class="edge" x1="230" y1="84" x2="230" y2="112" marker-end="url(#a3)"/>
+          <text class="m" x="240" y="102">TCP :7777 · JSON 한 줄씩 · 상태 50 Hz</text>
+
+          <rect class="box" x="60" y="112" width="340" height="140" rx="4"/>
+          <text class="t" x="230" y="134" text-anchor="middle">Session (관절마다 스레드 1개)</text>
+          <rect class="soft" x="76" y="146" width="150" height="40" rx="3"/>
+          <text class="s" x="151" y="162" text-anchor="middle">상태 기계</text>
+          <text class="s" x="151" y="178" text-anchor="middle">switched on → op. enabled → mode</text>
+          <rect class="soft" x="234" y="146" width="150" height="40" rx="3"/>
+          <text class="s" x="309" y="162" text-anchor="middle">궤적 · 셔틀 (루프 안)</text>
+          <text class="s" x="309" y="178" text-anchor="middle">disarm 즉시 같이 멈춤</text>
+          <rect class="soft" x="76" y="196" width="308" height="40" rx="3"/>
+          <text class="s" x="230" y="212" text-anchor="middle">safety Monitor · 레이트 실링 · 통계(p95)</text>
+          <text class="s" x="230" y="228" text-anchor="middle">공유 버스는 뮤텍스로 직렬화 (주기 안에서만 위상 정렬)</text>
+
+          <line class="edge" x1="230" y1="252" x2="230" y2="282" marker-end="url(#a3)"/>
+          <text class="m" x="240" y="272">Link::cycle(cmd, profile)</text>
+          <rect class="box" x="130" y="282" width="200" height="36" rx="4"/>
+          <text x="230" y="304" text-anchor="middle">드라이버 Link (축 1개)</text>
+          <line class="edge" x1="230" y1="318" x2="230" y2="346" marker-end="url(#a3)"/>
+          <rect class="box" x="130" y="346" width="200" height="36" rx="4"/>
+          <text x="230" y="368" text-anchor="middle">와이어</text>
+
+          <!-- right column -->
+          <rect class="box" x="610" y="44" width="200" height="40" rx="4"/>
+          <text x="710" y="68" text-anchor="middle">클라이언트 (궤적은 여기서 생성)</text>
+          <line class="edge acc" x1="710" y1="84" x2="710" y2="112" marker-end="url(#a3)"/>
+          <text class="m" x="720" y="102">CycloneDDS · rt/drlabs/lowcmd · ROS 2 타입명</text>
+
+          <rect class="hot" x="540" y="112" width="340" height="140" rx="4"/>
+          <text class="t acc" x="710" y="134" text-anchor="middle">rt 데몬 (버스마다 스레드 1개)</text>
+          <rect class="soft" x="556" y="146" width="150" height="40" rx="3"/>
+          <text class="s" x="631" y="162" text-anchor="middle">게이트</text>
+          <text class="s" x="631" y="178" text-anchor="middle">mode OFF / DRIVE + preflight</text>
+          <rect class="soft" x="714" y="146" width="150" height="40" rx="3"/>
+          <text class="s" x="789" y="162" text-anchor="middle">Guard (문자열 없음)</text>
+          <text class="s" x="789" y="178" text-anchor="middle">로봇 전체 e-stop 래치</text>
+          <rect class="soft" x="556" y="196" width="308" height="40" rx="3"/>
+          <text class="s" x="710" y="212" text-anchor="middle">트리플 버퍼 · 틱 경로에 락·할당 없음</text>
+          <text class="s" x="710" y="228" text-anchor="middle">SCHED_FIFO / time-constraint · deadline 미스 트립</text>
+
+          <line class="edge acc" x1="710" y1="252" x2="710" y2="282" marker-end="url(#a3)"/>
+          <text class="m" x="720" y="272">Bus::cycle(cmds[], replies[])</text>
+          <rect class="box" x="610" y="282" width="200" height="36" rx="4"/>
+          <text x="710" y="304" text-anchor="middle">드라이버 Bus (축 N개, 호출 1회)</text>
+          <line class="edge acc" x1="710" y1="318" x2="710" y2="346" marker-end="url(#a3)"/>
+          <rect class="box" x="610" y="346" width="200" height="36" rx="4"/>
+          <text x="710" y="368" text-anchor="middle">와이어 (sync write 1 + read 1)</text>
+        </svg>
+      </div>
+      <figcaption>차이는 네 가지입니다. 스레드 단위가 관절에서 버스로, 프로토콜이 TCP JSON에서 DDS 고정 레코드로, 궤적 생성이 루프 안에서 클라이언트로, e-stop이 축 단위에서 로봇 전체 래치로 바뀌었습니다. Dynamixel 15축 체인에서 관절별 왕복이 8축 근처에서 무너진 것이 이 전환의 직접적인 이유입니다.</figcaption>
+    </figure>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th></th><th>Session 경로</th><th>rt 경로</th></tr></thead>
+        <tbody>
+          <tr><td>명령</td><td class="mono">drlabs run · serve · bringup</td><td class="mono">drlabs rt · panel (클라이언트)</td></tr>
+          <tr><td>드라이버 트레이트</td><td class="mono">Link: cycle(cmd, profile) → Telemetry</td><td class="mono">Bus: cycle(&amp;[AxisCmd], &amp;mut [AxisReply])</td></tr>
+          <tr><td>Bus 구현 현황</td><td>moteus · dynamixel · robstride · odrive · sim</td><td>dynamixel · robstride · sim (moteus는 아직 Link만)</td></tr>
+          <tr><td>프로토콜</td><td>JSON lines / TCP, 상태 50 Hz</td><td>CycloneDDS, ROS 2 타입명(drlabs_msgs), 최대 64축</td></tr>
+          <tr><td>궤적</td><td>루프 안 (trajectory, shuttle)</td><td>클라이언트 (Python Client.move_to, panel)</td></tr>
+          <tr><td>실시간</td><td>1 ms 타이머 + 스핀, 레이트 실링</td><td>위에 더해 SCHED_FIFO · mlockall · 코어 고정 (Linux), time-constraint (macOS)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. 워크플로우 — 모르는 모터에서 돌아가는 로봇까지</h2>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 940 250" role="img" aria-label="왼쪽에서 오른쪽으로: 기계 준비, ports로 어댑터 찾기, probe로 식별(stop만 보냄), 낮은 첫 엔벌로프 결정, 사람이 보는 첫 동작, 한계와 영점 학습, robot.json 작성, rt -check 검증, rt 실행, 클라이언트 접속. 첫 동작 전까지 버스에 나가는 명령은 stop뿐이다.">
+          <defs>
+            <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <!-- safe zone band -->
+          <rect class="band" x="20" y="40" width="380" height="110" rx="4"/>
+          <text class="s acc" x="30" y="58">버스에는 stop만 나간다</text>
+          <rect class="warmbox" x="410" y="40" width="240" height="110" rx="4"/>
+          <text class="s warm" x="420" y="58">사람이 보고 있어야 한다</text>
+          <rect class="band" x="660" y="40" width="260" height="110" rx="4"/>
+          <text class="s" x="670" y="58">설명서가 진실이 된다</text>
+
+          <!-- steps: 9 boxes, w 86, gap 10 -->
+          <g>
+            <rect class="box" x="30" y="72" width="86" height="60" rx="3"/>
+            <text class="t" x="73" y="94" text-anchor="middle">0 준비</text>
+            <text class="s" x="73" y="110" text-anchor="middle">가동 범위 · 전원</text>
+            <text class="s" x="73" y="124" text-anchor="middle">CAN 종단</text>
+
+            <rect class="box" x="126" y="72" width="86" height="60" rx="3"/>
+            <text class="t" x="169" y="94" text-anchor="middle">1 ports</text>
+            <text class="s" x="169" y="110" text-anchor="middle">어댑터 찾기</text>
+            <text class="s" x="169" y="124" text-anchor="middle">cu.* 노드</text>
+
+            <rect class="box" x="222" y="72" width="86" height="60" rx="3"/>
+            <text class="t" x="265" y="94" text-anchor="middle">2 probe</text>
+            <text class="s" x="265" y="110" text-anchor="middle">보드 · 전압 · 위치</text>
+            <text class="s" x="265" y="124" text-anchor="middle">replies 100 %?</text>
+
+            <rect class="box" x="318" y="72" width="76" height="60" rx="3"/>
+            <text class="t" x="356" y="94" text-anchor="middle">3 첫 한계</text>
+            <text class="s" x="356" y="110" text-anchor="middle">0.05 Nm</text>
+            <text class="s" x="356" y="124" text-anchor="middle">±0.3 rad</text>
+
+            <rect class="box" x="420" y="72" width="106" height="60" rx="3"/>
+            <text class="t" x="473" y="94" text-anchor="middle">4 첫 동작</text>
+            <text class="s" x="473" y="110" text-anchor="middle">panel에서 enable operation</text>
+            <text class="s" x="473" y="124" text-anchor="middle">0.1 rad 스텝 · 방향 기록</text>
+
+            <rect class="box" x="536" y="72" width="104" height="60" rx="3"/>
+            <text class="t" x="588" y="94" text-anchor="middle">5 학습</text>
+            <text class="s" x="588" y="110" text-anchor="middle">손으로 범위 · 영점</text>
+            <text class="s" x="588" y="124" text-anchor="middle">토크 상한 · 달성 rate</text>
+
+            <rect class="hot" x="670" y="72" width="76" height="60" rx="3"/>
+            <text class="t acc" x="708" y="94" text-anchor="middle">robot.json</text>
+            <text class="s" x="708" y="110" text-anchor="middle">buses · joints</text>
+            <text class="s" x="708" y="124" text-anchor="middle">limits · rt · api</text>
+
+            <rect class="box" x="756" y="72" width="72" height="60" rx="3"/>
+            <text class="t" x="792" y="94" text-anchor="middle">rt -check</text>
+            <text class="s" x="792" y="110" text-anchor="middle">열지 않고</text>
+            <text class="s" x="792" y="124" text-anchor="middle">엄격 검증</text>
+
+            <rect class="box" x="838" y="72" width="72" height="60" rx="3"/>
+            <text class="t" x="874" y="94" text-anchor="middle">rt 실행</text>
+            <text class="s" x="874" y="110" text-anchor="middle">DDS domain 0</text>
+            <text class="s" x="874" y="124" text-anchor="middle">클라이언트</text>
+          </g>
+          <g>
+            <line class="edge" x1="116" y1="102" x2="126" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="212" y1="102" x2="222" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="308" y1="102" x2="318" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="394" y1="102" x2="420" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="526" y1="102" x2="536" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="640" y1="102" x2="670" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="746" y1="102" x2="756" y2="102" marker-end="url(#a4)"/>
+            <line class="edge" x1="828" y1="102" x2="838" y2="102" marker-end="url(#a4)"/>
+          </g>
+          <!-- what each stage yields -->
+          <text class="s" x="30" y="180">단계가 내는 숫자 →  port(1) · id(2) · 방향과 "겨우 움직이는 토크"(4) · 토크 상한 · 위치 엔벌로프 · 영점(5) · 달성 rate(5)</text>
+          <text class="s" x="30" y="200">그 숫자가 들어가는 곳 →  joints[].bus / id / direction / offset_rad / limits{min_rad, max_rad, max_torque_nm, max_velocity_rad_s, max_accel_rad_s2} / rate_hz</text>
+          <text class="s" x="30" y="228">각 단계는 앞 단계가 증명한 것 안에서만 안전합니다. 모르는 보드는 -allow-unknown-board 없이는 멈춥니다. 응답률이 100 % 아래면 배선부터 고칩니다.</text>
+        </svg>
+      </div>
+      <figcaption>bring-up은 명령이 아니라 절차입니다. 결과물은 robot.json 한 장이고, 그 뒤로는 <code>drlabs rt robot.json</code> 하나로 기계가 올라옵니다. 설명서 로더는 빠진 기어비, ±1이 아닌 방향, 빈 가동 범위, 중복 주소를 전부 거부합니다.</figcaption>
+    </figure>
+    <div class="cols">
+      <div>
+        <h3>설명서의 모양</h3>
+<pre>{
+  "robot": "right_arm", "rate_hz": 500,
+  "rt":  { "priority": 80, "deadline_miss_trip": 50 },
+  "api": { "dds": { "domain": 0, "prefix": "drlabs" },
+           "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" },
+  "buses": [
+    { "name": "dxl0", "transport": "serial",
+      "port": "COM3", "baud": 4000000 } ],
+  "joints": [
+    { "name": "r_wri_p", "bus": "dxl0",
+      "driver": "dynamixel", "id": 11,
+      "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+      "limits": { "min_rad": -1.2, "max_rad": 1.2,
+                  "max_torque_nm": 1.5,
+                  "max_velocity_rad_s": 4.0 } } ]
+}</pre>
+      </div>
+      <div>
+        <h3>저장소에 있는 설명서</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>파일</th><th class="num">관절</th><th class="num">Hz</th><th>용도</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">single_moteus.json</td><td class="num">1</td><td class="num">200</td><td>벤치 qdd100</td></tr>
+              <tr><td class="mono">single_xl330.json</td><td class="num">1</td><td class="num">100</td><td>벤치 XL330</td></tr>
+              <tr><td class="mono">bench_pair.json</td><td class="num">2</td><td class="num">100</td><td>두 벤더 한 기계</td></tr>
+              <tr><td class="mono">shoulder_pair.json</td><td class="num">2</td><td class="num">100</td><td>어깨 2축</td></tr>
+              <tr><td class="mono">humanoid_arm.json</td><td class="num">5</td><td class="num">100</td><td>팔 예제</td></tr>
+              <tr><td class="mono">ubp15.json / ubp.json</td><td class="num">15 / 16</td><td class="num">10</td><td>UBP 상체, 쇼 데모</td></tr>
+              <tr><td class="mono">sim_arm.json</td><td class="num">3</td><td class="num">100</td><td>bringup 시뮬</td></tr>
+              <tr><td class="mono">sim26.json</td><td class="num">26</td><td class="num">500</td><td>rt 데몬 부하 시험</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5. 안전 — 두 층, 그리고 Fault 래치</h2>
+    <p>상태와 동사는 CiA 402 이름을 씁니다. switched on(토크 off) → operation enabled(토크 on), 트립이나 quick stop이면 fault, <code>fault_reset</code>으로만 풀리고 풀려도 switched on입니다. 2026-11-02에 "armed" 어휘를 전부 이것으로 바꿨습니다.</p>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 940 300" role="img" aria-label="명령은 호스트 안전층에서 엔벌로프로 clamp된 뒤 와이어로 나가 컨트롤러 펌웨어의 보드 보호를 지나 모터에 닿는다. 텔레메트리는 반대로 돌아와 Guard가 지속 시간이 있는 트립을 평가하고, 트립이면 로봇 전체 e-stop이 래치되어 다음 틱부터 Stop이 나간다. preflight는 차단 사유와 권고를 구분한다.">
+          <defs>
+            <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+            <marker id="a5b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--danger)"/>
+            </marker>
+          </defs>
+          <!-- forward path -->
+          <rect class="box" x="20" y="60" width="130" height="56" rx="4"/>
+          <text x="85" y="84" text-anchor="middle">setpoint</text>
+          <text class="s" x="85" y="102" text-anchor="middle">클라이언트가 보낸 값</text>
+          <line class="edge" x1="150" y1="88" x2="200" y2="88" marker-end="url(#a5)"/>
+
+          <rect class="hot" x="200" y="40" width="260" height="96" rx="4"/>
+          <text class="t acc" x="330" y="62" text-anchor="middle">호스트 안전층 · 기계를 지킨다</text>
+          <text class="s" x="330" y="82" text-anchor="middle">위치 엔벌로프 · 토크 상한 · 속도 · 가속으로 clamp</text>
+          <text class="s" x="330" y="100" text-anchor="middle">조작자가 선언, 컨트롤러 설정에는 절대 쓰지 않음</text>
+          <text class="s" x="330" y="118" text-anchor="middle">와치독 · 프로파일 레지스터는 limits에서 매 틱</text>
+          <line class="edge" x1="460" y1="88" x2="510" y2="88" marker-end="url(#a5)"/>
+          <text class="s" x="485" y="78" text-anchor="middle">와이어</text>
+
+          <rect class="box" x="510" y="40" width="240" height="96" rx="4"/>
+          <text class="t" x="630" y="62" text-anchor="middle">컨트롤러 펌웨어 · 보드를 지킨다</text>
+          <text class="s" x="630" y="82" text-anchor="middle">과·저전압 · 과열 · 위치 바운드</text>
+          <text class="s" x="630" y="100" text-anchor="middle">명령 와치독 (두 번째 층)</text>
+          <text class="s" x="630" y="118" text-anchor="middle">그대로 둔다, 대체하지 않는다</text>
+          <line class="edge" x1="750" y1="88" x2="800" y2="88" marker-end="url(#a5)"/>
+          <rect class="box" x="800" y="60" width="120" height="56" rx="4"/>
+          <text x="860" y="84" text-anchor="middle">모터 · 기어 · 기구</text>
+          <text class="s" x="860" y="102" text-anchor="middle">제조사 밖의 물건</text>
+
+          <!-- return path -->
+          <line class="edge dash" x1="860" y1="116" x2="860" y2="190" marker-end="url(#a5)"/>
+          <text class="s" x="868" y="156">telemetry</text>
+          <rect class="box" x="560" y="190" width="300" height="80" rx="4"/>
+          <text class="t" x="710" y="212" text-anchor="middle">Guard · 트립에는 지속 시간이 있다</text>
+          <text class="s" x="710" y="232" text-anchor="middle">전류 · 속도 폭주 · 정지(stall) · 온도: 조건이 N초 이어져야 트립</text>
+          <text class="s" x="710" y="250" text-anchor="middle">엔벌로프 이탈은 operation enabled일 때만 트립 (꺼진 축은 손으로 되돌려야 함)</text>
+          <line class="edge bad" x1="560" y1="230" x2="470" y2="230" marker-end="url(#a5b)"/>
+          <text class="s bad" x="515" y="220" text-anchor="middle">TripCode</text>
+
+          <rect class="badbox" x="230" y="190" width="240" height="80" rx="4"/>
+          <text class="t bad" x="350" y="212" text-anchor="middle">Fault 래치 (e-stop · 상태 기계와 직교)</text>
+          <text class="s" x="350" y="232" text-anchor="middle">어느 상태에서든 걸리고, 매 틱 Stop을 강제</text>
+          <text class="s" x="350" y="250" text-anchor="middle">fault_reset은 명시적 · 풀려도 switched on, 스스로 안 움직임</text>
+          <path class="edge bad dash" d="M350,190 L350,150 L330,150 L330,136" marker-end="url(#a5b)"/>
+
+          <rect class="box" x="20" y="190" width="190" height="80" rx="4"/>
+          <text class="t" x="115" y="212" text-anchor="middle">preflight (enable 직전)</text>
+          <text class="s" x="115" y="232" text-anchor="middle">차단: 텔레메트리 없음 · 전압 밖</text>
+          <text class="s" x="115" y="250" text-anchor="middle">결함 · 엔벌로프 밖 → blocked 코드</text>
+          <text class="s" x="115" y="266" text-anchor="middle">권고: 따뜻한 보드, 미확인 모델</text>
+        </svg>
+      </div>
+      <figcaption>펌웨어는 보드를 지키고 호스트 안전층은 기계를 지킵니다. 한 샘플로 트립하는 안전층은 가속을 과전류로 읽어 조작자가 끄게 만들고, 모든 관찰을 차단 사유로 다루는 preflight는 사람을 클릭 통과에 길들입니다. 이 둘을 피하는 것이 설계 규칙입니다.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>6. 드라이버와 하드웨어 — 무엇이 실기에서 확인됐는가</h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>드라이버</th><th>와이어</th><th>구현</th><th>실기 검증</th><th>비고</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">moteus</td><td>mjlib multiplex, CAN-FD, fdcanusb 텍스트 라인</td><td>Link · 콘솔 · 프레임 빌더</td><td><span class="pill ok">qdd100 r4.11</span></td><td>프레임 11종이 공식 Python 패키지와 바이트 일치. 200.2 Hz 실측. Bus 트레이트는 아직 없음</td></tr>
+          <tr><td class="mono">dynamixel</td><td>Protocol 2.0, TTL/RS-485 시리얼</td><td>Link · Chain · Bus · Fast Sync Read · 진단 도구</td><td><span class="pill ok">XL330 · MX 16축 체인</span></td><td>9축 이상 Sync Read 응답 유실 실측 → 8축 청크. Return Delay 20 µs. 와치독 래치 open 시 해제</td></tr>
+          <tr><td class="mono">robstride</td><td>CAN 2.0B 1 Mbit/s, 29비트 ID</td><td>Link · Bus · 모델 7종 스케일 · 파라미터 표</td><td><span class="pill warn">문서 + 시뮬만</span></td><td>모델은 설정으로 선언, 버스가 확인 못 함. 토크 스케일이 모델 간 22배 차이</td></tr>
+          <tr><td class="mono">odrive</td><td>CANSimple (node_id &lt;&lt; 5 | cmd), ASCII 라인</td><td>Link · 프로토콜</td><td><span class="pill bad">벤치 미경험</span></td><td>보드명에 "never bench tested"를 넣고 envelope을 주장하지 않음</td></tr>
+          <tr><td class="mono">sim</td><td>없음</td><td>사다리꼴 궤적 → 토크 제한 PD → 관성 + 점성, 열 상승, 전압 강하, 2 kHz</td><td>—</td><td>오버슈트 · 정지 · 열 폭주 · 엔벌로프 이탈이 실제로 일어남. 드라이버마다 하나가 아닌 하나</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="cols">
+      <div>
+        <h3>벤치 (Windows PC)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <tbody>
+              <tr><td>mjbots qdd100</td><td>moteus r4.11, COM5 fdcanusb, CAN id 1, 19:1</td></tr>
+              <tr><td>ROBOTIS XL330-M288-T</td><td>COM6 U2D2, 1 Mbaud, id 1, 5 V</td></tr>
+              <tr><td>UBP 상체</td><td>COM7 3 Mbaud, MX/X 15–16축, 2026-09 쇼 데모</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h3>호스트 OS</h3>
+        <div class="tbl-wrap">
+          <table>
+            <tbody>
+              <tr><td>Windows</td><td><span class="pill ok">실기</span> 1 ms 멀티미디어 타이머, 1 ms 읽기 타임아웃, TIME_CRITICAL</td></tr>
+              <tr><td>Linux</td><td><span class="pill warn">타입체크만</span> SCHED_FIFO · affinity · mlockall, x86-64-v2 / aarch64 크로스(zig)</td></tr>
+              <tr><td>macOS</td><td><span class="pill warn">시뮬 검증</span> IOSSIOSPEED 보레이트, mach time-constraint. 2026-10-31 M2에서 527 테스트 통과, 실기 미접속</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>7. 검증 — 하드웨어 없이 증명되는 것과 아닌 것</h2>
+    <div class="cols">
+      <div>
+        <h3>크레이트별 테스트 (2026-10-31, macOS)</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>크레이트</th><th class="num">테스트</th><th class="num">줄</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">drlabs-dynamixel</td><td class="num">87</td><td class="num">6 461</td></tr>
+              <tr><td class="mono">drlabs-moteus</td><td class="num">69</td><td class="num">4 107</td></tr>
+              <tr><td class="mono">drlabs-rt</td><td class="num">48</td><td class="num">2 801</td></tr>
+              <tr><td class="mono">drlabs-robstride</td><td class="num">46</td><td class="num">2 421</td></tr>
+              <tr><td class="mono">drlabs-robot</td><td class="num">43</td><td class="num">2 540</td></tr>
+              <tr><td class="mono">drlabs-safety</td><td class="num">41 + 1</td><td class="num">2 089</td></tr>
+              <tr><td class="mono">drlabs-session</td><td class="num">32 + 10</td><td class="num">3 054</td></tr>
+              <tr><td class="mono">drlabs-cli</td><td class="num">33</td><td class="num">3 160</td></tr>
+              <tr><td class="mono">drlabs-core</td><td class="num">31</td><td class="num">1 782</td></tr>
+              <tr><td class="mono">drlabs-transport</td><td class="num">29</td><td class="num">2 033</td></tr>
+              <tr><td class="mono">drlabs-odrive</td><td class="num">23</td><td class="num">1 213</td></tr>
+              <tr><td class="mono">drlabs-timing</td><td class="num">13</td><td class="num">929</td></tr>
+              <tr><td class="mono">drlabs-sim</td><td class="num">12 + 1</td><td class="num">843</td></tr>
+              <tr><td class="mono">drlabs-api</td><td class="num">8</td><td class="num">1 131</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h3>테스트가 잡도록 만들어진 것</h3>
+        <ul>
+          <li><b>와이어가 움직이지 않았다.</b> moteus 프레임 11종을 공식 Python 패키지 출력과 바이트 단위로 고정. 실패하면 인코더가 바뀐 것이고, 기대값을 고치는 쪽이 아니라 참조 구현에서 다시 뽑습니다.</li>
+          <li><b>레이트 실링.</b> 600 ms 동안 명령을 쏟아부어도 루프가 설정 rate 근처에 머무는지 단언. 실링을 빼면 50 Hz 설정에서 520 564 Hz가 나와, 테스트가 그 결함을 잡는다는 것 자체가 확인됨.</li>
+          <li><b>찢김 없음.</b> 트리플 버퍼가 항상 온전한 레코드를 건네는지. <code>no_alloc</code> 테스트는 Guard와 시뮬 틱 경로에 할당이 없는지 봅니다.</li>
+          <li><b>토크 방향.</b> 기어비로 나누는 쪽을 전용 테스트로 고정.</li>
+          <li><b>macOS 수면 정확도.</b> time-constraint 정책 아래 15–50 µs 안에 깨어나는지. 하이퍼바이저 게스트(CI)에서는 건너뜀.</li>
+        </ul>
+        <h3>시뮬이 말해주지 못하는 것</h3>
+        <p>기구에 대한 모든 것. 실제 축이 못 가는 목표에, 실제 모터가 거부할 토크로 기꺼이 도달합니다. 그래서 하드웨어에서 찾은 결함은 전부 "돌아가는 소프트웨어처럼 보였던" 것이었습니다. operation enabled 뒤 첫 명령을 거부한 서보, 성공을 보고하며 67 Hz로 돌던 루프, 엉뚱한 키에서 읽힌 설정값.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>8. 타임라인 — 어떻게 여기까지 왔는가</h2>
+    <figure>
+      <div class="frame">
+        <svg viewBox="0 0 940 190" role="img" aria-label="2026년 1월 Go Dynamixel SDK에서 시작해 8월 19일 프레임워크, 8월 22일부터 23일 Rust 포팅, 9월 3일부터 5일 다관절 bring-up과 모션 쇼, 10월 27일 실시간 런타임과 UDP API, 10월 29일 macOS 지원, 10월 31일 Apple Silicon 검증까지의 타임라인.">
+          <line class="edge" x1="40" y1="90" x2="900" y2="90"/>
+          <g>
+            <circle class="dot" cx="60" cy="90" r="5"/>
+            <text class="m" x="60" y="70" text-anchor="middle">2026-01</text>
+            <text class="s" x="60" y="112" text-anchor="middle">순수 Go Dynamixel SDK</text>
+            <text class="s" x="60" y="128" text-anchor="middle">사다리꼴 궤적</text>
+
+            <circle class="dot" cx="230" cy="90" r="5"/>
+            <text class="m" x="230" y="70" text-anchor="middle">08-19</text>
+            <text class="s" x="230" y="112" text-anchor="middle">프레임워크 (Go)</text>
+            <text class="s" x="230" y="128" text-anchor="middle">Link · session · safety</text>
+            <text class="s" x="230" y="144" text-anchor="middle">ROS 2 브리지 · 어깨 2축</text>
+
+            <circle class="dot" cx="370" cy="90" r="5"/>
+            <text class="m" x="370" y="70" text-anchor="middle">08-22 → 23</text>
+            <text class="s" x="370" y="112" text-anchor="middle">Rust 포팅, 이틀</text>
+            <text class="s" x="370" y="128" text-anchor="middle">core → 드라이버 4 → 패널</text>
+            <text class="s" x="370" y="144" text-anchor="middle">355 테스트, 0.7 MB 바이너리</text>
+
+            <circle class="dot" cx="510" cy="90" r="5"/>
+            <text class="m" x="510" y="70" text-anchor="middle">09-03 → 05</text>
+            <text class="s" x="510" y="112" text-anchor="middle">다관절 bring-up 인프라</text>
+            <text class="s" x="510" y="128" text-anchor="middle">UBP 16축 · 범위 학습</text>
+            <text class="s" x="510" y="144" text-anchor="middle">8자 · 손 흔들기 · 얼굴 인사</text>
+
+            <circle class="dot" cx="660" cy="90" r="6" style="stroke:var(--accent);stroke-width:2;fill:var(--surface)"/>
+            <text class="m" x="660" y="70" text-anchor="middle">10-27</text>
+            <text class="s acc" x="660" y="112" text-anchor="middle">실시간 런타임 drlabs-rt</text>
+            <text class="s" x="660" y="128" text-anchor="middle">버스당 스레드 · LowCmd/LowState</text>
+            <text class="s" x="660" y="144" text-anchor="middle">Fast Sync Read · 레코드 API</text>
+
+            <circle class="dot" cx="790" cy="90" r="5"/>
+            <text class="m" x="790" y="70" text-anchor="middle">10-29</text>
+            <text class="s" x="790" y="112" text-anchor="middle">macOS 1급 호스트</text>
+            <text class="s" x="790" y="128" text-anchor="middle">IOSSIOSPEED · time-constraint</text>
+
+            <circle class="dot" cx="890" cy="90" r="5"/>
+            <text class="m" x="890" y="70" text-anchor="middle">10-31</text>
+            <text class="s" x="890" y="112" text-anchor="middle">M2 검증</text>
+            <text class="s" x="890" y="128" text-anchor="middle">527 통과</text>
+          </g>
+          <text class="s" x="40" y="176">83 커밋 · 26일 작업 · Go 트리는 main에 그대로, develop은 Rust만</text>
+        </svg>
+      </div>
+      <figcaption>포팅은 속도 때문이 아니었습니다. 바이너리 하나로 배포하기 위해, 하드웨어를 모는 코드의 메모리 안전을 위해, 그리고 rev와 rad가 같은 자리수로 찍혀 같은 숫자로 보였던 버그를 타입으로 막기 위해서였습니다.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>9. 아직 안 된 것</h2>
+    <ul>
+      <li><b>Linux 실행.</b> SCHED_FIFO · mlockall · 코어 고정은 타입체크만 됐고 로봇 PC에서 돌린 적이 없습니다. 500 Hz 운용의 기준 숫자는 거기서 나와야 합니다.</li>
+      <li><b>rt 경로에 실기 버스.</b> rt 런타임은 시뮬 버스로만 돌았습니다. moteus는 Bus 트레이트 구현이 없어 rt에서 못 씁니다.</li>
+      <li><b>macOS 실기.</b> IOSSIOSPEED 경로와 Apple FTDI 드라이버의 레이턴시 타이머(16 ms 추정)는 문서 기준 구현입니다. 체크리스트는 DYNAMIXEL.md macOS 절에 있습니다.</li>
+      <li><b>RobStride와 ODrive 실기.</b> 둘 다 벤치에 올라온 적이 없습니다.</li>
+      <li><b>공유 버스에 두 컨트롤러.</b> Session 경로의 잠금은 구조상 맞지만 실제 어댑터로 두 컨트롤러를 돌린 적이 없습니다.</li>
+      <li><b>와이어 예산 검증.</b> <code>rt -check</code>는 축 수와 rate만 보고, 버스별 틱당 바이트가 period에 드는지는 보지 않습니다. Dynamixel 500 Hz는 4 Mbps 버스당 8축이 안전값, Fast Sync Read 확인 시 12–13축입니다.</li>
+      <li><b>CLAUDE.md.</b> 아직 Go 레이아웃을 설명하고 있어 현재 Rust 워크스페이스와 맞지 않습니다.</li>
+      <li><b>ROS 2 실기 검증.</b> 2026-11-03에 rt 와이어를 UDP에서 CycloneDDS(ROS 2 명명, drlabs_msgs)로 바꾸고 Rust·Python 클라이언트와 시뮬에서 확인했지만, 실제 ROS 2 노드(rmw_cyclonedds)로 구독한 적은 아직 없습니다.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

@@ -17,7 +17,7 @@ drlabs servo on 127.0.0.1:7777
   driver moteus · id 1 · COM5 · 200 Hz
   energising and waiting for commands
 OK    Operation enabled automatically
-      holding position at 0.0000 rev · torque limit 0.20 Nm
+      holding position at 0.0000 rad · torque limit 0.20 Nm
 ```
 
 ## What "running" means here
@@ -55,8 +55,8 @@ shell, with no dependency on either side.
 
 | Line | Effect |
 |---|---|
-| `{"cmd":"position","value":0.25}` | position mode, target in revolutions |
-| `{"cmd":"velocity","value":-1.0}` | velocity mode, rev/s |
+| `{"cmd":"position","value":0.5}` | position mode, target in radians at the shaft |
+| `{"cmd":"velocity","value":-1.0}` | velocity mode, rad/s |
 | `{"cmd":"torque","value":0.3}` | torque mode, Nm feedforward |
 | `{"cmd":"mode","mode":"hold"}` | select a mode without a setpoint |
 | `{"cmd":"hold"}` | zero-velocity hold |
@@ -72,6 +72,11 @@ shell, with no dependency on either side.
 | `{"cmd":"state"}` | one state line, on demand |
 | `{"cmd":"ping"}` | liveness |
 
+Every angle on this protocol is radians at the motor shaft and every rate is
+rad/s or rad/s²; the state line says so with `"units":"rad"`. (Until
+2026-11-03 it was revolutions. A client that does not see the `units` field is
+talking to an old server.)
+
 Every reply is `{"type":"reply","ok":true}` or
 `{"type":"reply","ok":false,"error":"…"}`. A refusal is an answer, not a
 failure: `enable operation first` and `a fault is latched; reset it first` arrive this way.
@@ -79,10 +84,10 @@ failure: `enable operation first` and `a fault is latched; reset it first` arriv
 ### State lines
 
 ```json
-{"type":"state","connection":"connected","drive_state":"operation_enabled","mode":"position",
- "estop":false,"position":0.2501,"velocity":0.0,"torque":0.02,
+{"type":"state","units":"rad","connection":"connected","drive_state":"operation_enabled",
+ "mode":"position","estop":false,"position":0.5002,"velocity":0.0,"torque":0.02,
  "current":-1.6,"voltage":24.0,"temperature":30.5,"fault":0,
- "setpoint_position":0.25,"trajectory_running":false,"rate_hz":199.8}
+ "setpoint_position":0.5,"trajectory_running":false,"rate_hz":199.8}
 ```
 
 Optional measurements are `null` when the driver did not read them, never `0`.
@@ -121,12 +126,12 @@ def send(**command):
     stream.write((json.dumps(command) + '\n').encode())
     stream.flush()
 
-send(cmd='position', value=0.25)
+send(cmd='position', value=0.5)
 
 for line in stream:
     message = json.loads(line)
     if message.get('type') == 'state' and message['position'] is not None:
-        print('%.4f rev' % message['position'])
+        print('%.4f rad' % message['position'])
 ```
 
 ## What the framework still refuses to give up
@@ -164,7 +169,9 @@ axis; the command timeout above covers the dangerous half of that case anyway.
 
 ## Verified
 
-Against the simulator at 200 Hz:
+Against the simulator at 200 Hz. Measured in 2026-08, when the protocol still
+spoke revolutions; the numbers below are in rev and the commands today take the
+same values in radians.
 
 | Behaviour | Result |
 |---|---|

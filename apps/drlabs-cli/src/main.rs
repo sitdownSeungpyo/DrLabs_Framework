@@ -124,21 +124,22 @@ Common flags:
 run flags:
   -rate     control rate in Hz (default 100)
   -seconds  how long to run; 0 runs until Ctrl+C (default 0)
-  -position position target, in revolutions
-  -shuttle  A,B,dwell — run the A↔B sequencer instead
-  -min      travel envelope, lower bound in revolutions (default -0.5)
-  -max      travel envelope, upper bound (default 0.5)
+  -position position target, in radians at the shaft
+  -shuttle  A,B,dwell — run the A↔B sequencer instead (A and B in rad)
+  -min      travel envelope, lower bound in rad (default -π, half a turn)
+  -max      travel envelope, upper bound (default π)
   -torque   torque ceiling in Nm (default 0.3)
-  -velocity velocity ceiling in rev/s (default 1.0)
+  -velocity velocity ceiling in rad/s (default 6.0)
 
 serve flags:
   -addr             address to listen on (default 127.0.0.1:7777)
   -rate             control rate in Hz (default 200)
   -state-rate       unsolicited state lines a second (default 50, 0 disables)
   -max-torque       torque ceiling in Nm (default 0.3)
-  -velocity-limit   velocity ceiling in rev/s (default 1.0)
-  -position-min     soft envelope, lower bound in rev (default -0.5)
-  -position-max     soft envelope, upper bound (default 0.5)
+  -velocity-limit   velocity ceiling in rad/s (default 6.0)
+  -accel-limit      acceleration ceiling in rad/s² (default 30.0)
+  -position-min     soft envelope, lower bound in rad (default -π)
+  -position-max     soft envelope, upper bound (default π)
   -command-timeout  seconds of silence after which a velocity or torque
                     command reverts to holding position (default 1, 0 disables)
   -deadman          seconds without a client before stopping (0 disables)

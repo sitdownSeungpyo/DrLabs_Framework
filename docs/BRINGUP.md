@@ -63,9 +63,9 @@ Read four things from its output:
 ```
 Board             moteus r4.11          the framework recognised the hardware
   status          supported             …and has an envelope for it
-  travel bounds   [-5.000, 5.000] rev   the controller's own limits
+  travel bounds   [-31.416, 31.416] rad the controller's own limits
 Voltage           24.00 V               the supply, as the controller sees it
-Position          -0.0006 rev           where the axis thinks it is
+Position          -0.0038 rad           where the axis thinks it is
 Loop              99.6 Hz requested 100 replies 100%
 ```
 
@@ -89,8 +89,9 @@ Not measured yet; guessed deliberately low, so that stage 4 is survivable.
 - **Torque:** start at a value you expect to be *too low to move the axis*. On a
   small motor, 0.05–0.1 Nm. You want the first surprise to be "it did not
   move", not "it moved further than I thought".
-- **Position envelope:** the smallest range that proves anything. ±0.05 rev is
-  18 degrees and plenty.
+- **Position envelope:** the smallest range that proves anything. ±0.3 rad is
+  17 degrees and plenty. Every number here is radians at the motor shaft;
+  the joint's gearing comes later, in the robot description.
 
 ## Stage 4 — first motion, with a human watching
 
@@ -103,11 +104,11 @@ webui -driver moteus -port COM5 -id 1
 
 Then, in the page: set the torque ceiling and position envelope from stage 3 in
 the **Safety** panel, read the preflight checklist, enable operation, and command a small
-position step — 0.02 rev.
+position step — 0.1 rad.
 
 Three outcomes, all of them informative:
 
-- **It moves the way you expected.** Note the direction. Positive revolutions
+- **It moves the way you expected.** Note the direction. Positive radians
   going the wrong way is a fact to record now, not to discover in the upper
   layer later.
 - **It does not move.** The torque ceiling is below what the axis needs. Raise
@@ -131,7 +132,7 @@ Now the numbers are measurements rather than guesses.
   the mechanism. If the axis needed 0.15 Nm to move, 0.3 gives headroom without
   giving it authority to destroy anything.
 - **Position envelope:** the travel you actually want, plus the overshoot you
-  observed. The trip margin (`PositionTripMargin`, 0.05 rev by default) absorbs
+  observed. The trip margin (`position_trip_margin`, 0.31 rad by default) absorbs
   normal overshoot; the envelope should not have to.
 - **Zero reference:** with operation disabled, put it where zero should be and
   press *Set position = 0*. On a moteus this is runtime only — it does not

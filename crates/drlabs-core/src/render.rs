@@ -4,8 +4,10 @@
 //! problem solved. This is the rest of it: a number that is *about* to be shown
 //! to somebody has to be shown in the units they wrote their limits in.
 //!
-//! A single-axis session speaks motor space — revolutions at the shaft — and
-//! that is what [`MotorUnits`] renders. A robot's joints are authored in joint
+//! A single-axis session speaks motor space — the shaft, with no gearing or
+//! zero offset — and that is what [`MotorUnits`] renders: radians at the shaft.
+//! Every number a person reads is in radians; `Rev` stays inside the code, where
+//! the moteus wire and the safety configuration are written in it. A robot's joints are authored in joint
 //! space, and `runtime/robot` supplies a renderer that converts on the way out.
 //! The safety layer holds one of these and never converts anything itself, so
 //! there is exactly one place where the two spaces meet.
@@ -35,7 +37,8 @@ pub trait Units: Send + Sync {
     fn torque(&self, value: Nm) -> String;
 }
 
-/// Motor space: revolutions at the shaft, torque at the rotor.
+/// Motor space: the shaft, torque at the rotor. Rendered in radians at the
+/// shaft — the same unit as joint space, but with no gearing or offset applied.
 ///
 /// What a session driving one controller directly speaks.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,19 +46,19 @@ pub struct MotorUnits;
 
 impl Units for MotorUnits {
     fn position(&self, value: Rev) -> String {
-        format!("{:.4} rev", value.value())
+        format!("{:.4} rad", value.to_rad().value())
     }
 
     fn span(&self, value: Rev) -> String {
-        format!("{:.4} rev", value.value())
+        format!("{:.4} rad", value.to_rad().value())
     }
 
     fn velocity(&self, value: RevPerSec) -> String {
-        format!("{:.3} rev/s", value.value())
+        format!("{:.3} rad/s", value.to_rad_per_sec().value())
     }
 
     fn accel(&self, value: RevPerSec2) -> String {
-        format!("{:.3} rev/s²", value.value())
+        format!("{:.3} rad/s²", value.to_rad_per_sec2().value())
     }
 
     fn torque(&self, value: Nm) -> String {
@@ -79,15 +82,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn motor_space_renders_revolutions() {
-        assert_eq!(MotorUnits.position(Rev(0.4771)), "0.4771 rev");
-        assert_eq!(MotorUnits.velocity(RevPerSec(1.5)), "1.500 rev/s");
+    fn motor_space_renders_radians_at_the_shaft() {
+        assert_eq!(MotorUnits.position(Rev(0.4771)), "2.9977 rad");
+        assert_eq!(MotorUnits.velocity(RevPerSec(1.5)), "9.425 rad/s");
         assert_eq!(MotorUnits.torque(Nm(0.25)), "0.250 Nm");
     }
 
     #[test]
     fn no_renderer_means_motor_space() {
-        assert_eq!(render(None).position(Rev(1.0)), "1.0000 rev");
+        assert_eq!(render(None).position(Rev(1.0)), "6.2832 rad");
     }
 
     /// In motor space a place and a distance render alike. They do not in joint

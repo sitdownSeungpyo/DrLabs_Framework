@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use drlabs_core::command::ControlMode;
-use drlabs_core::units::{Nm, Rev, RevPerSec, RevPerSec2};
+use drlabs_core::units::{Nm, Rad, RadPerSec, RadPerSec2, RevPerSec, RevPerSec2};
 use drlabs_safety::Config as SafetyConfig;
 use drlabs_session::{Options, Params, Session};
 use serde::Deserialize;
@@ -84,18 +84,19 @@ pub fn serve(args: &[String]) -> Result<(), String> {
     let rate: u32 = flags.number("rate", 200)?;
     let state_rate: u32 = flags.number("state-rate", 50)?;
     let max_torque: f64 = flags.number("max-torque", 0.3)?;
-    let velocity_limit: f64 = flags.number("velocity-limit", 1.0)?;
-    let accel_limit: f64 = flags.number("accel-limit", 5.0)?;
+    // Radians at the shaft on the command line; revolutions inside.
+    let velocity_limit: f64 = flags.number("velocity-limit", 6.0)?;
+    let accel_limit: f64 = flags.number("accel-limit", 30.0)?;
     let command_timeout: f64 = flags.number("command-timeout", 1.0)?;
     let auto_enable = !flags.switch("no-auto-enable");
     let allow_unknown = flags.switch("allow-unknown-board");
 
     let safety = SafetyConfig {
         max_torque: Nm(max_torque),
-        max_velocity: RevPerSec(velocity_limit),
-        accel_limit: RevPerSec2(accel_limit),
-        position_min: Rev(flags.number("position-min", -0.5)?),
-        position_max: Rev(flags.number("position-max", 0.5)?),
+        max_velocity: RadPerSec(velocity_limit).to_rev_per_sec(),
+        accel_limit: RadPerSec2(accel_limit).to_rev_per_sec2(),
+        position_min: Rad(flags.number("position-min", -std::f64::consts::PI)?).to_rev(),
+        position_max: Rad(flags.number("position-max", std::f64::consts::PI)?).to_rev(),
         deadman_timeout: flags.number("deadman", 0.0)?,
         ..Default::default()
     };
@@ -276,18 +277,24 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
             session
                 .set_mode(ControlMode::Position)
                 .map_err(|error| error.to_string())?;
-            let clamped = session.set_position(Rev(value));
+            let clamped = session.set_position(Rad(value).to_rev());
             note_motion(motion, false);
-            Ok(format!("{{\"ok\":true,\"position\":{}}}", clamped.value()))
+            Ok(format!(
+                "{{\"ok\":true,\"position\":{}}}",
+                clamped.to_rad().value()
+            ))
         }
         "velocity" => {
             let value = need(command.value, "value")?;
             session
                 .set_mode(ControlMode::Velocity)
                 .map_err(|error| error.to_string())?;
-            let clamped = session.set_velocity(RevPerSec(value));
+            let clamped = session.set_velocity(RadPerSec(value).to_rev_per_sec());
             note_motion(motion, true);
-            Ok(format!("{{\"ok\":true,\"velocity\":{}}}", clamped.value()))
+            Ok(format!(
+                "{{\"ok\":true,\"velocity\":{}}}",
+                clamped.to_rad_per_sec().value()
+            ))
         }
         "torque" => {
             let value = need(command.value.or(command.feedforward), "value")?;
@@ -330,11 +337,14 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
             let params = session.params();
             let max_velocity = command
                 .max_velocity
-                .map(RevPerSec)
+                .map(|v| RadPerSec(v).to_rev_per_sec())
                 .unwrap_or(params.velocity_limit);
-            let accel = command.accel.map(RevPerSec2).unwrap_or(params.accel_limit);
+            let accel = command
+                .accel
+                .map(|a| RadPerSec2(a).to_rev_per_sec2())
+                .unwrap_or(params.accel_limit);
             session
-                .start_trajectory(Rev(target), max_velocity, accel)
+                .start_trajectory(Rad(target).to_rev(), max_velocity, accel)
                 .map_err(|error| error.to_string())?;
             note_motion(motion, false);
             Ok(ok())
@@ -352,8 +362,8 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
             let a = need(command.a, "an \"a\"")?;
             let b = need(command.b, "a \"b\"")?;
             session.configure_shuttle(
-                Rev(a),
-                Rev(b),
+                Rad(a).to_rev(),
+                Rad(b).to_rev(),
                 command.dwell.unwrap_or(1.0),
                 command.cycles.unwrap_or(0),
             );
@@ -407,7 +417,7 @@ fn execute(session: &Arc<Session>, motion: &Mutex<Motion>, command: &ClientComma
         "zero" => {
             let value = command.value.unwrap_or(0.0);
             session
-                .zero_output(Rev(value))
+                .zero_output(Rad(value).to_rev())
                 .map(|()| ok())
                 .map_err(|error| error.to_string())
         }
@@ -434,7 +444,7 @@ fn state_line(session: &Arc<Session>) -> String {
     };
 
     format!(
-        "{{\"state\":true,\"drive_state\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
+        "{{\"state\":true,\"units\":\"rad\",\"drive_state\":{},\"estop\":{},\"estop_reason\":{},\"mode\":{},\
           \"position\":{},\"velocity\":{},\"torque\":{},\"current\":{},\"voltage\":{},\
           \"temperature\":{},\"target\":{},\"rate_hz\":{},\"fault\":{},\"cycles\":{}}}",
         serde_json::to_string(status.drive_state.as_str()).unwrap_or_else(|_| "\"\"".into()),
@@ -448,13 +458,13 @@ fn state_line(session: &Arc<Session>) -> String {
         )
         .unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(status.mode.as_str()).unwrap_or_else(|_| "\"\"".into()),
-        number(telemetry.position.map(|v| v.value())),
-        number(telemetry.velocity.map(|v| v.value())),
+        number(telemetry.position.map(|v| v.to_rad().value())),
+        number(telemetry.velocity.map(|v| v.to_rad_per_sec().value())),
         number(telemetry.torque.map(|v| v.value())),
         number(telemetry.q_current.map(|v| v.value())),
         number(telemetry.voltage.map(|v| v.value())),
         number(telemetry.board_temperature.map(|v| v.value())),
-        status.setpoint.position.value(),
+        status.setpoint.position.to_rad().value(),
         status.achieved_rate_hz,
         serde_json::to_string(
             &telemetry

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use drlabs_core::command::ControlMode;
 use drlabs_core::link::Link;
-use drlabs_core::units::Rev;
+use drlabs_core::units::{Rad, RadPerSec};
 use drlabs_dynamixel::DynamixelLink;
 use drlabs_moteus::link::MoteusLink;
 use drlabs_odrive::OdriveLink;
@@ -179,10 +179,10 @@ pub fn probe(args: &[String]) -> Result<(), String> {
             }
             if let Some((lower, upper)) = identity.bounds {
                 println!(
-                    "{:<14}{:.4} … {:.4} rev",
+                    "{:<14}{:.4} … {:.4} rad",
                     "TRAVEL",
-                    lower.value(),
-                    upper.value()
+                    lower.to_rad().value(),
+                    upper.to_rad().value()
                 );
             }
         }
@@ -264,23 +264,24 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let shuttle = flags.string("shuttle", "");
 
     // The travel envelope is the operator's, not the driver's, so it has to be
-    // sayable on the command line. A default of ±0.5 rev is right for a first
-    // power-up and wrong for an axis that is parked anywhere else — and a
+    // sayable on the command line, in radians at the shaft. A default of ±π
+    // (half a turn) is right for a first power-up and wrong for an axis that is
+    // parked anywhere else — and a
     // motor that cannot enable operation because of a default nobody chose is the sort
     // of thing people work around by disabling the check.
     let mut safety = drlabs_safety::Config {
         max_torque: drlabs_core::units::Nm(flags.number("torque", 0.3)?),
-        max_velocity: drlabs_core::units::RevPerSec(flags.number("velocity", 2.0)?),
+        max_velocity: RadPerSec(flags.number("velocity", 12.0)?).to_rev_per_sec(),
         ..Default::default()
     };
     if let Ok(min) = flags.number::<f64>("min", f64::NAN) {
         if min.is_finite() {
-            safety.position_min = Rev(min);
+            safety.position_min = Rad(min).to_rev();
         }
     }
     if let Ok(max) = flags.number::<f64>("max", f64::NAN) {
         if max.is_finite() {
-            safety.position_max = Rev(max);
+            safety.position_max = Rad(max).to_rev();
         }
     }
 
@@ -299,7 +300,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     session.set_params(drlabs_session::Params {
         max_torque: drlabs_core::units::Nm(flags.number("torque", 0.3)?),
-        velocity_limit: drlabs_core::units::RevPerSec(flags.number("velocity", 1.0)?),
+        velocity_limit: RadPerSec(flags.number("velocity", 6.0)?).to_rev_per_sec(),
         ..Default::default()
     });
 
@@ -317,8 +318,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|_| format!("-shuttle {text:?} is not a number"))
         };
         session.configure_shuttle(
-            Rev(parse(parts[0])?),
-            Rev(parse(parts[1])?),
+            Rad(parse(parts[0])?).to_rev(),
+            Rad(parse(parts[1])?).to_rev(),
             parse(parts[2])?,
             0,
         );
@@ -327,7 +328,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         session
             .set_mode(ControlMode::Position)
             .map_err(|e| e.to_string())?;
-        session.set_position(Rev(target));
+        session.set_position(Rad(target).to_rev());
     }
 
     let started = Instant::now();
@@ -348,16 +349,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
         let status = session.status();
         print!(
-            "\r{:>8.4} rev  {:>7.3} rev/s  {:>6.2} A  {:>5.1} V  {:>4.0} Hz  tx {:>5.2}/{:>5.2}/{:>5.2} ms  {}   ",
+            "\r{:>8.4} rad  {:>7.3} rad/s  {:>6.2} A  {:>5.1} V  {:>4.0} Hz  tx {:>5.2}/{:>5.2}/{:>5.2} ms  {}   ",
             status
                 .telemetry
                 .position
-                .map(|v| v.value())
+                .map(|v| v.to_rad().value())
                 .unwrap_or(f64::NAN),
             status
                 .telemetry
                 .velocity
-                .map(|v| v.value())
+                .map(|v| v.to_rad_per_sec().value())
                 .unwrap_or(f64::NAN),
             status
                 .telemetry

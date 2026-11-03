@@ -52,7 +52,7 @@ The starting point was a Dynamixel SDK. A framework needs three things the SDK
 did not have:
 
 1. **A seam that is not vendor-shaped.** `motor.Link` is the only interface the
-   runtime is written against. Applications say "go to 0.25 revolutions", not
+   runtime is written against. Applications say "go to 0.5 radians", not
    "write 1024 to control table address 116" or "set register 0x020 to 25000".
 2. **A control loop that keeps its period.** Motor control is a real-time
    problem. A loop that silently runs at 64 Hz while claiming 100 Hz makes every
@@ -119,8 +119,8 @@ talking to encoder counts or to 0.00001-revolution register steps.
 
 | Quantity | Unit |
 |----------|------|
-| position | revolutions (rev) |
-| velocity | revolutions per second (rev/s) |
+| position | radians (rad) wherever a person reads or types it: the CLI, `serve`, logs, the panel. Inside, motor space is `Rev` and joint space is `Rad`, two types the compiler keeps apart |
+| velocity | rad/s on the same surfaces; `RevPerSec` inside motor space |
 | torque | newton-metres (Nm) |
 | current | amperes (A) |
 | voltage | volts (V) |

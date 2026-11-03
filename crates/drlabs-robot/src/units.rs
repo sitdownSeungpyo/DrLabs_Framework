@@ -69,7 +69,8 @@ mod tests {
     fn one_position_reads_differently_in_each_space() {
         let units = reduced();
         let motor = units.mapping.motor_position(drlabs_core::units::Rad(3.0));
-        assert_eq!(MotorUnits.position(motor), "9.0718 rev");
+        // 3 rad at the joint is 57 rad at the shaft through a 19:1 reduction.
+        assert_eq!(MotorUnits.position(motor), "57.0000 rad");
         assert_eq!(units.position(motor), "3.0000 rad");
     }
 

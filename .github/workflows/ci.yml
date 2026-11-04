@@ -28,11 +28,14 @@ jobs:
             # Put the failing tests' own output on the Checks tab as
             # annotations, so a failure says which test and why without
             # anyone opening the raw log.
-            sed -n '/^failures:$/,$p' test.log | grep -v '^$' | head -60 | sed 's/^/::error::/'
+            # dtolnay/rust-toolchain sets CARGO_TERM_COLOR=always, so the
+            # log carries ANSI codes; strip them or nothing below matches.
+            sed 's/\x1b\[[0-9;]*[A-Za-z]//g' test.log > test.txt
+            sed -n '/^failures:$/,$p' test.txt | grep -v '^$' | head -60 | sed 's/^/::error::/'
             # A build failure never reaches `failures:`; surface the compiler
             # and build-script errors the same way, so a broken C dependency
             # (CycloneDDS via cyclors) reads from the Checks tab too.
-            grep -n -A12 -E '^(error|warning: build failed|  = note: |  process didn)' test.log | head -80 | sed 's/^/::error::/'
+            grep -n -A12 -E '^(error|warning: build failed|  = note: |  process didn|CMake Error|  --- stderr)' test.txt | head -80 | sed 's/^/::error::/'
             exit 1
           fi
 

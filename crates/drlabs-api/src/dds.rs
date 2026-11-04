@@ -173,7 +173,8 @@ impl Writer {
     pub fn write(&self, sample: &[u8]) -> Result<(), DdsError> {
         let iov = ddsrt_iovec_t {
             iov_base: sample.as_ptr() as *mut c_void,
-            iov_len: sample.len(),
+            // `as _`: the field is usize on unix and u32 on Windows (WSABUF).
+            iov_len: sample.len() as _,
         };
         unsafe {
             let serdata = ddsi_serdata_from_ser_iov(
@@ -229,8 +230,8 @@ unsafe extern "C" fn on_data(reader: dds_entity_t, arg: *mut c_void) {
             let size = ddsi_serdata_size(serdata) as usize;
             let mut iov: ddsrt_iovec_t = std::mem::zeroed();
             let reference = ddsi_serdata_to_ser_ref(serdata, 0, size, &mut iov);
-            if !iov.iov_base.is_null() && iov.iov_len > 0 {
-                let bytes = std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len);
+            if !iov.iov_base.is_null() && iov.iov_len as usize > 0 {
+                let bytes = std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len as usize);
                 callback(bytes);
             }
             if !reference.is_null() {

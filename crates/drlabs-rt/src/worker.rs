@@ -200,10 +200,38 @@ impl BusWorker {
     /// on the same grid.
     pub fn run(mut self, epoch: Instant) {
         self.epoch = epoch;
-        if let Err(error) = self.bus.open() {
-            eprintln!("[{}] open failed: {error}", self.config.name);
-            self.estop.latch(TripCode::Transport);
-            return;
+        match self.bus.open() {
+            Ok(identities) => {
+                for (axis, identity) in self.axes.iter().zip(identities) {
+                    match identity {
+                        Some(identity) => eprintln!(
+                            "[{}] joint {}: {}{}{}",
+                            self.config.name,
+                            axis.spec.joint,
+                            identity.board,
+                            if identity.firmware.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" fw {}", identity.firmware)
+                            },
+                            if identity.simulated {
+                                " (simulated)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        None => eprintln!(
+                            "[{}] joint {}: reports nothing identifying",
+                            self.config.name, axis.spec.joint
+                        ),
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("[{}] open failed: {error}", self.config.name);
+                self.estop.latch(TripCode::Transport);
+                return;
+            }
         }
         let period = self.config.period;
         let granted = drlabs_timing::rt::promote(self.config.priority, self.config.cpu, period);

@@ -140,7 +140,7 @@ fn parse_option(target: &Target, name: &str, default: f64) -> Result<f64, String
 /// Refusing when nothing identified itself is better than opening whatever
 /// happens to be first — that could be a modem, a GPS, or another machine's
 /// console.
-fn auto_detect() -> Result<String, String> {
+pub fn auto_detect() -> Result<String, String> {
     let ports = drlabs_transport::serial::list().map_err(|error| error.to_string())?;
     match ports.first() {
         Some(port) if port.is_can_adapter => Ok(port.path.clone()),

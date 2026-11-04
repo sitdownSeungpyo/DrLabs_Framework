@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use drlabs_core::bus::{AxisFault, AxisReply, AxisStatus};
 use drlabs_core::command::{Command, ControlMode, Field, Mode, QueryProfile, TorqueLimit};
 use drlabs_core::error::{Error, Result};
 use drlabs_core::link::{Capabilities, Envelope, Identity, Link};
@@ -20,21 +21,30 @@ use crate::frames::{self, PositionCommand, Send, StayWithinCommand};
 use crate::hardware;
 use crate::multiplex::Resolution;
 use crate::query::QueryResolution;
-use crate::registers::{self as reg, Register};
+use crate::registers::{self as reg, PositionResolution, Register};
 use crate::stream::Stream;
 
 /// A [`Link`] backed by one moteus controller.
 pub struct MoteusLink {
     controller: Controller,
     bus: Option<Arc<SharedBus>>,
+    codec: Codec,
+}
 
-    fast: QueryResolution,
-    full: QueryResolution,
-    verify: QueryResolution,
+/// Turns framework commands into frame payloads for one controller, and
+/// remembers what that controller was last told.
+///
+/// Shared by the one-axis [`MoteusLink`] and the N-axis
+/// [`crate::bus::MoteusBus`], so the two cannot drift apart: the frame a
+/// joint receives is the same whichever path built it.
+pub(crate) struct Codec {
+    pub(crate) fast: QueryResolution,
+    pub(crate) full: QueryResolution,
+    pub(crate) verify: QueryResolution,
 
     /// What the controller was last told, so an unchanged parameter costs no
     /// frame budget.
-    sent: SentParams,
+    pub(crate) sent: SentParams,
 }
 
 /// The command registers that keep their value until they are written again.
@@ -44,7 +54,7 @@ pub struct MoteusLink {
 /// about 48 bytes, a wide telemetry query is another 18, and a CAN-FD frame
 /// holds 64. The controller answers an over-long frame by not receiving it.
 #[derive(Debug, Clone, Copy, Default)]
-struct SentParams {
+pub(crate) struct SentParams {
     valid: bool,
 
     feedforward_torque: f64,
@@ -63,7 +73,7 @@ impl SentParams {
     ///
     /// Used on connect, when the command registers hold whatever a previous
     /// session or a power cycle left in them.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
@@ -92,10 +102,7 @@ impl MoteusLink {
         Self {
             controller: Controller::new(id),
             bus: Some(bus),
-            fast: QueryResolution::fast(),
-            full: QueryResolution::full(),
-            verify: QueryResolution::verify(),
-            sent: SentParams::default(),
+            codec: Codec::new(),
         }
     }
 
@@ -116,7 +123,33 @@ impl MoteusLink {
         self.bus.as_ref().ok_or(Error::Closed)
     }
 
-    fn query_for(&self, profile: QueryProfile) -> &QueryResolution {
+    /// Renders one command with no telemetry query attached.
+    #[cfg(test)]
+    fn command_payload(&mut self, command: &Command) -> Result<Vec<u8>> {
+        Ok(self
+            .codec
+            .command_payload(command, &self.controller.position_resolution))
+    }
+}
+
+impl Codec {
+    pub(crate) fn new() -> Self {
+        Self {
+            fast: QueryResolution::fast(),
+            full: QueryResolution::full(),
+            verify: QueryResolution::verify(),
+            sent: SentParams::default(),
+        }
+    }
+
+    /// Forgets what the controller was told; the next command re-sends
+    /// everything. For open, when the registers hold whatever a previous
+    /// session or a power cycle left in them.
+    pub(crate) fn reset(&mut self) {
+        self.sent.reset();
+    }
+
+    pub(crate) fn query_for(&self, profile: QueryProfile) -> &QueryResolution {
         match profile {
             QueryProfile::Full => &self.full,
             QueryProfile::Verify => &self.verify,
@@ -135,7 +168,7 @@ impl MoteusLink {
     ///
     /// Narrowing costs a cycle of the wider registers, which the next rotation
     /// picks up. Overflowing costs the connection.
-    fn fit_query<'a>(
+    pub(crate) fn fit_query<'a>(
         &'a self,
         command_bytes: usize,
         requested: &'a QueryResolution,
@@ -152,24 +185,48 @@ impl MoteusLink {
     }
 
     /// Renders one command with no telemetry query attached.
-    fn command_payload(&mut self, command: &Command) -> Result<Vec<u8>> {
-        let resolutions = self.controller.position_resolution;
-        Ok(match command.mode {
+    pub(crate) fn command_payload(
+        &mut self,
+        command: &Command,
+        resolutions: &PositionResolution,
+    ) -> Vec<u8> {
+        match command.mode {
             Mode::Stop => frames::stop(None),
             Mode::Query => Vec::new(),
             Mode::Brake => frames::brake(None),
-            Mode::Hold => frames::zero_velocity(field_send(command.kd_scale), &resolutions, None),
+            Mode::Hold => frames::zero_velocity(field_send(command.kd_scale), resolutions, None),
             Mode::SetOutput { position } => {
                 frames::set_output(reg::SET_OUTPUT_EXACT, position.value(), None)
             }
             Mode::StayWithin { lower, upper } => {
-                frames::stay_within(&self.stay_within(command, lower, upper), &resolutions, None)
+                frames::stay_within(&self.stay_within(command, lower, upper), resolutions, None)
             }
             Mode::Position | Mode::Velocity | Mode::Torque => {
                 let position = self.position(command);
-                frames::position(&position, &resolutions, None)
+                frames::position(&position, resolutions, None)
             }
-        })
+        }
+    }
+
+    /// One command with the widest query that fits beside it. Returns the
+    /// payload and whether a reply is to be expected.
+    pub(crate) fn frame_payload(
+        &mut self,
+        command: &Command,
+        profile: QueryProfile,
+        resolutions: &PositionResolution,
+    ) -> (Vec<u8>, bool) {
+        // Build the command first, then choose a query that fits beside it.
+        // The two share one 64-byte frame, and the command is not negotiable.
+        let mut payload = self.command_payload(command, resolutions);
+        let requested = self.query_for(profile).clone();
+        let query = self.fit_query(payload.len(), &requested);
+        let expect_reply = query.is_some();
+        if let Some(query) = query {
+            let (data, _) = query.encode();
+            payload.extend_from_slice(&data);
+        }
+        (payload, expect_reply)
     }
 
     /// Translates a framework command into moteus position-mode fields.
@@ -345,9 +402,9 @@ impl Link for MoteusLink {
             })?;
 
         // Nothing may be assumed to be already set.
-        self.sent.reset();
+        self.codec.reset();
 
-        let payload = frames::stop(Some(&self.fast));
+        let payload = frames::stop(Some(&self.codec.fast));
         match self.controller.transact(&bus, &payload, true)? {
             Some(_) => Ok(()),
             None => Err(Error::Refused(format!(
@@ -370,35 +427,7 @@ impl Link for MoteusLink {
 
     fn identify(&mut self) -> Result<Option<Identity>> {
         let bus = self.require_bus()?.clone();
-        let mut identity = Identity::new("moteus");
-
-        let mut want = BTreeMap::new();
-        want.insert(reg::MODEL_NUMBER, Resolution::Int32);
-        want.insert(reg::FIRMWARE_VERSION, Resolution::Int32);
-        if let Ok(values) = self.controller.read_registers(&bus, &want) {
-            if let Some(&model) = values.get(&reg::MODEL_NUMBER) {
-                if model.is_finite() && model != 0.0 {
-                    identity.model_number = Some(model as u32);
-                }
-            }
-            if let Some(&version) = values.get(&reg::FIRMWARE_VERSION) {
-                if version.is_finite() {
-                    identity.firmware = format_firmware(version as u32);
-                }
-            }
-        }
-
-        let mut want = BTreeMap::new();
-        for register in [
-            reg::SERIAL_NUMBER_1,
-            reg::SERIAL_NUMBER_2,
-            reg::SERIAL_NUMBER_3,
-        ] {
-            want.insert(register, Resolution::Int32);
-        }
-        if let Ok(values) = self.controller.read_registers(&bus, &want) {
-            identity.serial = format_serial(&values);
-        }
+        let mut identity = identify_registers(&self.controller, &bus);
 
         // The console is slow, so it is read once here and never inside the
         // control loop.
@@ -463,50 +492,18 @@ impl Link for MoteusLink {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            modes: vec![
-                ControlMode::Stop,
-                ControlMode::Query,
-                ControlMode::Position,
-                ControlMode::Velocity,
-                ControlMode::Torque,
-                ControlMode::Hold,
-                ControlMode::Brake,
-                ControlMode::StayWithin,
-                ControlMode::SetOutput,
-            ],
-            max_rate_hz: hardware::CAN_DOCUMENTED_MAX_CYCLE_HZ,
-            has_watchdog: true,
-            reports_temperature: true,
-            reports_current: true,
-            reports_voltage: true,
-        }
+        capabilities()
     }
 
     fn envelope(&self) -> Option<Envelope> {
-        Some(Envelope {
-            voltage_min: Some(Volts(hardware::R4_ENVELOPE.input_voltage_min)),
-            voltage_max: Some(Volts(hardware::R4_ENVELOPE.input_voltage_max)),
-            voltage_rated: Some(Volts(hardware::R4_ENVELOPE.input_voltage_nominal)),
-            velocity_max: Some(RevPerSec(hardware::R4_ENVELOPE.velocity_max)),
-            peak_current: Some(Amps(hardware::R4_ENVELOPE.peak_phase_current)),
-        })
+        Some(envelope())
     }
 
     fn cycle(&mut self, command: &Command, profile: QueryProfile) -> Result<Option<Telemetry>> {
         let bus = self.require_bus()?.clone();
-
-        // Build the command first, then choose a query that fits beside it. The
-        // two share one 64-byte frame, and the command is not negotiable.
-        let mut payload = self.command_payload(command)?;
-
-        let requested = self.query_for(profile).clone();
-        let query = self.fit_query(payload.len(), &requested);
-        let expect_reply = query.is_some();
-        if let Some(query) = query {
-            let (data, _) = query.encode();
-            payload.extend_from_slice(&data);
-        }
+        let (payload, expect_reply) =
+            self.codec
+                .frame_payload(command, profile, &self.controller.position_resolution);
 
         let started = Instant::now();
         match self.controller.transact(&bus, &payload, expect_reply)? {
@@ -533,6 +530,108 @@ impl Link for MoteusLink {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Every mode a moteus has.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        modes: vec![
+            ControlMode::Stop,
+            ControlMode::Query,
+            ControlMode::Position,
+            ControlMode::Velocity,
+            ControlMode::Torque,
+            ControlMode::Hold,
+            ControlMode::Brake,
+            ControlMode::StayWithin,
+            ControlMode::SetOutput,
+        ],
+        max_rate_hz: hardware::CAN_DOCUMENTED_MAX_CYCLE_HZ,
+        has_watchdog: true,
+        reports_temperature: true,
+        reports_current: true,
+        reports_voltage: true,
+    }
+}
+
+/// The r4 electrical envelope, which is the board this was verified on.
+pub fn envelope() -> Envelope {
+    Envelope {
+        voltage_min: Some(Volts(hardware::R4_ENVELOPE.input_voltage_min)),
+        voltage_max: Some(Volts(hardware::R4_ENVELOPE.input_voltage_max)),
+        voltage_rated: Some(Volts(hardware::R4_ENVELOPE.input_voltage_nominal)),
+        velocity_max: Some(RevPerSec(hardware::R4_ENVELOPE.velocity_max)),
+        peak_current: Some(Amps(hardware::R4_ENVELOPE.peak_phase_current)),
+    }
+}
+
+/// What the registers say about a board: model, firmware, serial. The
+/// family and revision live only in the console's firmware record and are
+/// not read here; [`Link::identify`] goes on to read those.
+pub(crate) fn identify_registers(controller: &Controller, bus: &SharedBus) -> Identity {
+    let mut identity = Identity::new("moteus");
+
+    let mut want = BTreeMap::new();
+    want.insert(reg::MODEL_NUMBER, Resolution::Int32);
+    want.insert(reg::FIRMWARE_VERSION, Resolution::Int32);
+    if let Ok(values) = controller.read_registers(bus, &want) {
+        if let Some(&model) = values.get(&reg::MODEL_NUMBER) {
+            if model.is_finite() && model != 0.0 {
+                identity.model_number = Some(model as u32);
+            }
+        }
+        if let Some(&version) = values.get(&reg::FIRMWARE_VERSION) {
+            if version.is_finite() {
+                identity.firmware = format_firmware(version as u32);
+            }
+        }
+    }
+
+    let mut want = BTreeMap::new();
+    for register in [
+        reg::SERIAL_NUMBER_1,
+        reg::SERIAL_NUMBER_2,
+        reg::SERIAL_NUMBER_3,
+    ] {
+        want.insert(register, Resolution::Int32);
+    }
+    if let Ok(values) = controller.read_registers(bus, &want) {
+        identity.serial = format_serial(&values);
+    }
+    identity
+}
+
+/// Turns a register map into a bus reply: the same readings as [`decode`]
+/// with no strings, for the runtime's fixed arrays.
+pub fn decode_axis(values: &crate::controller::Values) -> AxisReply {
+    let scaled = |register: Register| -> Option<f64> {
+        values
+            .get(&register)
+            .map(|value| reg::scale_value(register, value.raw, value.resolution))
+            .filter(|value| value.is_finite())
+    };
+    let raw = |register: Register| -> Option<i32> {
+        values
+            .get(&register)
+            .map(|value| value.raw)
+            .filter(|value| value.is_finite())
+            .map(|value| value as i32)
+    };
+    AxisReply {
+        status: AxisStatus::Ok,
+        mode: raw(reg::MODE),
+        fault: raw(reg::FAULT).map(|code| AxisFault {
+            code,
+            hard: hardware::is_hard_fault(code),
+        }),
+        position: scaled(reg::POSITION).map(Rev),
+        velocity: scaled(reg::VELOCITY).map(RevPerSec),
+        torque: scaled(reg::TORQUE).map(Nm),
+        current: scaled(reg::Q_CURRENT).map(Amps),
+        voltage: scaled(reg::VOLTAGE).map(Volts),
+        board_temperature: scaled(reg::TEMPERATURE).map(Celsius),
+        motor_temperature: scaled(reg::MOTOR_TEMPERATURE).map(Celsius),
     }
 }
 
@@ -758,7 +857,7 @@ mod tests {
 
         let first = link.command_payload(&command).unwrap();
         let _ = link.command_payload(&command).unwrap();
-        link.sent.reset();
+        link.codec.reset();
         let after_reset = link.command_payload(&command).unwrap();
         assert_eq!(first.len(), after_reset.len());
     }
@@ -795,21 +894,21 @@ mod tests {
     /// overrun, because an over-long frame is not received at all.
     #[test]
     fn a_query_that_does_not_fit_is_narrowed() {
-        let link = link();
+        let codec = Codec::new();
         let full = QueryResolution::full();
 
         // A command with plenty of room keeps what it asked for.
         assert_eq!(
-            link.fit_query(8, &full).map(|q| q.encoded_len()),
+            codec.fit_query(8, &full).map(|q| q.encoded_len()),
             Some(full.encoded_len())
         );
 
         // One that does not gets the fast set instead.
-        let narrowed = link.fit_query(48, &full).expect("the fast set still fits");
-        assert_eq!(narrowed.encoded_len(), link.fast.encoded_len());
+        let narrowed = codec.fit_query(48, &full).expect("the fast set still fits");
+        assert_eq!(narrowed.encoded_len(), codec.fast.encoded_len());
 
         // And a command with no room at all asks nothing.
-        assert!(link.fit_query(60, &full).is_none());
+        assert!(codec.fit_query(60, &full).is_none());
     }
 
     #[test]
@@ -852,6 +951,43 @@ mod tests {
         assert_eq!(telemetry.position, None);
         assert_eq!(telemetry.voltage, None);
         assert_eq!(telemetry.fault, None);
+    }
+
+    /// The bus reply carries the same readings as the telemetry, minus the
+    /// strings, and classifies the fault the same way.
+    #[test]
+    fn a_bus_reply_agrees_with_the_telemetry() {
+        let mut values = crate::controller::Values::new();
+        values.insert(
+            reg::POSITION,
+            RawValue {
+                resolution: Resolution::Int32,
+                raw: 25000.0,
+            },
+        );
+        values.insert(
+            reg::FAULT,
+            RawValue {
+                resolution: Resolution::Int8,
+                raw: 102.0,
+            },
+        );
+        let reply = decode_axis(&values);
+        let telemetry = decode(&values);
+        assert_eq!(reply.status, AxisStatus::Ok);
+        assert_eq!(reply.position, telemetry.position);
+        assert_eq!(reply.fault.unwrap().code, 102);
+        assert!(!reply.fault.unwrap().hard, "limiting is information");
+        assert_eq!(reply.voltage, None, "unreported is absent, not zero");
+
+        values.insert(
+            reg::FAULT,
+            RawValue {
+                resolution: Resolution::Int8,
+                raw: 33.0,
+            },
+        );
+        assert!(decode_axis(&values).fault.unwrap().hard);
     }
 
     #[test]

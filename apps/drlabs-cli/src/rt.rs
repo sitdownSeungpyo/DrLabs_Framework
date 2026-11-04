@@ -208,6 +208,35 @@ fn factory(
                     .with_period(period),
             ))
         }
+        "fdcanusb" => {
+            if let Some(joint) = joints.iter().find(|joint| joint.driver != "moteus") {
+                return Err(format!(
+                    "bus {:?}: joint {:?} is a {:?}; an fdcanusb bus carries moteus joints only \
+                     in this version (robstride and odrive have no bus driver yet)",
+                    bus.name, joint.name, joint.driver
+                ));
+            }
+            let port = if bus.port.is_empty() {
+                crate::probe::auto_detect()?
+            } else {
+                bus.port.clone()
+            };
+            let device = drlabs_transport::fdcanusb::open(&port)
+                .map_err(|error| format!("bus {:?}: open {port}: {error}", bus.name))?;
+            let shared = Arc::new(drlabs_transport::can::SharedBus::new(Box::new(device)));
+            let ids: Vec<u8> = joints
+                .iter()
+                .map(|joint| {
+                    u8::try_from(joint.id).map_err(|_| {
+                        format!(
+                            "joint {:?}: CAN id {} is out of range (1..126)",
+                            joint.name, joint.id
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Box::new(drlabs_moteus::MoteusBus::new(shared, &ids)))
+        }
         other => Err(format!(
             "bus {:?}: transport {other:?} is not carried by the runtime yet",
             bus.name

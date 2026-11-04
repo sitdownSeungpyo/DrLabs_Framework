@@ -5,6 +5,7 @@
 //! exposes upward is in framework units, so callers work against
 //! `drlabs_core::Link` and never see a register.
 
+pub mod bus;
 pub mod combiner;
 pub mod controller;
 pub mod frames;
@@ -14,3 +15,6 @@ pub mod multiplex;
 pub mod query;
 pub mod registers;
 pub mod stream;
+
+pub use bus::MoteusBus;
+pub use link::MoteusLink;

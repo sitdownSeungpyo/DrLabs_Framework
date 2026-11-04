@@ -56,7 +56,7 @@ How a driver reads the modes:
 |---|---|---|---|---|---|
 | dynamixel | torque off | goal position = `q` through the mapping, clamped; `dq`, `tau` not applied | refused (`status` 3); the servo is a position servo | goal position = where the hold began | refused; use `offset_rad` in the description |
 | sim | stop | position target with the simulator's own PD | native | native | native |
-| moteus | (not on the bus trait yet) | | | | |
+| moteus | stop | position with `dq`/`tau` feed-forward | native (moteus modes 10 and 13) | native (mode 12) | native (set output exact; runtime only) |
 
 A refused mode leaves the axis torque-off and says so in `status`; it does
 not trip the robot. Leaving any driving mode sends three stop frames before
@@ -94,7 +94,18 @@ The robot description from `drlabs-robot` plus two sections, both optional:
 "api": { "dds": { "domain": 0, "prefix": "drlabs" }, "state_div": 1, "cmd_timeout_ms": 100, "on_cmd_timeout": "hold" }
 ```
 
-`buses[].transport` may be `sim`. `rate_hz` up to 1000. At most 64 joints.
+`buses[].transport` is `sim`, `serial` (Dynamixel) or `fdcanusb` (moteus;
+RobStride and ODrive have no bus driver yet). `rate_hz` up to 1000. At most
+64 joints.
+
+The moteus bus (`crates/drivers/drlabs-moteus/src/bus.rs`) sends every
+axis's frame before waiting for any reply, then sorts the replies back by
+the controller's source id, so the adapter's turnaround is paid once a tick.
+Its frames are tested byte for byte against the one-axis link's, which are
+pinned against the reference `moteus` package. It has not yet run on the
+bench (2026-11-04): the cycle time of N frames through the fdcanusb's line
+protocol is the measurement that decides how many moteus one adapter can
+carry at 500 Hz.
 
 ## Measured
 

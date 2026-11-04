@@ -2,13 +2,16 @@
 //!
 //! This is the subcommand the single-binary idea is about: a robot is a JSON
 //! file and an executable, and running this holds every joint under control
-//! until somebody stops it.
+//! until somebody stops it. It is a client of the runtime it starts: the
+//! buses belong to `drlabs-rt`, and this process only says where the joints
+//! should be.
 
 use std::time::{Duration, Instant};
 
-use drlabs_robot::{Config, Robot};
+use drlabs_rt::Config;
 
 use crate::flags::{Flags, Kind};
+use crate::machine::{self, Commander};
 
 const BRINGUP_FLAGS: &[(&str, Kind)] = &[
     ("check", Kind::Switch),
@@ -16,6 +19,10 @@ const BRINGUP_FLAGS: &[(&str, Kind)] = &[
     ("sweep", Kind::Value),
     ("flood", Kind::Switch),
 ];
+
+/// How often the command record is re-sent while nothing changes, so the
+/// runtime never sees it go stale (`api.cmd_timeout_ms`, 100 by default).
+const KEEPALIVE: Duration = Duration::from_millis(20);
 
 pub fn bringup(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(args, BRINGUP_FLAGS).map_err(|error| error.to_string())?;
@@ -38,33 +45,50 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
     }
 
     let joint_count = config.joints.len();
-    let rate = config.rate_hz;
     let name = config.robot.clone();
-
-    let mut robot = Robot::new(config).map_err(|error| error.to_string())?;
     println!("\nBringing up {joint_count} joints…");
 
-    robot.bring_up().map_err(|error| error.to_string())?;
+    let mut handle = machine::start(&config)?;
+    let mut commander = Commander::new(joint_count);
 
-    // Bringing a machine up is switching it on, not telling it what to do.
+    // Every joint has to see at least one telemetry cycle before its
+    // preflight can pass, and on a shared chain those cycles are taken in
+    // turn — so the window grows with the machine.
+    let budget = Duration::from_millis(5_000 + 500 * joint_count as u64);
+    let first = match machine::wait_for_telemetry(&mut handle, &config, budget) {
+        Ok(state) => state,
+        Err(error) => {
+            machine::shutdown(handle, &mut commander);
+            return Err(error);
+        }
+    };
+
+    // Bringing a machine up is switching it on, not telling it what to do:
+    // every joint is energised where it already is, and no further target
+    // comes from here unless a sweep was asked for. Whatever drives the
+    // robot afterwards is then the only thing that decides where it goes.
     //
-    // Unless this run was asked for a sweep or a flood, every joint goes quiet
-    // once it is energised: torque on, holding the position it was already in,
-    // and no further target from here. Whatever drives the robot afterwards —
-    // the panel, a program — is then the only thing that decides where it
-    // goes, and `bringup` cannot be the reason a joint moved.
-    if sweep <= 0.0 && !flood {
-        robot
-            .hold_where_they_are()
-            .map_err(|error| error.to_string())?;
+    // All or nothing. A humanoid with one dead shoulder is more dangerous
+    // than one that never came up: the rest of the machine will happily
+    // hold poses that assume the missing joint is holding too. So a joint
+    // that cannot be energised takes the whole robot down, torque off, and
+    // says which one and why.
+    for index in 0..joint_count {
+        commander.drive(index, first.state[index].q as f64, 0.0);
+    }
+    if let Err(error) = machine::wait_until_driving(&mut handle, &config, &mut commander, budget)
+    {
+        let state = handle.state();
+        println!();
+        print!("{}", machine::state_table(&config, &state));
+        machine::shutdown(handle, &mut commander);
+        return Err(format!("joints {error}"));
     }
 
-    // Let the loops run long enough to have a rate worth reporting; the
-    // measurement is over a window, and there is no window yet.
-    std::thread::sleep(Duration::from_millis(500));
-    print_state(&robot);
-
-    println!("\nrobot {name:?} live · {joint_count} joints · {rate} Hz");
+    let state = handle.state();
+    println!();
+    print!("{}", machine::state_table(&config, &state));
+    println!("\nrobot {name:?} live · {joint_count} joints · {} Hz", config.rate_hz);
     if sweep <= 0.0 && !flood {
         println!("  energised and holding · no position commands are being sent");
     }
@@ -74,115 +98,100 @@ pub fn bringup(args: &[String]) -> Result<(), String> {
         println!("  Ctrl+C to stop");
     }
 
-    // A coordinated sweep drives every joint at once, which is the only way to
-    // find out whether they interfere. On this bench that is exactly what the
-    // Go version's two worst defects needed: one joint's commands starving the
-    // other's bus, and a pose that reached some joints and not others.
-    let sweep_targets: Vec<(String, f64, f64)> = if sweep > 0.0 {
-        robot
-            .config
+    // A coordinated sweep drives every joint at once, which is the only way
+    // to find out whether they interfere: one joint's commands starving the
+    // other's bus, or a pose that reaches some joints and not others.
+    let sweep_targets: Vec<(usize, f64, f64)> = if sweep > 0.0 {
+        config
             .joints
             .iter()
-            .map(|joint| {
+            .enumerate()
+            .map(|(index, joint)| {
                 let centre = (joint.limits.min_rad + joint.limits.max_rad) / 2.0;
                 let half = (joint.limits.max_rad - joint.limits.min_rad) / 2.0;
-                (joint.name.clone(), centre, half * sweep.clamp(0.0, 1.0))
+                (index, centre, half * sweep.clamp(0.0, 1.0))
             })
             .collect()
     } else {
         Vec::new()
     };
     if !sweep_targets.is_empty() {
-        println!(
-            "
-Sweeping {} joints…",
-            sweep_targets.len()
-        );
+        println!("\nSweeping {} joints…", sweep_targets.len());
         if flood {
-            println!("  commanding as fast as this thread can, to test the rate ceiling");
+            println!("  commanding as fast as this thread can; the bus keeps its own rate");
         }
     }
 
     let started = Instant::now();
-    loop {
+    let mut timing = machine::Timing::new(&state);
+    let mut next_report = started + Duration::from_secs(1);
+    let mut sends = 0u64;
+    let outcome = loop {
         if sweep_targets.is_empty() {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(KEEPALIVE);
+            commander.send(&mut handle, 0);
+            sends += 1;
         } else {
             // Either one pose per 20 ms, or as fast as the thread manages —
-            // which is what a slider drag looks like from the loop's side.
-            let deadline = Instant::now() + Duration::from_millis(if flood { 500 } else { 20 });
+            // which is what a slider drag looks like from the runtime's side.
+            let deadline = Instant::now() + if flood { Duration::from_millis(500) } else { KEEPALIVE };
             loop {
                 let phase = started.elapsed().as_secs_f64() * std::f64::consts::TAU / 4.0;
-                let pose: std::collections::BTreeMap<String, drlabs_core::units::Rad> =
-                    sweep_targets
-                        .iter()
-                        .map(|(name, centre, amplitude)| {
-                            (
-                                name.clone(),
-                                drlabs_core::units::Rad(centre + amplitude * phase.sin()),
-                            )
-                        })
-                        .collect();
-                if let Err(error) = robot.set_positions(&pose) {
-                    println!(
-                        "
-pose refused: {error}"
-                    );
-                    break;
+                for (index, centre, amplitude) in &sweep_targets {
+                    commander.drive(*index, centre + amplitude * phase.sin(), 0.0);
                 }
+                commander.send(&mut handle, 0);
+                sends += 1;
                 if !flood || Instant::now() >= deadline {
                     break;
                 }
             }
             if !flood {
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(KEEPALIVE);
             }
         }
-        robot.heartbeat();
 
-        // A joint that stopped itself is the whole machine's problem: the rest
-        // of it will happily hold poses that assume the stopped one is holding
-        // too.
-        let stopped: Vec<String> = robot
-            .state()
-            .iter()
-            .filter(|joint| joint.estop)
-            .map(|joint| format!("{} ({})", joint.name, joint.estop_reason))
-            .collect();
-        if !stopped.is_empty() {
-            println!("\nEmergency stop: {}", stopped.join(", "));
-            print_state(&robot);
-            break;
+        let state = handle.state();
+        if state.estop != 0 {
+            println!(
+                "\nEmergency stop: {}",
+                machine::trip_name(state.estop_code)
+            );
+            print!("{}", machine::state_table(&config, &state));
+            break Err(format!("stopped: {}", machine::trip_name(state.estop_code)));
         }
-
         if seconds > 0.0 && started.elapsed().as_secs_f64() >= seconds {
-            print_state(&robot);
-            break;
+            print!("{}", machine::state_table(&config, &state));
+            break Ok(());
         }
-        if sweep_targets.is_empty() {
-            continue;
+        let now = Instant::now();
+        if now >= next_report {
+            next_report += Duration::from_secs(1);
+            let rate = timing.rate(&state);
+            let elapsed = started.elapsed().as_secs_f64();
+            let mut line = format!(
+                "t={:>4.0}s  bus {:>6.1} Hz  client {:>6.0}/s  miss {:>3}  late_max {:>5.2} ms",
+                elapsed,
+                rate,
+                sends as f64 / elapsed,
+                state.deadline_miss,
+                handle.late_max_ns() as f64 / 1e6
+            );
+            if !sweep_targets.is_empty() {
+                for (index, joint) in config.joints.iter().enumerate().take(4) {
+                    line.push_str(&format!("  {} {:+.3}", joint.name, state.state[index].q));
+                }
+                if joint_count > 4 {
+                    line.push_str(&format!("  … {} more", joint_count - 4));
+                }
+            }
+            println!("{line}");
         }
-        // While sweeping, report often enough to watch both joints move.
-        if started.elapsed().as_millis() % 1000 < 25 {
-            let state = robot.state();
-            let line: Vec<String> = state
-                .iter()
-                .map(|joint| {
-                    format!(
-                        "{} {:+.3} rad @ {:.0} Hz",
-                        joint.name,
-                        joint.position_rad.unwrap_or(f64::NAN),
-                        joint.rate_hz
-                    )
-                })
-                .collect();
-            println!("  {}", line.join("   "));
-        }
-    }
+    };
 
     println!("\nStopping…");
-    robot.shutdown();
-    Ok(())
+    machine::shutdown(handle, &mut commander);
+    outcome
 }
 
 /// Says what the description asks for before anything is opened.
@@ -233,11 +242,11 @@ fn print_plan(config: &Config) {
         );
     }
 
-    // The load line is the one worth reading. A CAN joint costs a transaction
-    // per cycle, so a CAN bus carries joints × rate; a Dynamixel chain is
-    // cycled as a whole and costs two a period however many servos are on it.
-    // A number the adapter cannot carry is better seen here than diagnosed
-    // later through a machine that will not keep time.
+    // The load line is the one worth reading. A CAN joint costs a
+    // transaction per cycle, so a CAN bus carries joints × rate; a Dynamixel
+    // chain is cycled as a whole and costs two a period however many servos
+    // are on it. A number the adapter cannot carry is better seen here than
+    // diagnosed later through a machine that will not keep time.
     for (bus, total) in &load {
         if *total > 400 {
             println!(
@@ -246,37 +255,5 @@ fn print_plan(config: &Config) {
                  cannot keep up."
             );
         }
-    }
-}
-
-fn print_state(robot: &Robot) {
-    println!();
-    println!(
-        "{:<12}{:<8}{:<12}{:<12}{:<10}{:<8}NOTE",
-        "JOINT", "ENABLED", "POSITION", "TARGET", "TORQUE", "RATE"
-    );
-    for joint in robot.state() {
-        let position = joint
-            .position_rad
-            .map(|value| format!("{value:+.4} rad"))
-            .unwrap_or_else(|| "—".into());
-        let torque = joint
-            .torque_nm
-            .map(|value| format!("{value:+.3} Nm"))
-            .unwrap_or_else(|| "—".into());
-        let note = if joint.estop {
-            joint.estop_reason.clone()
-        } else if !joint.blocked.is_empty() {
-            joint.blocked.join(" ")
-        } else {
-            joint.fault_name.clone()
-        };
-        let target = format!("{:+.4} rad", joint.target_rad);
-        let rate = format!("{:.0} Hz", joint.rate_hz);
-        println!(
-            "{:<12}{:<8}{position:<12}{target:<12}{torque:<10}{rate:<8}{note}",
-            joint.name,
-            if joint.operation_enabled { "yes" } else { "no" }
-        );
     }
 }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use drlabs_api::{describe::describe_json, DdsServer};
 use drlabs_core::lowlevel::{mode, LowCmd, MotorCmd};
 use drlabs_core::AxisStatus;
-use drlabs_rt::{Config, Daemon};
+use drlabs_rt::Config;
 
 use crate::flags::{Flags, Kind};
 
@@ -54,7 +54,7 @@ pub fn rt(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let handle = Arc::new(Mutex::new(Daemon::start(&config, &factory)?));
+    let handle = Arc::new(Mutex::new(crate::machine::start(&config)?));
     let state_period =
         Duration::from_secs_f64(config.api.state_div.max(1) as f64 / config.rate_hz as f64);
     let server = DdsServer::start(
@@ -169,79 +169,6 @@ pub fn rt(args: &[String]) -> Result<(), String> {
     );
     handle.stop();
     Ok(())
-}
-
-fn factory(
-    bus: &drlabs_rt::BusConfig,
-    joints: &[&drlabs_rt::JointConfig],
-) -> Result<Box<dyn drlabs_core::Bus>, String> {
-    match bus.transport.as_str() {
-        "sim" => drlabs_rt::daemon::sim_factory(bus, joints),
-        "serial" => {
-            if let Some(joint) = joints.iter().find(|joint| joint.driver != "dynamixel") {
-                return Err(format!(
-                    "bus {:?}: joint {:?} is a {:?}; a serial bus carries dynamixel joints only",
-                    bus.name, joint.name, joint.driver
-                ));
-            }
-            if bus.port.is_empty() {
-                return Err(format!("bus {:?}: a serial bus needs a port", bus.name));
-            }
-            let baud = if bus.baud == 0 { 1_000_000 } else { bus.baud };
-            let port = drlabs_transport::serial::open(&bus.port, baud)
-                .map_err(|error| format!("bus {:?}: open {}: {error}", bus.name, bus.port))?;
-            let shared = drlabs_transport::serial::SharedPort::new(Box::new(port));
-            let mut servos = Vec::with_capacity(joints.len());
-            for joint in joints {
-                let profile = match joint.options.get("profile") {
-                    Some(name) => Some(drlabs_dynamixel::profile::profile_named(name).ok_or_else(
-                        || format!("joint {:?}: unknown profile {name:?}", joint.name),
-                    )?),
-                    None => None,
-                };
-                servos.push((joint.id as u8, profile));
-            }
-            let period = Duration::from_secs_f64(1.0 / bus.rate_hz.max(1) as f64);
-            Ok(Box::new(
-                drlabs_dynamixel::DynamixelBus::new(shared, &servos)
-                    .with_port_name(&bus.port, baud)
-                    .with_period(period),
-            ))
-        }
-        "fdcanusb" => {
-            if let Some(joint) = joints.iter().find(|joint| joint.driver != "moteus") {
-                return Err(format!(
-                    "bus {:?}: joint {:?} is a {:?}; an fdcanusb bus carries moteus joints only \
-                     in this version (robstride and odrive have no bus driver yet)",
-                    bus.name, joint.name, joint.driver
-                ));
-            }
-            let port = if bus.port.is_empty() {
-                crate::probe::auto_detect()?
-            } else {
-                bus.port.clone()
-            };
-            let device = drlabs_transport::fdcanusb::open(&port)
-                .map_err(|error| format!("bus {:?}: open {port}: {error}", bus.name))?;
-            let shared = Arc::new(drlabs_transport::can::SharedBus::new(Box::new(device)));
-            let ids: Vec<u8> = joints
-                .iter()
-                .map(|joint| {
-                    u8::try_from(joint.id).map_err(|_| {
-                        format!(
-                            "joint {:?}: CAN id {} is out of range (1..126)",
-                            joint.name, joint.id
-                        )
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Box::new(drlabs_moteus::MoteusBus::new(shared, &ids)))
-        }
-        other => Err(format!(
-            "bus {:?}: transport {other:?} is not carried by the runtime yet",
-            bus.name
-        )),
-    }
 }
 
 fn print_plan(config: &Config) {

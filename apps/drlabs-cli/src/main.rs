@@ -10,12 +10,13 @@
 //! drlabs serve   -driver … -id …     the servo role: energised, over a socket
 //! ```
 //!
-//! Every subcommand goes through the same `Link` and the same session an
-//! application would, so what the CLI can do is a lower bound on what the
-//! framework can do.
+//! `probe` goes through the same `Link` a driver test would; `run`, `bringup`
+//! and `rt` start the runtime in this process and are clients of it, so
+//! what the CLI can do is a lower bound on what the framework can do.
 
 mod bringup;
 mod flags;
+mod machine;
 mod panel;
 mod probe;
 mod rt;
@@ -121,15 +122,16 @@ Common flags:
   -id       bus address: CAN id or servo id (default 1)
   -opt      driver option, repeatable: -opt key=value
 
-run flags:
-  -rate     control rate in Hz (default 100)
+run flags (the axis is driven through the runtime, as a one-joint machine):
+  -rate     bus rate in Hz (default 100)
   -seconds  how long to run; 0 runs until Ctrl+C (default 0)
-  -position position target, in radians at the shaft
-  -shuttle  A,B,dwell — run the A↔B sequencer instead (A and B in rad)
+  -position move to this target, in radians at the shaft; none holds
+  -shuttle  A,B,dwell — move A↔B forever, dwell seconds at each end
   -min      travel envelope, lower bound in rad (default -π, half a turn)
   -max      travel envelope, upper bound (default π)
   -torque   torque ceiling in Nm (default 0.3)
-  -velocity velocity ceiling in rad/s (default 6.0)
+  -velocity velocity ceiling and move speed in rad/s (default 6.0)
+  -accel    acceleration ceiling and move ramp in rad/s² (default 10.0)
 
 serve flags:
   -addr             address to listen on (default 127.0.0.1:7777)
@@ -149,11 +151,11 @@ panel flags:
   -addr     address to listen on (default 127.0.0.1:8080)
   -check    validate the description and exit
 
-bringup flags:
+bringup flags (the machine runs on the runtime; this process is its client):
   -check    validate the description and print the plan, opening nothing
   -seconds  how long to hold the machine up; 0 runs until Ctrl+C
   -sweep    drive every joint through this fraction of its travel, together
-  -flood    command poses as fast as possible, to test the rate ceiling
+  -flood    command poses as fast as possible; the bus keeps its own rate
 "#
     );
 }

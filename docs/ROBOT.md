@@ -279,7 +279,16 @@ neither has met a real adapter with two controllers on it.
 
 `drlabs rt <robot.json>` (crate `drlabs-rt`, `docs/RT.md`) runs one thread
 per bus and exchanges fixed-size LowCmd/LowState records with clients over
-CycloneDDS (UDP until 2026-11-03). `drlabs panel` is now a client of it, with the same HTTP API as before.
-`drlabs bringup` and the per-joint `Session` path remain for single-axis
-tools and are not developed further. The JSON-lines protocol described above
-has no Rust server.
+CycloneDDS (UDP until 2026-11-03). `drlabs panel` is now a client of it, with
+the same HTTP API as before. The JSON-lines protocol described above has no
+Rust server.
+
+Since 2026-11-04 `drlabs bringup` and `drlabs run` are clients of the
+runtime too: they start it in-process and command it through the same
+`LowCmd` record anything else would. The description crate (`drlabs-robot`)
+and its per-joint `Session` machine are gone; the description, the mapping
+and the validation live in `drlabs-rt`. `bringup -flood` now shows the
+runtime's answer to the slider-drag defect above: the client thread sends
+about a million records a second and the bus stays at its configured rate.
+`drlabs serve` is the last user of the session crate; it goes when the
+runtime has passed its bench acceptance (RT.md).

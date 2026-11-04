@@ -395,9 +395,7 @@ impl BusWorker {
 
         if self.bus.cycle(&self.cmds, &mut self.replies).is_err() {
             self.estop.latch(TripCode::Transport);
-            for reply in &mut self.replies {
-                *reply = AxisReply::SILENT;
-            }
+            self.replies.fill(AxisReply::SILENT);
         }
 
         for (axis, reply) in self.axes.iter_mut().zip(self.replies.iter()) {

@@ -49,8 +49,9 @@ crates/
   drlabs-timing/               scheduling accuracy (per platform)
   drlabs-transport/            serial (per platform), CAN abstraction, fdcanusb
   drlabs-safety/               envelope, monitor, trips
-  drlabs-session/              one-axis control loop, trajectory, shuttle
-  drlabs-robot/                description to machine, joint mapping
+  drlabs-session/              one-axis control loop (serve only; to be retired)
+  drlabs-rt/                   description, joint mapping, one RT thread per bus
+  drlabs-api/                  LowCmd/LowState over CycloneDDS, ROS 2 names
   drivers/
     drlabs-moteus/
     drlabs-dynamixel/
@@ -96,9 +97,10 @@ Three changes from the Go tree, all aimed at reading it six months from now:
 | `drlabs-robstride` | complete: protocol, parameters, controller, link | 46 passing |
 | `drlabs-odrive` | **implemented, never bench tested** — see below | 23 passing |
 | `drlabs-safety` | complete: clamps, trips, presets, preflight | 27 passing |
-| `drlabs-session` | complete: loop, state machine, trajectory, shuttle | 40 passing |
-| `drlabs-robot` | complete: description, joint mapping, atomic pose | 31 passing |
-| `drlabs-cli` | ports, drivers, probe, run, bringup, panel | 17 passing |
+| `drlabs-session` | complete; only `serve` still uses it (see RT.md) | 40 passing |
+| `drlabs-rt` | description, mapping, gate, bus threads; `run`/`bringup`/`rt` run on it | 63 passing |
+| `drlabs-api` | CycloneDDS transport, hand-written CDR pinned against the Python package | 24 passing |
+| `drlabs-cli` | ports, drivers, probe, run, bringup, rt, panel | 17 passing |
 | `drlabs-panel` | folded into the CLI, assets compiled in | — |
 
 A crate joins the workspace `members` list when it builds and its tests pass,
@@ -134,7 +136,13 @@ e-stopped it. A machine stopped by the rate of somebody's mouse.
 for six hundred milliseconds and asserts the loop stayed near its configured
 rate. Removing the ceiling and re-running it gives **520,564 Hz against a
 50 Hz configuration** — so the test is known to catch the thing it was written
-for, rather than merely passing.
+for, rather than merely passing. The runtime cannot have the defect by
+construction — the bus thread owns the tick and a client only replaces a
+snapshot — and `crates/drlabs-rt/tests/loop_behaviour.rs` carries the same
+claims over as properties: `drlabs bringup configs/sim26.json -sweep 0.3
+-flood` sends about a million records a second from the client thread and
+the bus reports 500.0 Hz with no missed deadline (2026-11-04, debug build,
+this Mac).
 
 ### macOS builds, tests and runs; the hardware path is not yet proven there
 

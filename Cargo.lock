@@ -143,7 +143,6 @@ dependencies = [
  "drlabs-dynamixel",
  "drlabs-moteus",
  "drlabs-odrive",
- "drlabs-robot",
  "drlabs-robstride",
  "drlabs-rt",
  "drlabs-safety",
@@ -187,24 +186,6 @@ version = "0.1.0"
 dependencies = [
  "drlabs-core",
  "drlabs-transport",
- "thiserror",
-]
-
-[[package]]
-name = "drlabs-robot"
-version = "0.1.0"
-dependencies = [
- "drlabs-core",
- "drlabs-dynamixel",
- "drlabs-moteus",
- "drlabs-odrive",
- "drlabs-robstride",
- "drlabs-safety",
- "drlabs-session",
- "drlabs-sim",
- "drlabs-transport",
- "serde",
- "serde_json",
  "thiserror",
 ]
 

@@ -122,7 +122,7 @@
     <h2>1. 계층 — 크레이트가 쌓인 모양</h2>
     <figure>
       <div class="frame">
-        <svg viewBox="0 0 940 560" role="img" aria-label="위에서 아래로 외부 클라이언트, CLI 앱, 런타임 크레이트(session, robot, rt, api), safety와 timing, 벤더 중립 이음새인 core, 드라이버 다섯, transport, 하드웨어 순으로 쌓인 계층 그림. core 위는 관절 공간, 아래는 모터 공간이며 변환은 robot과 rt의 Mapping에서만 일어난다.">
+        <svg viewBox="0 0 940 560" role="img" aria-label="위에서 아래로 외부 클라이언트, CLI 앱, 런타임 크레이트(session, rt, api), safety와 timing, 벤더 중립 이음새인 core, 드라이버 다섯, transport, 하드웨어 순으로 쌓인 계층 그림. core 위는 관절 공간, 아래는 모터 공간이며 변환은 rt의 Mapping에서만 일어난다.">
           <defs>
             <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
               <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
@@ -153,13 +153,10 @@
           <text class="s" x="30" y="170">런타임</text>
           <rect class="box" x="180" y="162" width="150" height="52" rx="3"/>
           <text class="t" x="255" y="182" text-anchor="middle">drlabs-session</text>
-          <text class="s" x="255" y="200" text-anchor="middle">단일 축 루프 · 궤적 · 셔틀</text>
-          <rect class="box" x="345" y="162" width="150" height="52" rx="3"/>
-          <text class="t" x="420" y="182" text-anchor="middle">drlabs-robot</text>
-          <text class="s" x="420" y="200" text-anchor="middle">JSON → 기계 · Mapping</text>
-          <rect class="hot" x="510" y="162" width="150" height="52" rx="3"/>
-          <text class="t" x="585" y="182" text-anchor="middle">drlabs-rt</text>
-          <text class="s" x="585" y="200" text-anchor="middle">버스당 RT 스레드 · 게이트</text>
+          <text class="s" x="255" y="200" text-anchor="middle">단일 축 루프 (serve만, 퇴역 예정)</text>
+          <rect class="hot" x="345" y="162" width="315" height="52" rx="3"/>
+          <text class="t" x="502" y="182" text-anchor="middle">drlabs-rt</text>
+          <text class="s" x="502" y="200" text-anchor="middle">JSON 설명서 · Mapping · 버스당 RT 스레드 · 게이트</text>
           <rect class="box" x="675" y="162" width="150" height="52" rx="3"/>
           <text class="t" x="750" y="182" text-anchor="middle">drlabs-api</text>
           <text class="s" x="750" y="200" text-anchor="middle">CycloneDDS · CDR · 클라이언트</text>
@@ -229,7 +226,7 @@
           <line class="edge dash" x1="848" y1="266" x2="662" y2="266" marker-end="url(#a1)"/>
         </svg>
       </div>
-      <figcaption>core 위는 관절 공간, 아래는 모터 공간입니다. 변환은 robot과 rt가 공유하는 <code>Mapping</code> 한 곳에서만 일어나고, 단위는 <code>Rev</code>·<code>Rad</code>·<code>Nm</code> 타입이라 컴파일 시점에 섞이지 않습니다. 드라이버는 core와 transport에만 의존하고, 런타임은 드라이버 안을 모릅니다.</figcaption>
+      <figcaption>core 위는 관절 공간, 아래는 모터 공간입니다. 변환은 rt의 <code>Mapping</code> 한 곳에서만 일어나고, 단위는 <code>Rev</code>·<code>Rad</code>·<code>Nm</code> 타입이라 컴파일 시점에 섞이지 않습니다. 드라이버는 core와 transport에만 의존하고, 런타임은 드라이버 안을 모릅니다.</figcaption>
     </figure>
   </section>
 
@@ -619,7 +616,6 @@
               <tr><td class="mono">drlabs-moteus</td><td class="num">69</td><td class="num">4 107</td></tr>
               <tr><td class="mono">drlabs-rt</td><td class="num">48</td><td class="num">2 801</td></tr>
               <tr><td class="mono">drlabs-robstride</td><td class="num">46</td><td class="num">2 421</td></tr>
-              <tr><td class="mono">drlabs-robot</td><td class="num">43</td><td class="num">2 540</td></tr>
               <tr><td class="mono">drlabs-safety</td><td class="num">41 + 1</td><td class="num">2 089</td></tr>
               <tr><td class="mono">drlabs-session</td><td class="num">32 + 10</td><td class="num">3 054</td></tr>
               <tr><td class="mono">drlabs-cli</td><td class="num">33</td><td class="num">3 160</td></tr>

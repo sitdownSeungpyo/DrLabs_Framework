@@ -25,9 +25,46 @@ use crate::worker::{AxisSpec, BusState, BusWorker, WorkerConfig};
 pub type BusFactory = dyn Fn(&BusConfig, &[&JointConfig]) -> Result<Box<dyn Bus>, String>;
 
 /// The buses this crate can build on its own: the simulator.
+///
+/// The first joint's `options` may set the physics for the whole bus:
+/// `inertia` (kg·m²), `friction` (Nm per rev/s), `torque_constant` (Nm/A).
+/// A driver named `moteus-sim` or `robstride-sim` reports itself as that
+/// family, so a description written for a real machine can be dry-run by
+/// changing nothing but the driver names.
 pub fn sim_factory(bus: &BusConfig, joints: &[&JointConfig]) -> Result<Box<dyn Bus>, String> {
     match bus.transport.as_str() {
-        "sim" => Ok(Box::new(drlabs_sim::SimBus::new(joints.len()))),
+        "sim" => {
+            let mut physics = drlabs_sim::Physics::default();
+            if let Some(joint) = joints.first() {
+                let option = |name: &str, default: f64| -> Result<f64, String> {
+                    match joint.options.get(name) {
+                        Some(text) => text.parse().map_err(|_| {
+                            format!("joint {:?}: option {name}={text:?} is not a number", joint.name)
+                        }),
+                        None => Ok(default),
+                    }
+                };
+                physics.inertia = option("inertia", physics.inertia)?;
+                physics.friction = option("friction", physics.friction)?;
+                physics.torque_constant = option("torque_constant", physics.torque_constant)?;
+                if physics.inertia <= 0.0 || physics.torque_constant <= 0.0 {
+                    return Err(format!(
+                        "joint {:?}: inertia and torque_constant must be positive",
+                        joint.name
+                    ));
+                }
+            }
+            let kind = match joints.first().map(|joint| joint.driver.as_str()) {
+                Some("moteus-sim") => "moteus-sim",
+                Some("robstride-sim") => "robstride-sim",
+                _ => "sim",
+            };
+            Ok(Box::new(drlabs_sim::SimBus::with_physics(
+                joints.len(),
+                kind,
+                physics,
+            )))
+        }
         other => Err(format!(
             "bus {:?}: this build cannot open a {other:?} transport",
             bus.name
@@ -246,7 +283,11 @@ impl Daemon {
 /// A description with no `buses` section puts every joint on one unnamed
 /// bus; its transport is whatever the joints' driver implies.
 fn implicit_transport(config: &Config) -> String {
-    if config.joints.iter().all(|joint| joint.driver == "sim") {
+    if config
+        .joints
+        .iter()
+        .all(|joint| joint.driver == "sim" || joint.driver.ends_with("-sim"))
+    {
         "sim".into()
     } else {
         "serial".into()

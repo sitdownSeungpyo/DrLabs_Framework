@@ -87,7 +87,8 @@ The session's enable-operation / disable-operation / fault state machine (CiA 40
 
 ## Configuration
 
-The robot description from `drlabs-robot` plus two sections, both optional:
+The robot description (`crates/drlabs-rt/src/config.rs`) plus two sections,
+both optional:
 
 ```json
 "rt":  { "cpus": [], "priority": 0, "deadline_miss_trip": 5 },
@@ -173,6 +174,12 @@ directly — see [ROS2.md](ROS2.md). The transport is a client of the daemon's
 handle, not part of it: the bus threads never see DDS.
 
 ## Clients that exist
+
+- `drlabs run` and `drlabs bringup` — in-process clients: they build or
+  load a description, start the daemon in the same process, and plan on top
+  of it (`run` streams a trapezoid for `-position` and `-shuttle`;
+  `bringup` energises every joint where it is and optionally sweeps). No
+  DDS endpoint is opened; `drlabs rt` is the one that serves clients.
 
 - `tools/drlabs_client` — Python on the Eclipse `cyclonedds` package:
   `Client(domain, prefix)`, `move_to` (trapezoid, client side), `hold`,

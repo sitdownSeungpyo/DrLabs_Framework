@@ -1,6 +1,6 @@
 //! The one place motor space and joint space meet.
 //!
-//! Everything below `drlabs-robot` works in **motor space**: revolutions at the
+//! Everything below this crate works in **motor space**: revolutions at the
 //! shaft, torque at the rotor. Everything above it is authored in **joint
 //! space**: radians at the output, torque at the mechanism. A gear ratio, a
 //! sign and a zero offset separate them.

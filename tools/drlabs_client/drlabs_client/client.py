@@ -28,6 +28,7 @@ from .types import (
     FAULT_RESET,
     OFF,
     QUICK_STOP,
+    ZERO,
     Describe,
     LowCmd,
     LowState,
@@ -244,6 +245,15 @@ class Client:
         names = list(names) if names is not None else list(current)
         self.command({name: current[name] for name in names
                       if current[name] == current[name]})  # not NaN
+
+    def zero(self, targets: Dict[str, float]) -> None:
+        """Re-references joints: each one's current output position becomes
+        the value given.  The joint must be off (a driving joint is stopped
+        first); the runtime acts once, on the change into ZERO, so the entry
+        is put back to OFF afterwards."""
+        self.command(targets, mode=ZERO)
+        time.sleep(0.05)
+        self.release(list(targets))
 
     def quick_stop(self) -> None:
         """Latches the robot-wide fault (CiA 402 quick stop)."""

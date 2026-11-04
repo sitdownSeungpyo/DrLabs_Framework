@@ -28,13 +28,57 @@ pub const MAX_AXES: usize = 64;
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// What a client may ask of one motor.
+///
+/// Modes 1 to 5 drive the axis; the runtime honours them once the axis
+/// passes its preflight check, and the torque ceiling, velocity and
+/// acceleration limits and watchdog come from the joint's declared limits
+/// whatever the mode. `kp` and `kd` are carried but not applied in this
+/// version: the controller's own gains stand.
 pub mod mode {
     /// Torque off. The axis is observed, not driven. This is the state a
     /// motor starts in and the state a stop returns it to.
     pub const OFF: u8 = 0;
-    /// Drive: follow `q`/`dq` with the gains and feed-forward given. The
-    /// runtime only honours it once the axis passes its preflight check.
+    /// Position: go to `q`, with `dq` as velocity feed-forward and `tau` as
+    /// torque feed-forward. The target is clamped to the envelope.
     pub const DRIVE: u8 = 1;
+    /// Velocity: run at `dq` with no position target, `tau` feed-forward.
+    /// The envelope edge in the direction of travel is sent as the stop
+    /// position, so a controller that honours one stops there.
+    pub const VELOCITY: u8 = 2;
+    /// Torque: `tau` only, no position or velocity opinion.
+    pub const TORQUE: u8 = 3;
+    /// Hold: servo velocity to zero without a position target. A driver
+    /// with no such mode (a position servo) holds the position the axis
+    /// was at when the hold began.
+    pub const HOLD: u8 = 4;
+    /// Stay within: torque only outside the joint's declared travel, `tau`
+    /// feed-forward inside it. The bounds are the envelope; a client cannot
+    /// narrow them.
+    pub const STAY_WITHIN: u8 = 5;
+    /// Re-reference: the axis's current output position becomes `q`, once,
+    /// the first command in which the entry changes to this mode. The axis
+    /// must be off; a driving axis is stopped first. Repeating the record
+    /// (a keep-alive) does not re-reference again — it takes a change of
+    /// mode away and back.
+    pub const ZERO: u8 = 6;
+
+    /// Whether a mode drives the axis.
+    pub const fn drives(mode: u8) -> bool {
+        mode >= DRIVE && mode <= STAY_WITHIN
+    }
+
+    pub fn as_str(mode: u8) -> &'static str {
+        match mode {
+            OFF => "off",
+            DRIVE => "drive",
+            VELOCITY => "velocity",
+            TORQUE => "torque",
+            HOLD => "hold",
+            STAY_WITHIN => "stay_within",
+            ZERO => "zero",
+            _ => "unknown",
+        }
+    }
 }
 
 /// Robot-wide requests that ride on a [`LowCmd`].
@@ -270,6 +314,23 @@ mod tests {
         assert!(state.q.is_nan());
         assert!(state.voltage.is_nan());
         assert_eq!(state.fault, 0);
+    }
+
+    #[test]
+    fn only_the_driving_modes_drive() {
+        assert!(!mode::drives(mode::OFF));
+        for m in [
+            mode::DRIVE,
+            mode::VELOCITY,
+            mode::TORQUE,
+            mode::HOLD,
+            mode::STAY_WITHIN,
+        ] {
+            assert!(mode::drives(m), "{}", mode::as_str(m));
+        }
+        assert!(!mode::drives(mode::ZERO), "a re-reference is not a drive");
+        assert!(!mode::drives(200));
+        assert_eq!(mode::as_str(mode::ZERO), "zero");
     }
 
     #[test]

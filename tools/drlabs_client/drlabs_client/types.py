@@ -18,9 +18,16 @@ from cyclonedds.idl.types import array, float32, uint8, uint16, uint32, uint64
 
 MAX_AXES = 64
 
-#: MotorCmd.mode
+#: MotorCmd.mode — see docs/RT.md for what each does on each driver.
 OFF = 0
-DRIVE = 1
+DRIVE = 1          # position q, dq and tau as feed-forward
+VELOCITY = 2       # run at dq, no position target
+TORQUE = 3         # tau only
+HOLD = 4           # zero-velocity servo; a position servo holds where it is
+STAY_WITHIN = 5    # torque only outside the joint's declared travel
+ZERO = 6           # once, on the change into this mode: output position becomes q
+MODE_NAMES = {0: "off", 1: "drive", 2: "velocity", 3: "torque", 4: "hold",
+              5: "stay_within", 6: "zero"}
 
 #: LowCmd.flags — the CiA 402 verbs: a quick stop latches the robot-wide
 #: fault, a fault reset clears it and leaves every axis OFF.

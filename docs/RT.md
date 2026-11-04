@@ -24,37 +24,56 @@ has no shape). Little-endian, `repr(C)`; sizes are pinned by tests in
 `drlabs-core/src/lowlevel.rs`.
 
 `MotorCmd` (24 bytes): `mode u8, reserved[3], q f32, dq f32, kp f32, kd f32, tau f32`.
-`mode` 0 = OFF (observe, torque off), 1 = DRIVE.
+
+| `mode` | name | what the axis does |
+|---|---|---|
+| 0 | OFF | observed, torque off |
+| 1 | DRIVE | position `q`, with `dq` and `tau` as feed-forward |
+| 2 | VELOCITY | runs at `dq`, no position target, `tau` feed-forward; the envelope edge ahead is sent as the stop position |
+| 3 | TORQUE | `tau` only |
+| 4 | HOLD | zero-velocity servo; a position servo holds where the hold began |
+| 5 | STAY_WITHIN | torque only outside the joint's declared travel, `tau` inside it |
+| 6 | ZERO | once, on the change into this mode: the current output position becomes `q`; the axis must be off and is stopped first |
+
+`kp` and `kd` are carried but not applied in this version. A `ZERO` repeated
+by a keep-alive is not a new request; it takes a change of mode away and
+back. The torque ceiling, velocity limit, acceleration limit and watchdog
+come from the joint's declared limits every tick, whatever the mode.
 
 `MotorState` (28 bytes): `q, dq, tau, current, voltage, temp: f32; fault u16; status u8; blocked u8`.
 `status` is an `AxisStatus` (0 ok, 1 silent, 2 alert, 3 refused, 4 off, 5 tripped);
 `blocked` says why a DRIVE request is not honoured (`safety::Blocked`).
 
 `LowCmd` (1560 bytes): `seq u32, flags u32, t_ns u64, n u16, reserved[6], cmd[64]`.
-`flags`: bit 0 ESTOP, bit 1 RESET_ESTOP.
+`flags`: bit 0 QUICK_STOP, bit 1 FAULT_RESET.
 
 `LowState` (1832 bytes): `seq u32, cmd_seq u32, tick u64, t_ns u64, period_ns u32,
 deadline_miss u32, estop_code u16, estop u8, reserved u8, n u16, reserved[2], state[64]`.
 
-How a driver reads `{mode, q, dq, kp, kd, tau}`:
+How a driver reads the modes:
 
-| driver | mode 0 | mode 1 |
-|---|---|---|
-| dynamixel | torque off | goal position = `q` through the mapping, clamped to the envelope; `dq`, `tau` not applied; `kp`/`kd` not applied in this version |
-| sim | stop | position target with the simulator's own PD |
-| moteus | (not on the bus trait yet) | |
+| driver | OFF | DRIVE | VELOCITY, TORQUE, STAY_WITHIN | HOLD | ZERO |
+|---|---|---|---|---|---|
+| dynamixel | torque off | goal position = `q` through the mapping, clamped; `dq`, `tau` not applied | refused (`status` 3); the servo is a position servo | goal position = where the hold began | refused; use `offset_rad` in the description |
+| sim | stop | position target with the simulator's own PD | native | native | native |
+| moteus | (not on the bus trait yet) | | | | |
 
-The torque ceiling, velocity limit, acceleration limit and watchdog come from
-the joint's declared limits every tick, whatever the client sends.
+A refused mode leaves the axis torque-off and says so in `status`; it does
+not trip the robot. Leaving any driving mode sends three stop frames before
+the axis is merely observed, so a released motor is told rather than left
+to its watchdog.
 
 ## The gate
 
 The session's enable-operation / disable-operation / fault state machine (CiA 402 names, see [ARCHITECTURE.md](ARCHITECTURE.md)), driven by `mode`:
 
 - `OFF` → the axis is read, not driven.
-- `DRIVE` → honoured once the axis passes preflight (telemetry received,
-  supply in band, no hard fault, position inside the envelope plus margin).
-  Until then it stays off and `blocked` says why.
+- `DRIVE`, `VELOCITY`, `TORQUE`, `HOLD`, `STAY_WITHIN` → honoured once the
+  axis passes preflight (telemetry received, supply in band, no hard fault,
+  position inside the envelope plus margin). Until then it stays off and
+  `blocked` says why.
+- `ZERO` → not a drive: the axis is stopped if it was driving, then
+  re-referenced once.
 - A guard trip, `max_consecutive_timeouts` silent ticks on a driven axis,
   `deadline_miss_trip` consecutive late ticks, a transport failure, or the
   client's QUICK_STOP flag latches a robot-wide fault: every axis gets Stop,
@@ -62,8 +81,9 @@ The session's enable-operation / disable-operation / fault state machine (CiA 40
 - FAULT_RESET clears the latch. Every axis is then OFF and has to be asked
   for again — clearing a stop drives nothing.
 - A `LowCmd` older than `api.cmd_timeout_ms` is stale: `on_cmd_timeout:
-  hold` keeps the last `q` with `dq`/`tau` zeroed, `release` turns every
-  axis off. The servo's own bus watchdog is the second layer.
+  hold` keeps the last `q` with `dq`/`tau` zeroed (a stale `VELOCITY` or
+  `TORQUE` becomes a `HOLD`), `release` turns every axis off. The servo's
+  own bus watchdog is the second layer.
 
 ## Configuration
 

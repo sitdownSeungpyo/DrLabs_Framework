@@ -5,7 +5,9 @@
 //! 1. take the latest [`LowCmd`] snapshot and note how old it is;
 //! 2. act on its robot-wide flags, once per command sequence number;
 //! 3. for every axis, decide through the gate whether it is driven, and
-//!    build its motor-space command — clamped to the safety envelope;
+//!    build its motor-space command — clamped to the safety envelope; an
+//!    axis that has just left driving gets a short burst of stops, and an
+//!    axis that is off and was asked to re-reference gets that once;
 //! 4. one call into the bus, the only blocking I/O on the thread;
 //! 5. for every axis, merge the reply, run the guard, convert to joint
 //!    space, and latch the robot-wide stop if anything tripped;
@@ -25,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use drlabs_core::bus::{AxisCmd, AxisReply, AxisStatus, Bus};
 use drlabs_core::command::{Command, Field, Mode, QueryProfile, TorqueLimit};
+use drlabs_core::command::ControlMode;
 use drlabs_core::lowlevel::{flags, mode, LowCmd, MotorCmd, MotorState, MAX_AXES};
-use drlabs_core::units::{Nm, Rad, RadPerSec};
+use drlabs_core::units::{Nm, Rad, RadPerSec, Rev, RevPerSec};
 use drlabs_safety::{Config as SafetyConfig, Guard, TripCode};
 use drlabs_timing::{sleep_until, Resolution};
 
@@ -98,6 +101,11 @@ impl BusState {
     };
 }
 
+/// Stop frames sent after an axis leaves driving, before it is merely
+/// observed. One would do for a controller that acts on the first; a
+/// dropped frame on a noisy bus should not leave a motor energised.
+const STOP_BURST: u32 = 3;
+
 struct Axis {
     spec: AxisSpec,
     guard: Guard,
@@ -106,7 +114,18 @@ struct Axis {
     known: AxisReply,
     silent_run: u32,
     /// What the guard should expect the axis to be doing.
-    velocity_target: drlabs_core::units::RevPerSec,
+    velocity_target: RevPerSec,
+    /// The client's mode in the previous tick, for the edges that matter:
+    /// a change into `ZERO`.
+    last_mode: u8,
+    /// Stops still to send after the axis left driving.
+    stop_ticks: u32,
+    /// Where a hold latched, for a bus that cannot hold natively.
+    hold_at: Option<Rev>,
+    /// A re-reference waiting for the axis to be stopped, in motor space.
+    zero_pending: Option<Rev>,
+    /// Whether the bus holds zero velocity natively.
+    can_hold: bool,
 }
 
 pub struct BusWorker {
@@ -142,13 +161,19 @@ impl BusWorker {
         assert_eq!(bus.axes(), specs.len(), "one spec per axis on the bus");
         let axes = specs
             .iter()
-            .map(|spec| Axis {
+            .enumerate()
+            .map(|(index, spec)| Axis {
                 spec: *spec,
                 guard: Guard::new(spec.safety),
                 gate: AxisGate::default(),
                 known: AxisReply::SILENT,
                 silent_run: 0,
-                velocity_target: drlabs_core::units::RevPerSec(0.0),
+                velocity_target: RevPerSec(0.0),
+                last_mode: mode::OFF,
+                stop_ticks: 0,
+                hold_at: None,
+                zero_pending: None,
+                can_hold: bus.capabilities(index).modes.contains(&ControlMode::Hold),
             })
             .collect();
         Self {
@@ -277,24 +302,62 @@ impl BusWorker {
             } else {
                 MotorCmd::OFF
             };
+
+            // The edges are the client's own mode, before the stale rewrite:
+            // a keep-alive that repeats the record is not a new request.
+            if motor.mode != axis.last_mode {
+                axis.last_mode = motor.mode;
+                if motor.mode == mode::ZERO {
+                    axis.zero_pending =
+                        Some(axis.spec.mapping.motor_position(Rad(motor.q as f64)));
+                }
+            }
+
             if stale {
                 match self.config.on_timeout {
                     TimeoutPolicy::Release => motor.mode = mode::OFF,
                     TimeoutPolicy::Hold => {
+                        // A position is kept; a velocity or a torque has
+                        // nothing to keep, so it becomes a hold.
                         motor.dq = 0.0;
                         motor.tau = 0.0;
+                        if motor.mode == mode::VELOCITY || motor.mode == mode::TORQUE {
+                            motor.mode = mode::HOLD;
+                        }
                     }
                 }
             }
-            let want = motor.mode == mode::DRIVE;
+            if motor.mode == mode::HOLD {
+                // Latched once, where the axis was when the hold began, so a
+                // position servo holds a place rather than chasing a reading.
+                if axis.hold_at.is_none() {
+                    axis.hold_at = axis.known.position;
+                }
+            } else {
+                axis.hold_at = None;
+            }
+
+            let want = mode::drives(motor.mode);
+            let was_driving = axis.gate.driving;
             let drive = axis
                 .gate
                 .decide(want, &axis.known, &mut axis.guard, stopped);
+            if was_driving && !drive {
+                axis.stop_ticks = STOP_BURST;
+            }
 
             let command = if stopped {
+                // A stop cancels what was pending; the client asks again.
+                axis.zero_pending = None;
                 Command::new(Mode::Stop)
             } else if drive {
-                drive_command(&axis.spec, &motor, self.config.period, resend)
+                let hold_at = if axis.can_hold { None } else { axis.hold_at };
+                drive_command(&axis.spec, &motor, self.config.period, resend, hold_at)
+            } else if axis.stop_ticks > 0 {
+                axis.stop_ticks -= 1;
+                Command::new(Mode::Stop)
+            } else if let Some(position) = axis.zero_pending.take() {
+                Command::new(Mode::SetOutput { position })
             } else {
                 Command::new(Mode::Query)
             };
@@ -343,18 +406,27 @@ impl BusWorker {
 
 /// The motor-space command for a driven axis.
 ///
-/// What each field of the client's command becomes:
+/// What each field of the client's command becomes, by mode:
 ///
-/// | client | motor-space command |
+/// | mode | motor-space command |
 /// |---|---|
-/// | `q` | `position`, through the mapping, clamped to the envelope |
-/// | `dq` | `velocity` (feed-forward), through the mapping, clamped |
-/// | `tau` | `feedforward_torque`, through the mapping, clamped |
+/// | `DRIVE` | `position` = `q`, `velocity` = `dq` (feed-forward), `feedforward_torque` = `tau` |
+/// | `VELOCITY` | `velocity` = `dq`, no position target, `feedforward_torque` = `tau`; `stop_position` = the envelope edge ahead |
+/// | `TORQUE` | `feedforward_torque` = `tau`, no position or velocity opinion |
+/// | `HOLD` | `Hold` (zero velocity); on a bus without it, `position` = where the hold began, `velocity` 0 |
+/// | `STAY_WITHIN` | `StayWithin` at the envelope's bounds, `feedforward_torque` = `tau` |
 /// | `kp`, `kd` | not applied in this version: the controller's own gains stand |
 ///
-/// The torque ceiling, velocity limit, acceleration limit and watchdog come
-/// from the safety envelope, every tick.
-fn drive_command(spec: &AxisSpec, motor: &MotorCmd, period: Duration, resend: bool) -> Command {
+/// Every value goes through the mapping and is clamped to the envelope. The
+/// torque ceiling, velocity limit, acceleration limit and watchdog come from
+/// the safety envelope, every tick, whatever the mode.
+fn drive_command(
+    spec: &AxisSpec,
+    motor: &MotorCmd,
+    period: Duration,
+    resend: bool,
+    hold_at: Option<Rev>,
+) -> Command {
     let mapping = &spec.mapping;
     let safety = &spec.safety;
 
@@ -364,18 +436,72 @@ fn drive_command(spec: &AxisSpec, motor: &MotorCmd, period: Duration, resend: bo
         .motor_torque(Nm(motor.tau as f64))
         .clamp_to(-safety.max_torque, safety.max_torque);
 
-    Command {
-        mode: Mode::Position,
-        position: Field::Set(position),
-        velocity: Field::Set(velocity),
-        feedforward_torque: Field::Set(feedforward),
+    let limits = Command {
         max_torque: TorqueLimit::Nm(safety.max_torque),
         watchdog: Field::Set(safety.watchdog_timeout(period.as_secs_f64())),
         velocity_limit: Field::Set(safety.max_velocity),
         accel_limit: Field::Set(safety.accel_limit),
         full: resend,
-        velocity_target: velocity,
         ..Command::default()
+    };
+
+    match motor.mode {
+        mode::VELOCITY => Command {
+            mode: Mode::Velocity,
+            velocity: Field::Set(velocity),
+            feedforward_torque: Field::Set(feedforward),
+            // Run to the edge of the travel and no further, on a controller
+            // that honours a stop position; the guard's envelope trip is the
+            // layer behind it.
+            stop_position: Field::Set(if velocity.value() < 0.0 {
+                safety.position_min
+            } else {
+                safety.position_max
+            }),
+            velocity_target: velocity,
+            ..limits
+        },
+        mode::TORQUE => Command {
+            mode: Mode::Torque,
+            feedforward_torque: Field::Set(feedforward),
+            velocity_target: RevPerSec(0.0),
+            ..limits
+        },
+        mode::HOLD => match hold_at {
+            Some(at) => Command {
+                mode: Mode::Position,
+                position: Field::Set(safety.clamp_position(at).0),
+                velocity: Field::Set(RevPerSec(0.0)),
+                feedforward_torque: Field::Set(Nm(0.0)),
+                velocity_target: RevPerSec(0.0),
+                ..limits
+            },
+            None => Command {
+                mode: Mode::Hold,
+                velocity_target: RevPerSec(0.0),
+                ..limits
+            },
+        },
+        mode::STAY_WITHIN => Command {
+            mode: Mode::StayWithin {
+                lower: safety.position_min,
+                upper: safety.position_max,
+            },
+            feedforward_torque: Field::Set(feedforward),
+            // The bounds are the point of this mode, so they go out every
+            // cycle rather than only on a parameter refresh.
+            full: true,
+            velocity_target: RevPerSec(0.0),
+            ..limits
+        },
+        _ => Command {
+            mode: Mode::Position,
+            position: Field::Set(position),
+            velocity: Field::Set(velocity),
+            feedforward_torque: Field::Set(feedforward),
+            velocity_target: velocity,
+            ..limits
+        },
     }
 }
 
@@ -651,7 +777,7 @@ mod tests {
             tau: 50.0,
             ..MotorCmd::OFF
         };
-        let command = drive_command(&s, &motor, Duration::from_millis(2), false);
+        let command = drive_command(&s, &motor, Duration::from_millis(2), false, None);
         let max = s.safety.position_max;
         assert_eq!(command.position.get(), Some(max));
         assert_eq!(command.velocity.get(), Some(s.safety.max_velocity));
@@ -659,5 +785,330 @@ mod tests {
         assert_eq!(command.max_torque, TorqueLimit::Nm(s.safety.max_torque));
         assert!(max < Rev(0.3), "±1.5 rad is ±0.24 rev");
         let _ = RadPerSec2(0.0);
+    }
+
+    /// A bus that remembers what it was told, so a test can see the modes
+    /// the worker chose rather than only where the axes ended up.
+    struct Recording {
+        inner: SimBus,
+        log: Arc<std::sync::Mutex<Vec<Vec<Command>>>>,
+        holds: bool,
+    }
+
+    impl Bus for Recording {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+        fn axes(&self) -> usize {
+            self.inner.axes()
+        }
+        fn open(&mut self) -> drlabs_core::Result<Vec<Option<drlabs_core::Identity>>> {
+            self.inner.open()
+        }
+        fn close(&mut self) -> drlabs_core::Result<()> {
+            self.inner.close()
+        }
+        fn cycle(&mut self, cmds: &[AxisCmd], out: &mut [AxisReply]) -> drlabs_core::Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(cmds.iter().map(|c| c.command).collect());
+            self.inner.cycle(cmds, out)
+        }
+        fn capabilities(&self, axis: usize) -> drlabs_core::Capabilities {
+            let mut capabilities = self.inner.capabilities(axis);
+            if !self.holds {
+                capabilities.modes.retain(|m| *m != ControlMode::Hold);
+            }
+            capabilities
+        }
+    }
+
+    type Log = Arc<std::sync::Mutex<Vec<Vec<Command>>>>;
+
+    fn recording(
+        axes: usize,
+        holds: bool,
+        at: Rev,
+        on_timeout: TimeoutPolicy,
+    ) -> (BusWorker, Writer<Stamped<LowCmd>>, Reader<BusState>, Estop, Log) {
+        let (cmd_tx, cmd_rx) = triple(Stamped::now(LowCmd::EMPTY));
+        let (state_tx, state_rx) = triple(BusState::EMPTY);
+        let estop = Estop::new();
+        let specs: Vec<AxisSpec> = (0..axes).map(spec).collect();
+        let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut inner = SimBus::new(axes).fixed_step(0.002);
+        for axis in 0..axes {
+            inner = inner.at(axis, at);
+        }
+        let mut bus = Recording {
+            inner,
+            log: Arc::clone(&log),
+            holds,
+        };
+        bus.open().unwrap();
+        let worker = BusWorker::new(
+            WorkerConfig {
+                name: "rec".into(),
+                period: Duration::from_millis(2),
+                cmd_timeout: Duration::from_millis(100),
+                on_timeout,
+                deadline_miss_trip: 0,
+                full_every: 10,
+                resend_every: 50,
+                priority: 0,
+                cpu: None,
+            },
+            Box::new(bus),
+            &specs,
+            cmd_rx,
+            state_tx,
+            estop.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+        (worker, cmd_tx, state_rx, estop, log)
+    }
+
+    fn one(mode: u8, q: f32, dq: f32, tau: f32, seq: u32) -> LowCmd {
+        let mut cmd = LowCmd::EMPTY;
+        cmd.seq = seq;
+        cmd.n = 1;
+        cmd.cmd[0] = MotorCmd {
+            mode,
+            q,
+            dq,
+            tau,
+            ..MotorCmd::OFF
+        };
+        cmd
+    }
+
+    fn last_mode(log: &Log) -> Mode {
+        log.lock().unwrap().last().unwrap()[0].mode
+    }
+
+    /// A velocity command runs the axis without a position target, and a
+    /// torque command pushes it. Neither needs `q`.
+    #[test]
+    fn velocity_and_torque_modes_move_the_axis_without_a_target() {
+        let (mut worker, mut cmd_tx, mut state_rx, estop, log) =
+            recording(1, true, Rev(0.0), TimeoutPolicy::Hold);
+        let start = Instant::now();
+        for i in 0..250u64 {
+            // Kept fresh: a command older than the timeout becomes a hold.
+            let now = start + Duration::from_millis(2 * i);
+            cmd_tx.publish(Stamped {
+                value: one(mode::VELOCITY, 0.0, 1.0, 0.0, 1),
+                at: now,
+            });
+            worker.tick(now);
+        }
+        assert_eq!(last_mode(&log), Mode::Velocity);
+        let sent = log.lock().unwrap().last().unwrap()[0];
+        assert_eq!(sent.position.get(), None, "no position target in velocity mode");
+        assert_eq!(
+            sent.stop_position.get(),
+            Some(spec(0).safety.position_max),
+            "the stop is the envelope edge ahead"
+        );
+        let (state, _) = state_rx.latest();
+        assert_eq!(state.state[0].status, AxisStatus::Ok as u8);
+        assert!((state.state[0].dq - 1.0).abs() < 0.1, "{:?}", state.state[0]);
+        assert!(state.state[0].q > 0.3, "{:?}", state.state[0]);
+
+        // Torque: a push, briefly, so the sim axis does not reach the
+        // envelope.
+        cmd_tx.publish(Stamped {
+            value: one(mode::TORQUE, 0.0, 0.0, -0.05, 2),
+            at: start + Duration::from_millis(500),
+        });
+        for i in 250..270u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert_eq!(last_mode(&log), Mode::Torque);
+        let sent = log.lock().unwrap().last().unwrap()[0];
+        assert_eq!(sent.position.get(), None);
+        assert_eq!(sent.velocity.get(), None);
+        assert!((sent.feedforward_torque.get().unwrap().value() + 0.05).abs() < 1e-9);
+        assert_eq!(estop.code(), None);
+    }
+
+    /// A hold is the controller's own zero-velocity mode where it has one,
+    /// and a position at the place the hold began where it does not.
+    #[test]
+    fn a_hold_is_native_or_a_latched_position() {
+        for holds in [true, false] {
+            let (mut worker, mut cmd_tx, mut state_rx, _, log) =
+                recording(1, holds, Rev(0.1), TimeoutPolicy::Hold);
+            let start = Instant::now();
+            cmd_tx.publish(Stamped {
+                value: one(mode::HOLD, 0.0, 0.0, 0.0, 1),
+                at: start,
+            });
+            for i in 0..50u64 {
+                worker.tick(start + Duration::from_millis(2 * i));
+            }
+            let sent = log.lock().unwrap().last().unwrap()[0];
+            if holds {
+                assert_eq!(sent.mode, Mode::Hold);
+            } else {
+                assert_eq!(sent.mode, Mode::Position);
+                assert!((sent.position.get().unwrap().value() - 0.1).abs() < 1e-3);
+                assert_eq!(sent.velocity.get(), Some(RevPerSec(0.0)));
+            }
+            let (state, _) = state_rx.latest();
+            assert_eq!(state.state[0].status, AxisStatus::Ok as u8, "holds={holds}");
+            assert!((state.state[0].q - Rev(0.1).to_rad().value() as f32).abs() < 0.05);
+        }
+    }
+
+    /// With the `hold` policy a stale velocity or torque command has
+    /// nothing to keep, so it becomes a hold; a stale position keeps its
+    /// target.
+    #[test]
+    fn a_stale_velocity_command_becomes_a_hold() {
+        let (mut worker, mut cmd_tx, _, _, log) =
+            recording(1, true, Rev(0.0), TimeoutPolicy::Hold);
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::VELOCITY, 0.0, 0.5, 0.0, 1),
+            at: start,
+        });
+        for i in 0..10u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert_eq!(last_mode(&log), Mode::Velocity);
+        worker.tick(start + Duration::from_millis(200));
+        assert_eq!(last_mode(&log), Mode::Hold);
+        assert_eq!(worker.driving(), vec![true]);
+    }
+
+    /// Stay-within carries the envelope as its bounds, every cycle.
+    #[test]
+    fn stay_within_uses_the_envelope_as_its_bounds() {
+        let s = spec(0);
+        let motor = MotorCmd {
+            mode: mode::STAY_WITHIN,
+            tau: 0.1,
+            ..MotorCmd::OFF
+        };
+        let command = drive_command(&s, &motor, Duration::from_millis(2), false, None);
+        assert_eq!(
+            command.mode,
+            Mode::StayWithin {
+                lower: s.safety.position_min,
+                upper: s.safety.position_max
+            }
+        );
+        assert!(command.full, "the bounds go out every cycle");
+        assert!((command.feedforward_torque.get().unwrap().value() - 0.1).abs() < 1e-6);
+    }
+
+    /// Leaving driving sends a burst of stops before the axis is merely
+    /// observed: a released motor must be told so, not left to its watchdog.
+    #[test]
+    fn a_release_sends_stops_then_queries() {
+        let (mut worker, mut cmd_tx, _, _, log) =
+            recording(1, true, Rev(0.0), TimeoutPolicy::Hold);
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 0.0, 0.0, 0.0, 1),
+            at: start,
+        });
+        for i in 0..5u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert_eq!(last_mode(&log), Mode::Position);
+        cmd_tx.publish(Stamped {
+            value: one(mode::OFF, 0.0, 0.0, 0.0, 2),
+            at: start,
+        });
+        let before = log.lock().unwrap().len();
+        for i in 5..15u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        let modes: Vec<Mode> = log.lock().unwrap()[before..]
+            .iter()
+            .map(|c| c[0].mode)
+            .collect();
+        assert_eq!(&modes[..STOP_BURST as usize], &[Mode::Stop; 3]);
+        assert!(modes[STOP_BURST as usize..]
+            .iter()
+            .all(|m| *m == Mode::Query), "{modes:?}");
+    }
+
+    /// A re-reference happens once, on the change of mode, and not again
+    /// for a keep-alive that repeats the record; and an axis that was
+    /// driving is stopped before it is re-referenced.
+    #[test]
+    fn a_zero_request_re_references_once_after_the_axis_is_stopped() {
+        let (mut worker, mut cmd_tx, mut state_rx, _, log) =
+            recording(1, true, Rev(0.3), TimeoutPolicy::Hold);
+        let start = Instant::now();
+        let set_outputs = |log: &Log| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|c| matches!(c[0].mode, Mode::SetOutput { .. }))
+                .count()
+        };
+
+        // Off, then ZERO: the very next cycle re-references.
+        worker.tick(start);
+        let (state, _) = state_rx.latest();
+        assert!((state.state[0].q - Rev(0.3).to_rad().value() as f32).abs() < 1e-3);
+        cmd_tx.publish(Stamped {
+            value: one(mode::ZERO, 0.0, 0.0, 0.0, 1),
+            at: start,
+        });
+        worker.tick(start + Duration::from_millis(2));
+        assert_eq!(last_mode(&log), Mode::SetOutput { position: Rev(0.0) });
+        assert_eq!(set_outputs(&log), 1);
+        let (state, _) = state_rx.latest();
+        assert!(state.state[0].q.abs() < 1e-3, "{:?}", state.state[0]);
+        assert_eq!(state.state[0].status, AxisStatus::Off as u8);
+
+        // The same record again, with a new sequence number: nothing.
+        for seq in 2..6u32 {
+            cmd_tx.publish(Stamped {
+                value: one(mode::ZERO, 0.0, 0.0, 0.0, seq),
+                at: start,
+            });
+            worker.tick(start + Duration::from_millis(2 * seq as u64));
+        }
+        assert_eq!(set_outputs(&log), 1, "a keep-alive is not a new request");
+        assert_eq!(last_mode(&log), Mode::Query);
+
+        // Drive, then ZERO at 0.5 rad: three stops first, then the
+        // re-reference, then queries.
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 0.0, 0.0, 0.0, 6),
+            at: start,
+        });
+        for i in 6..12u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert_eq!(worker.driving(), vec![true]);
+        cmd_tx.publish(Stamped {
+            value: one(mode::ZERO, 0.5, 0.0, 0.0, 7),
+            at: start,
+        });
+        let before = log.lock().unwrap().len();
+        for i in 12..20u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        let modes: Vec<Mode> = log.lock().unwrap()[before..]
+            .iter()
+            .map(|c| c[0].mode)
+            .collect();
+        assert_eq!(&modes[..3], &[Mode::Stop; 3]);
+        assert_eq!(
+            modes[3],
+            Mode::SetOutput {
+                position: Rad(0.5).to_rev()
+            }
+        );
+        assert!(modes[4..].iter().all(|m| *m == Mode::Query), "{modes:?}");
+        assert_eq!(set_outputs(&log), 2);
     }
 }

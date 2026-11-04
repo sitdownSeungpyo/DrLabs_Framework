@@ -230,6 +230,34 @@ impl Client {
         );
     }
 
+    /// Asks for one joint in any mode, with the full entry.
+    pub fn set_mode(&self, index: usize, mode: u8, q: f32, dq: f32, tau: f32) {
+        self.set(
+            index,
+            MotorCmd {
+                mode,
+                q,
+                dq,
+                tau,
+                ..MotorCmd::OFF
+            },
+        );
+    }
+
+    /// Re-references one joint: its current output position becomes `q`.
+    /// The runtime acts once, on the change into `ZERO`, so the entry has
+    /// to go back to `OFF` (via [`Client::release`]) before a second one.
+    pub fn zero(&self, index: usize, q: f32) {
+        self.set(
+            index,
+            MotorCmd {
+                mode: mode::ZERO,
+                q,
+                ..MotorCmd::OFF
+            },
+        );
+    }
+
     /// Turns one joint off.
     pub fn release(&self, index: usize) {
         if let Some(entry) = self.shared.cmd.lock().unwrap().cmd.get_mut(index) {

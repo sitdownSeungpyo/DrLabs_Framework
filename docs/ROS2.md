@@ -22,7 +22,7 @@ installed: it hand-writes the same CDR the generated types produce
 
 | message | fields |
 |---|---|
-| `MotorCmd` | `uint8 mode` (0 OFF, 1 DRIVE), `float32 q, dq, kp, kd, tau` |
+| `MotorCmd` | `uint8 mode` (0 OFF, 1 DRIVE, 2 VELOCITY, 3 TORQUE, 4 HOLD, 5 STAY_WITHIN, 6 ZERO), `float32 q, dq, kp, kd, tau` |
 | `MotorState` | `float32 q, dq, tau, current, voltage, temp`, `uint16 fault`, `uint8 status, blocked` |
 | `LowCmd` | `uint32 seq, flags`, `uint64 t_ns`, `uint16 n`, `MotorCmd[64] cmd` |
 | `LowState` | `uint32 seq, cmd_seq`, `uint64 tick, t_ns`, `uint32 period_ns, deadline_miss`, `uint16 estop_code`, `uint8 estop`, `uint16 n`, `MotorState[64] state` |

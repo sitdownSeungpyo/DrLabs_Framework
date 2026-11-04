@@ -15,7 +15,10 @@ pub mod record;
 pub mod session;
 pub mod shuttle;
 pub mod state;
-pub mod trajectory;
+/// The profile now lives in the core; re-exported so nothing above moves.
+pub mod trajectory {
+    pub use drlabs_core::trajectory::{Point, ProfileError, Trapezoidal};
+}
 
 pub use record::{Event, Level, Sample};
 pub use session::{Options, Session, Status};

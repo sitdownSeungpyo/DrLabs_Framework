@@ -24,7 +24,7 @@ use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
 use drlabs_core::{AxisStatus, DriveState};
 use drlabs_rt::Config;
 use drlabs_safety::{Blocked, TripCode};
-use drlabs_session::trajectory::Trapezoidal;
+use drlabs_core::trajectory::Trapezoidal;
 
 use crate::flags::{Flags, Kind};
 use http::{parse_learn, parse_limits, parse_move, parse_pose, quote, Request, Response};

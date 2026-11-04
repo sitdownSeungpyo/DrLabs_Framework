@@ -1,5 +1,10 @@
 //! Host-side motion profiles.
 //!
+//! The runtime does not plan moves; a client does, and streams the samples
+//! as setpoints. This lives in the core so a client needs no more than the
+//! core to plan one. The arithmetic is unit-agnostic: the panel uses it in
+//! radians at the joint, a motor-space caller in revolutions.
+//!
 //! Both CAN controller families can profile a move themselves — moteus from its
 //! velocity and acceleration limits, RobStride from its CSP speed limit — and
 //! when they can, letting them do it is better: the profile is regenerated at
@@ -14,7 +19,7 @@
 //! * the host wants the velocity feedforward that comes with knowing where on
 //!   the profile it is, which a bare position setpoint cannot express.
 
-use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
+use crate::units::{Rev, RevPerSec, RevPerSec2};
 
 /// One point on a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

@@ -1,6 +1,6 @@
 """What a client does above the runtime: profiled moves.
 
-A port of ``crates/drlabs-session/src/trajectory.rs``.  The runtime takes
+A port of ``crates/drlabs-core/src/trajectory.rs``.  The runtime takes
 setpoints; a move is the client sending the right setpoint at the right
 time, and this is where "right" is worked out.
 """

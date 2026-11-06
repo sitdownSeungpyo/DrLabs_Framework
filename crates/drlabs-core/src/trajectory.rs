@@ -200,9 +200,144 @@ impl Trapezoidal {
     }
 }
 
+/// One axis's share of a coordinated move: where it is, where it goes, and
+/// the most it may be asked to do on the way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Leg {
+    pub start: Rev,
+    pub target: Rev,
+    pub max_velocity: RevPerSec,
+    pub accel: RevPerSec2,
+}
+
+/// Plans several axes so that they leave together and arrive together.
+///
+/// Planned independently, each axis finishes when its own distance and limits
+/// say, so a short move lands early and the joints take different paths
+/// through the space between. Here the slowest axis keeps its natural profile
+/// and every other axis is stretched in time to match it.
+///
+/// A profile stretched in time by a factor `s` is still a trapezoid: the same
+/// shape with the velocity limit divided by `s` and the acceleration limit by
+/// `s²`. That keeps every axis inside the limits it was given — time is only
+/// ever added, never removed — and makes the arrival times equal by
+/// construction rather than by tuning. An axis that does not move stays put.
+///
+/// The result is in the order of `legs`. Any leg with unusable limits fails
+/// the whole plan, so a move is never started on half the machine.
+pub fn synchronized(legs: &[Leg]) -> Result<Vec<Trapezoidal>, ProfileError> {
+    let natural = legs
+        .iter()
+        .map(|leg| Trapezoidal::new(leg.start, leg.target, leg.max_velocity, leg.accel))
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = natural
+        .iter()
+        .map(Trapezoidal::total_time)
+        .fold(0.0, f64::max);
+
+    legs.iter()
+        .zip(&natural)
+        .map(|(leg, profile)| {
+            let own = profile.total_time();
+            // The slowest axis, and any axis with nowhere to go, keep theirs.
+            if own == 0.0 || own >= total {
+                return Ok(*profile);
+            }
+            let stretch = total / own;
+            Trapezoidal::new(
+                leg.start,
+                leg.target,
+                RevPerSec(leg.max_velocity.value() / stretch),
+                RevPerSec2(leg.accel.value() / (stretch * stretch)),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leg(start: f64, target: f64, velocity: f64, accel: f64) -> Leg {
+        Leg {
+            start: Rev(start),
+            target: Rev(target),
+            max_velocity: RevPerSec(velocity),
+            accel: RevPerSec2(accel),
+        }
+    }
+
+    /// The point of the exercise: a long move, a short one and a triangle
+    /// finish at the same instant, each exactly on its own target.
+    #[test]
+    fn synchronized_axes_arrive_together() {
+        let legs = [
+            leg(0.0, 3.0, 1.0, 2.0),  // long: trapezoid, the slowest
+            leg(0.0, 0.5, 1.0, 2.0),  // shorter: stretched
+            leg(1.0, 0.98, 4.0, 1.0), // tiny and backwards: a triangle
+        ];
+        let profiles = synchronized(&legs).unwrap();
+        let slowest = profiles[0].total_time();
+        for (profile, leg) in profiles.iter().zip(&legs) {
+            assert!(
+                (profile.total_time() - slowest).abs() < 1e-9,
+                "{} against {slowest}",
+                profile.total_time()
+            );
+            assert_eq!(profile.sample(profile.total_time()).position, leg.target);
+        }
+    }
+
+    /// Stretching must only ever slow an axis down. Sampled finely, no axis
+    /// exceeds the velocity or acceleration it was allowed.
+    #[test]
+    fn synchronizing_never_exceeds_a_limit() {
+        let legs = [
+            leg(0.0, 3.0, 1.0, 2.0),
+            leg(0.0, 0.5, 1.0, 2.0),
+            leg(1.0, 0.98, 4.0, 1.0),
+        ];
+        let profiles = synchronized(&legs).unwrap();
+        for (profile, leg) in profiles.iter().zip(&legs) {
+            for point in profile.generate(2000.0) {
+                assert!(point.velocity.value().abs() <= leg.max_velocity.value() + 1e-9);
+                assert!(point.accel.value().abs() <= leg.accel.value() + 1e-9);
+            }
+        }
+    }
+
+    /// The slowest axis is not touched: it is the reference the rest are
+    /// stretched to, and its profile is the one it would have had alone.
+    #[test]
+    fn the_slowest_axis_keeps_its_own_profile() {
+        let legs = [leg(0.0, 3.0, 1.0, 2.0), leg(0.0, 0.5, 1.0, 2.0)];
+        let profiles = synchronized(&legs).unwrap();
+        let alone = Trapezoidal::new(Rev(0.0), Rev(3.0), RevPerSec(1.0), RevPerSec2(2.0)).unwrap();
+        assert_eq!(profiles[0], alone);
+    }
+
+    /// An axis that is already where it is told to go has no profile to
+    /// stretch; it must not turn a zero time into a division by zero.
+    #[test]
+    fn an_axis_with_nowhere_to_go_stays_put() {
+        let legs = [leg(0.0, 2.0, 1.0, 2.0), leg(0.7, 0.7, 1.0, 2.0)];
+        let profiles = synchronized(&legs).unwrap();
+        assert_eq!(profiles[1].total_time(), 0.0);
+        assert_eq!(profiles[1].sample(0.5).position, Rev(0.7));
+        assert!(profiles[0].total_time() > 0.0);
+    }
+
+    #[test]
+    fn no_axes_is_an_empty_plan() {
+        assert_eq!(synchronized(&[]).unwrap(), Vec::new());
+    }
+
+    /// One bad limit refuses the whole plan.
+    #[test]
+    fn one_unusable_limit_refuses_the_whole_move() {
+        let legs = [leg(0.0, 1.0, 1.0, 2.0), leg(0.0, 1.0, 0.0, 2.0)];
+        assert_eq!(synchronized(&legs), Err(ProfileError::VelocityNotPositive));
+    }
 
     #[test]
     fn a_profile_starts_where_it_says_and_ends_where_it_was_told() {

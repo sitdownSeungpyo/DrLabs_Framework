@@ -32,5 +32,5 @@ pub use link::{BoardStatus, Capabilities, Envelope, Identity, Link};
 pub use lowlevel::{LowCmd, LowState, MotorCmd, MotorState, MAX_AXES, PROTOCOL_VERSION};
 pub use render::{render, MotorUnits, Units};
 pub use telemetry::Telemetry;
-pub use trajectory::{Point, ProfileError, Trapezoidal};
+pub use trajectory::{synchronized, Leg, Point, ProfileError, Trapezoidal};
 pub use units::{Amps, Celsius, Nm, Rad, RadPerSec, RadPerSec2, Rev, RevPerSec, RevPerSec2, Volts};

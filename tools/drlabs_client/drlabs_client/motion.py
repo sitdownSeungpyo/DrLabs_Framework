@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,32 @@ class Trapezoidal:
             d = 0.5 * a * ta * ta + vc * tc + vc * s - 0.5 * a * s * s
             v = vc - a * s
         return self.start + direction * d, direction * v
+
+
+def synchronized(legs: Sequence[Tuple[float, float, float, float]]) -> List[Trapezoidal]:
+    """Plans several axes so they leave together and arrive together.
+
+    ``legs`` is ``(start, target, max_velocity, accel)`` per axis. The slowest
+    axis keeps its own profile; every other axis is stretched in time to match
+    it. A trapezoid stretched by ``s`` is the same shape with the velocity limit
+    divided by ``s`` and the acceleration limit by ``s**2``, so no axis ever
+    exceeds the limits it was given. An axis with nowhere to go stays put.
+
+    A port of ``synchronized`` in ``crates/drlabs-core/src/trajectory.rs``.
+    One unusable limit raises for the whole plan.
+    """
+    natural = [Trapezoidal(*leg) for leg in legs]
+    total = max((p.total_time for p in natural), default=0.0)
+    planned: List[Trapezoidal] = []
+    for (start, target, velocity, acceleration), profile in zip(legs, natural):
+        own = profile.total_time
+        if own == 0.0 or own >= total:
+            planned.append(profile)
+            continue
+        stretch = total / own
+        planned.append(Trapezoidal(start, target, velocity / stretch,
+                                   acceleration / (stretch * stretch)))
+    return planned
 
 
 def move_to(client, targets: Dict[str, float], max_velocity: float, accel: float,

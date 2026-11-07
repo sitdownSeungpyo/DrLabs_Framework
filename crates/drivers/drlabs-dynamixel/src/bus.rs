@@ -29,7 +29,7 @@
 use std::time::Duration;
 
 use drlabs_core::bus::{AxisCmd, AxisFault, AxisReply, AxisStatus, Bus};
-use drlabs_core::command::{ControlMode, Mode};
+use drlabs_core::command::{ControlMode, Mode, TorqueLimit};
 use drlabs_core::error::{Error, Result};
 use drlabs_core::link::{BoardStatus, Capabilities, Envelope, Identity};
 use drlabs_core::units::{Amps, Celsius, Nm, Rev, RevPerSec, Volts};
@@ -37,7 +37,10 @@ use drlabs_transport::serial::SharedPort;
 
 use crate::driver::{Driver, FastOutcome, Scratch};
 use crate::link::{watchdog_counts, EEPROM_SETTLE_TIME, RETURN_DELAY_COUNTS};
-use crate::profile::{known_model, profile_named, Profile, OP_MODE_EXTENDED_POSITION};
+use crate::profile::{
+    known_model, profile_named, Profile, OP_MODE_CURRENT_BASED_POSITION,
+    OP_MODE_EXTENDED_POSITION, PWM_FULL_SCALE,
+};
 use crate::protocol::MAX_VALID_MOTOR_ID;
 
 /// The most servos asked for in one plain sync read. See
@@ -57,12 +60,45 @@ pub const FAULT_WATCHDOG_LATCHED: i32 = 0x100;
 /// The alert bit seen before the error register has been read.
 pub const FAULT_ALERT: i32 = 0x80;
 
+/// How an axis's torque ceiling reaches the servo. Decided at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limiter {
+    /// Nothing the bus knows how to write: the ceiling is not enforced, and
+    /// the identity line says so.
+    None,
+    /// Current-based position mode, Goal Current. Families with a current
+    /// sensor.
+    Current,
+    /// Extended position mode with Goal PWM as the final output limiter.
+    /// Families without one.
+    Pwm,
+}
+
+/// A torque ceiling given in the servo's own units, which then stands in
+/// for the conversion from Nm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TorqueOverride {
+    /// Goal Current, mA (times the family's current unit).
+    pub current_ma: Option<u16>,
+    /// Goal PWM, counts of about 0.113 %.
+    pub pwm: Option<u16>,
+}
+
 struct Axis {
     id: u8,
     profile: Profile,
     declared: bool,
     model: Option<u32>,
     model_name: Option<&'static str>,
+
+    /// The torque ceiling's register, and its fixed value if the description
+    /// gave one in native units.
+    override_: TorqueOverride,
+    limiter: Limiter,
+    /// The servo's own Current Limit or PWM Limit, read at open.
+    torque_ceiling: u16,
+    last_torque_goal: Option<u16>,
+    torque_goal: Option<u16>,
 
     /// Whether the firmware answers a fast sync read. Found out at open.
     fast: bool,
@@ -97,6 +133,11 @@ impl Axis {
             declared: profile.is_some(),
             model: None,
             model_name: None,
+            override_: TorqueOverride::default(),
+            limiter: Limiter::None,
+            torque_ceiling: 0,
+            last_torque_goal: None,
+            torque_goal: None,
             fast: false,
             torque: false,
             velocity_limit_counts: None,
@@ -126,6 +167,93 @@ impl Axis {
     /// The fast block: current, velocity, position.
     fn fast_len(&self) -> u16 {
         self.profile.addr_present_position + 4 - self.profile.addr_present_current
+    }
+
+    /// Which register carries this axis's torque ceiling, from what the
+    /// family has and what the description gave.
+    fn choose_limiter(&self) -> Result<Limiter> {
+        let p = &self.profile;
+        let stall_known = p.stall_torque_nm.is_some() && p.stall_current_a.is_some();
+        if self.override_.current_ma.is_some() || self.override_.pwm.is_some() {
+            let known = if self.override_.current_ma.is_some() {
+                p.addr_current_limit
+            } else {
+                p.addr_pwm_limit
+            };
+            if known == 0 {
+                return Err(Error::Config(format!(
+                    "servo id {}: a native torque ceiling was given, but the {} profile does \
+                     not know its limit register or scale; it cannot be checked, so it is \
+                     not written",
+                    self.id, p.name
+                )));
+            }
+        }
+        if self.override_.current_ma.is_some() {
+            if !p.has_current_sense || p.addr_goal_current == 0 {
+                return Err(Error::Config(format!(
+                    "servo id {}: current_limit_ma given, but the {} has no current sensor \
+                     and no Goal Current; use pwm_limit",
+                    self.id, p.name
+                )));
+            }
+            return Ok(Limiter::Current);
+        }
+        if self.override_.pwm.is_some() {
+            return Ok(Limiter::Pwm);
+        }
+        Ok(if p.has_current_sense && p.addr_goal_current != 0 && stall_known {
+            Limiter::Current
+        } else if p.stall_torque_nm.is_some() && p.addr_goal_pwm != 0 {
+            Limiter::Pwm
+        } else {
+            Limiter::None
+        })
+    }
+
+    /// This tick's torque ceiling in register counts, if there is one to
+    /// write: the native override as given, else `limit` converted through
+    /// the stall figures. Never zero — a zero ceiling is a limp joint that
+    /// still reports itself driven.
+    fn torque_counts(&self, limit: TorqueLimit) -> Option<u16> {
+        let ceiling = self.torque_ceiling.max(1);
+        let fixed = match self.limiter {
+            Limiter::None => return None,
+            Limiter::Current => self.override_.current_ma,
+            Limiter::Pwm => self.override_.pwm,
+        };
+        if let Some(counts) = fixed {
+            return Some(counts.clamp(1, ceiling));
+        }
+        let nm = match limit {
+            TorqueLimit::Nm(nm) => nm.value().abs(),
+            TorqueLimit::Unchanged => return None,
+            // The controller's own configured limit: its ceiling register.
+            _ => return Some(ceiling),
+        };
+        if !nm.is_finite() {
+            return Some(ceiling);
+        }
+        let p = &self.profile;
+        let (stall_nm, stall_a) = (p.stall_torque_nm?, p.stall_current_a?);
+        let counts = match self.limiter {
+            Limiter::Current => nm * stall_a / stall_nm / p.current_amps_per_count,
+            Limiter::Pwm => nm / stall_nm * PWM_FULL_SCALE as f64,
+            Limiter::None => return None,
+        };
+        Some((counts.round().min(ceiling as f64) as u16).max(1))
+    }
+
+    fn limiter_line(&self) -> String {
+        let fixed = |kind: &str, counts: Option<u16>| match counts {
+            Some(c) => format!("{kind} {c} (as configured)"),
+            None => format!("{kind} from max_torque_nm via stall figures, approximate"),
+        };
+        match self.limiter {
+            Limiter::None => "torque ceiling NOT enforced (no stall figures for this family)".into(),
+            Limiter::Current => fixed("Goal Current", self.override_.current_ma),
+            Limiter::Pwm => fixed("Goal PWM", self.override_.pwm),
+        }
     }
 
     fn store(&mut self, data: &[u8], alert: bool) {
@@ -305,6 +433,22 @@ impl DynamixelBus {
         self
     }
 
+    /// Native-unit torque ceilings, in axis order (`current_limit_ma` /
+    /// `pwm_limit` in a joint's options). An axis left at the default
+    /// converts the command's `max_torque` instead.
+    pub fn with_torque_overrides(mut self, overrides: &[TorqueOverride]) -> Self {
+        for (axis, value) in self.axes.iter_mut().zip(overrides) {
+            axis.override_ = *value;
+        }
+        self
+    }
+
+    /// The register each axis's torque ceiling goes through, as decided at
+    /// open.
+    pub fn limiters(&self) -> Vec<(u8, Limiter)> {
+        self.axes.iter().map(|axis| (axis.id, axis.limiter)).collect()
+    }
+
     /// Whether each axis answers a fast sync read, as found at open. For a
     /// report line.
     pub fn fast_axes(&self) -> Vec<(u8, bool)> {
@@ -353,24 +497,68 @@ impl DynamixelBus {
             }
         }
 
-        // The one mode this bus drives. Set now, in EEPROM, so the tick never
-        // has to; read first so an already-right servo costs no write.
+        // The mode this bus drives the axis in, which depends on how its
+        // torque ceiling is enforced: current-based position (multi-turn,
+        // ±256 rev, e-Manual) where Goal Current carries it, extended
+        // position otherwise. Set now, in EEPROM, so the tick never has to;
+        // read first so an already-right servo costs no write. A change
+        // resets Goal PWM/Current to their limits, and mode 5 its PID too.
+        let limiter = self.axes[index].choose_limiter()?;
+        self.axes[index].limiter = limiter;
+        let wanted = if limiter == Limiter::Current {
+            OP_MODE_CURRENT_BASED_POSITION
+        } else {
+            OP_MODE_EXTENDED_POSITION
+        };
         let mode = self
             .driver
             .read(id, profile.addr_operating_mode, 1)
             .ok()
             .and_then(|data| data.first().copied());
-        if mode != Some(OP_MODE_EXTENDED_POSITION) {
+        if mode != Some(wanted) {
             self.driver.write_u8(id, profile.addr_torque_enable, 0)?;
             self.driver
-                .write_u8(id, profile.addr_operating_mode, OP_MODE_EXTENDED_POSITION)
+                .write_u8(id, profile.addr_operating_mode, wanted)
                 .map_err(|error| {
                     Error::Refused(format!(
-                        "servo id {id}: setting extended position mode: {error}"
+                        "servo id {id}: setting operating mode {wanted}: {error}"
                     ))
                 })?;
             std::thread::sleep(EEPROM_SETTLE_TIME);
         }
+
+        // The servo's own ceiling for the register, which Goal Current/PWM
+        // cannot exceed: read, not assumed, because it is EEPROM somebody
+        // may have set.
+        // A ceiling that cannot be read is not assumed: a guessed one above
+        // the servo's real limit is a write it refuses, silently, leaving
+        // the register at its full limit.
+        let limit_addr = match limiter {
+            Limiter::Current => profile.addr_current_limit,
+            Limiter::Pwm => profile.addr_pwm_limit,
+            Limiter::None => 0,
+        };
+        self.axes[index].torque_ceiling = 0;
+        if limiter != Limiter::None {
+            let data = self.driver.read(id, limit_addr, 2).map_err(|error| {
+                Error::Refused(format!(
+                    "servo id {id}: reading its {} ceiling (register {limit_addr}): {error}",
+                    if limiter == Limiter::Current { "current" } else { "PWM" }
+                ))
+            })?;
+            let value = match data.as_slice() {
+                [lo, hi] => u16::from_le_bytes([*lo, *hi]),
+                _ => 0,
+            };
+            if value == 0 {
+                return Err(Error::Refused(format!(
+                    "servo id {id}: its limit register {limit_addr} reads 0, so no torque \
+                     ceiling can be set under it; set that EEPROM limit first"
+                )));
+            }
+            self.axes[index].torque_ceiling = value;
+        }
+        self.axes[index].last_torque_goal = None;
 
         if profile.addr_velocity_limit != 0 {
             if let Ok(data) = self.driver.read(id, profile.addr_velocity_limit, 4) {
@@ -418,6 +606,13 @@ impl DynamixelBus {
         } else {
             BoardStatus::Unknown
         };
+        // Said once, at open, on the operator's console: whether the joint's
+        // torque ceiling is actually enforced, and how.
+        eprintln!(
+            "[dynamixel] servo id {id}: {}, ceiling register {}",
+            self.axes[index].limiter_line(),
+            self.axes[index].torque_ceiling
+        );
         Ok(Some(identity))
     }
 
@@ -595,10 +790,18 @@ impl Bus for DynamixelBus {
             axis.velocity = None;
             axis.accel = None;
             axis.watchdog = None;
+            axis.torque_goal = None;
             axis.refused = false;
             match command.mode {
                 Mode::Position => {
                     axis.want_torque = true;
+                    // The torque ceiling, as Goal Current or Goal PWM, ahead
+                    // of torque on: a servo is never energised without it.
+                    if let Some(counts) = axis.torque_counts(command.max_torque) {
+                        if command.full || axis.last_torque_goal != Some(counts) {
+                            axis.torque_goal = Some(counts);
+                        }
+                    }
                     if let Some(position) = command.position.get() {
                         axis.goal =
                             Some((position.value() * axis.profile.counts_per_rev).round() as i32);
@@ -662,6 +865,7 @@ impl Bus for DynamixelBus {
                 axis.last_velocity = None;
                 axis.last_accel = None;
                 axis.last_watchdog = None;
+                axis.last_torque_goal = None;
             }
         }
         self.emit(1, |axis, out| {
@@ -682,7 +886,19 @@ impl Bus for DynamixelBus {
                 axis.profile.addr_profile_velocity
             })
         })?;
+        self.emit(2, |axis, out| {
+            axis.torque_goal.map(|counts| {
+                out.extend_from_slice(&counts.to_le_bytes());
+                match axis.limiter {
+                    Limiter::Current => axis.profile.addr_goal_current,
+                    _ => axis.profile.addr_goal_pwm,
+                }
+            })
+        })?;
         for axis in &mut self.axes {
+            if let Some(counts) = axis.torque_goal {
+                axis.last_torque_goal = Some(counts);
+            }
             if let Some(counts) = axis.watchdog {
                 axis.last_watchdog = Some(counts);
             }
@@ -764,6 +980,7 @@ impl Bus for DynamixelBus {
                     let _ = self.driver.write_u8(id, address, 0);
                     self.axes[index].watchdog_byte = None;
                     self.axes[index].last_watchdog = None;
+                    self.axes[index].last_torque_goal = None;
                     self.axes[index].torque = false;
                     latched[index] = true;
                 }
@@ -813,7 +1030,14 @@ impl Bus for DynamixelBus {
                     .min(profile.max_velocity_rev_per_sec),
                 None => profile.max_velocity_rev_per_sec,
             })),
-            peak_current: None,
+            // The stall current, where the family measures current at all:
+            // the default 12 A trip is beyond anything these servos draw,
+            // which made the over-current trip a dead letter.
+            peak_current: profile
+                .has_current_sense
+                .then_some(profile.stall_current_a)
+                .flatten()
+                .map(Amps),
         })
     }
 }
@@ -864,6 +1088,13 @@ mod tests {
             registers.insert(6, 48); // firmware
             registers.insert(9, RETURN_DELAY_COUNTS);
             registers.insert(11, OP_MODE_EXTENDED_POSITION);
+            // PWM Limit and Current Limit at their e-Manual defaults.
+            for (offset, byte) in PWM_FULL_SCALE.to_le_bytes().iter().enumerate() {
+                registers.insert(36 + offset as u16, *byte);
+            }
+            for (offset, byte) in 1750u16.to_le_bytes().iter().enumerate() {
+                registers.insert(38 + offset as u16, *byte);
+            }
             for (offset, byte) in 1000u32.to_le_bytes().iter().enumerate() {
                 registers.insert(44 + offset as u16, *byte); // velocity limit
             }
@@ -1082,6 +1313,165 @@ mod tests {
             },
             profile: QueryProfile::Fast,
         }
+    }
+
+    fn drive_with_torque(position: Rev, nm: f64) -> AxisCmd {
+        let mut cmd = drive(position);
+        cmd.command.max_torque = TorqueLimit::Nm(Nm(nm));
+        cmd
+    }
+
+    fn u16_register(servos: &FakeServos, id: u8, address: u16) -> u16 {
+        u16::from_le_bytes([
+            servos.register(id, address).unwrap_or(0),
+            servos.register(id, address + 1).unwrap_or(0),
+        ])
+    }
+
+    /// A family with a current sensor and stall figures runs in
+    /// current-based position mode, one without in extended position with
+    /// Goal PWM, and one with no figures stays where it was and says the
+    /// ceiling is not enforced.
+    #[test]
+    fn each_family_gets_the_limiter_it_can_carry() {
+        let servos = FakeServos::new();
+        servos.add(1, 1200, true); // XL330-M288
+        servos.add(2, 1060, true); // XL430-W250
+        servos.add(3, 1020, true); // XM430: no stall figures entered
+        let mut bus = bus(&servos, &[1, 2, 3]);
+        bus.open().unwrap();
+        assert_eq!(
+            bus.limiters(),
+            vec![(1, Limiter::Current), (2, Limiter::Pwm), (3, Limiter::None)]
+        );
+        assert_eq!(servos.register(1, 11), Some(OP_MODE_CURRENT_BASED_POSITION));
+        assert_eq!(servos.register(2, 11), Some(OP_MODE_EXTENDED_POSITION));
+        assert_eq!(servos.register(3, 11), Some(OP_MODE_EXTENDED_POSITION));
+    }
+
+    /// Nm through the stall figures: an XL330 at 0.1 Nm is 0.1 × 1.47 / 0.52
+    /// A = 283 mA; an XL430 at 0.3 Nm is 0.3 / 1.4 of 885 = 190 counts.
+    /// Both go out before torque on, so no servo is energised unlimited.
+    #[test]
+    fn the_torque_ceiling_is_written_before_torque_on() {
+        let servos = FakeServos::new();
+        servos.add(1, 1200, true);
+        servos.add(2, 1060, true);
+        let mut bus = bus(&servos, &[1, 2]);
+        bus.open().unwrap();
+        servos.clear_log();
+        let mut out = vec![AxisReply::SILENT; 2];
+        bus.cycle(
+            &[
+                drive_with_torque(Rev(0.5), 0.1),
+                drive_with_torque(Rev(0.5), 0.3),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(u16_register(&servos, 1, 102), 283);
+        assert_eq!(u16_register(&servos, 2, 100), 190);
+
+        let writes: Vec<u16> = servos
+            .log()
+            .iter()
+            .filter(|(_, instruction, _)| *instruction == INST_SYNC_WRITE)
+            .map(|(_, _, params)| u16::from_le_bytes([params[0], params[1]]))
+            .collect();
+        let torque_on = writes.iter().position(|&a| a == 64).expect("torque on");
+        for register in [100, 102] {
+            let at = writes.iter().position(|&a| a == register).expect("ceiling written");
+            assert!(at < torque_on, "{register} after torque on: {writes:?}");
+        }
+
+        // Unchanged: not written again.
+        servos.clear_log();
+        bus.cycle(
+            &[
+                drive_with_torque(Rev(0.5), 0.1),
+                drive_with_torque(Rev(0.5), 0.3),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert!(!servos.log().iter().any(|(_, i, p)| *i == INST_SYNC_WRITE
+            && matches!(u16::from_le_bytes([p[0], p[1]]), 100 | 102)));
+    }
+
+    /// The servo's own Current Limit / PWM Limit is the ceiling, and a
+    /// ceiling of zero is never written.
+    #[test]
+    fn the_ceiling_is_clamped_to_the_servos_limit_and_never_zero() {
+        let servos = FakeServos::new();
+        servos.add(1, 1200, true);
+        servos.add(2, 1060, true);
+        // Current Limit 200 mA, PWM Limit 100.
+        for (offset, byte) in 200u16.to_le_bytes().iter().enumerate() {
+            servos.inner.lock().unwrap().servos.get_mut(&1).unwrap().registers.insert(38 + offset as u16, *byte);
+        }
+        for (offset, byte) in 100u16.to_le_bytes().iter().enumerate() {
+            servos.inner.lock().unwrap().servos.get_mut(&2).unwrap().registers.insert(36 + offset as u16, *byte);
+        }
+        let mut bus = bus(&servos, &[1, 2]);
+        bus.open().unwrap();
+        let mut out = vec![AxisReply::SILENT; 2];
+        bus.cycle(
+            &[
+                drive_with_torque(Rev(0.5), 0.5),
+                drive_with_torque(Rev(0.5), 1.4),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(u16_register(&servos, 1, 102), 200);
+        assert_eq!(u16_register(&servos, 2, 100), 100);
+        bus.cycle(
+            &[
+                drive_with_torque(Rev(0.5), 0.0),
+                drive_with_torque(Rev(0.5), 0.0),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(u16_register(&servos, 1, 102), 1);
+        assert_eq!(u16_register(&servos, 2, 100), 1);
+    }
+
+    /// A limit register that reads zero is a ceiling that cannot be set:
+    /// refused at open, not driven at full torque under a guessed limit.
+    #[test]
+    fn an_unreadable_ceiling_is_refused_at_open() {
+        let servos = FakeServos::new();
+        servos.add(1, 1060, true);
+        for address in [36u16, 37] {
+            servos.inner.lock().unwrap().servos.get_mut(&1).unwrap().registers.insert(address, 0);
+        }
+        let error = bus(&servos, &[1]).open().unwrap_err();
+        assert!(error.to_string().contains("reads 0"), "{error}");
+    }
+
+    /// A native ceiling in the description stands in for the conversion,
+    /// and asking for current on a servo with no current sensor is refused
+    /// at open rather than written into a register it does not have.
+    #[test]
+    fn a_native_override_wins_and_a_wrong_one_is_refused() {
+        let servos = FakeServos::new();
+        servos.add(1, 1060, true);
+        let mut limited = bus(&servos, &[1]).with_torque_overrides(&[TorqueOverride {
+            current_ma: None,
+            pwm: Some(300),
+        }]);
+        limited.open().unwrap();
+        let mut out = vec![AxisReply::SILENT; 1];
+        limited.cycle(&[drive_with_torque(Rev(0.5), 0.01)], &mut out).unwrap();
+        assert_eq!(u16_register(&servos, 1, 100), 300);
+
+        let mut refused = bus(&servos, &[1]).with_torque_overrides(&[TorqueOverride {
+            current_ma: Some(500),
+            pwm: None,
+        }]);
+        let error = refused.open().unwrap_err();
+        assert!(error.to_string().contains("no current sensor"), "{error}");
     }
 
     /// Open finds out which servos answer a fast sync read, picks their

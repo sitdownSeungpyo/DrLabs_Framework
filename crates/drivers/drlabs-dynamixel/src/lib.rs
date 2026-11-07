@@ -20,7 +20,32 @@ pub mod link;
 pub mod profile;
 pub mod protocol;
 
-pub use bus::DynamixelBus;
+pub use bus::{DynamixelBus, Limiter, TorqueOverride};
+
+/// Reads a joint's native torque ceiling from its options:
+/// `current_limit_ma` (Goal Current, mA) and `pwm_limit` (Goal PWM counts).
+/// A value that is not a whole number in range is an error naming the key.
+pub fn torque_override(
+    options: &std::collections::BTreeMap<String, String>,
+) -> Result<TorqueOverride, String> {
+    let read = |key: &str, max: u16| -> Result<Option<u16>, String> {
+        match options.get(key) {
+            None => Ok(None),
+            Some(text) => match text.trim().parse::<u16>() {
+                Ok(value) if (1..=max).contains(&value) => Ok(Some(value)),
+                _ => Err(format!("{key} {text:?} must be a whole number in 1..{max}")),
+            },
+        }
+    };
+    let value = TorqueOverride {
+        current_ma: read("current_limit_ma", i16::MAX as u16)?,
+        pwm: read("pwm_limit", profile::PWM_FULL_SCALE)?,
+    };
+    if value.current_ma.is_some() && value.pwm.is_some() {
+        return Err("give current_limit_ma or pwm_limit, not both".into());
+    }
+    Ok(value)
+}
 pub use driver::Driver;
 pub use link::DynamixelLink;
 pub use profile::{Profile, XL330, X_SERIES};

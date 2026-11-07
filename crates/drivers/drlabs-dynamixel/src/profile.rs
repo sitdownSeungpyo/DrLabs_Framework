@@ -26,6 +26,10 @@ pub struct Profile {
     /// registers. Four bytes of EEPROM, so it is whatever somebody last set on
     /// that particular servo — not a family constant.
     pub addr_velocity_limit: u16,
+    /// PWM Limit and Current Limit (EEPROM, 2 bytes each): the ceilings Goal
+    /// PWM and Goal Current are held under. Zero: not known for this family.
+    pub addr_pwm_limit: u16,
+    pub addr_current_limit: u16,
 
     // RAM area.
     pub addr_torque_enable: u16,
@@ -104,7 +108,20 @@ pub struct Profile {
     /// preflight, and cannot be armed at all. That is not a hypothetical — it
     /// is what happened on this bench.
     pub voltage_rated: f64,
+
+    /// Stall torque (Nm) and stall current (A) at `voltage_rated`, from the
+    /// e-Manual. They are how a torque ceiling in Nm becomes a register: a
+    /// Goal Current through their ratio, or a Goal PWM as a fraction of the
+    /// stall torque. Both are a straight line through a curve that is not
+    /// one, so the ceiling they give is approximate; `None` where nobody has
+    /// read the figures off the family's own page, and the ceiling is then
+    /// reported as not enforced rather than guessed.
+    pub stall_torque_nm: Option<f64>,
+    pub stall_current_a: Option<f64>,
 }
+
+/// Goal PWM's full scale on the X families: 885 counts of about 0.113 %.
+pub const PWM_FULL_SCALE: u16 = 885;
 
 /// The X-series (XM430, XC430, XH430, XW430 and relatives): a 4096-count
 /// encoder and the standard 2.69 mA current unit.
@@ -115,6 +132,8 @@ pub const X_SERIES: Profile = Profile {
     addr_return_delay: 9,
     addr_operating_mode: 11,
     addr_velocity_limit: 44,
+    addr_pwm_limit: 36,
+    addr_current_limit: 38,
     addr_torque_enable: 64,
     addr_led: 65,
     addr_hardware_error: 70,
@@ -147,6 +166,9 @@ pub const X_SERIES: Profile = Profile {
     voltage_min: 10.0,
     voltage_max: 14.8,
     voltage_rated: 12.0,
+    // Varies across the members; each needs its own page read.
+    stall_torque_nm: None,
+    stall_current_a: None,
 };
 
 /// The 5 V X-series family. Shares the control table but uses a 1 mA current
@@ -159,6 +181,10 @@ pub const XL330: Profile = Profile {
     voltage_min: 3.7,
     voltage_max: 6.0,
     voltage_rated: 5.0,
+    // "0.52 [N.m] (at 5.0 [V], 1.47 [A], 0.354 [Nm/A])" (XL330-M288-T
+    // e-Manual, read 2026-11-07).
+    stall_torque_nm: Some(0.52),
+    stall_current_a: Some(1.47),
     ..X_SERIES
 };
 
@@ -181,6 +207,11 @@ pub const XL430: Profile = Profile {
     voltage_rated: 11.1,
     // 57 rev/min at 11.1 V.
     max_velocity_rev_per_sec: 0.95,
+    // "1.4 [N.m] (at 11.1 [V], 1.3 [A], 1.077 [Nm/A])" (XL430-W250-T
+    // e-Manual, read 2026-11-07). The 2XL430 shares this profile and has not
+    // had its own page checked.
+    stall_torque_nm: Some(1.4),
+    stall_current_a: Some(1.3),
     ..X_SERIES
 };
 
@@ -275,6 +306,9 @@ pub const PH54: Profile = Profile {
     addr_return_delay: 9,            // e-Manual: Return Delay Time (9), 2 µs units
     addr_operating_mode: 11,
     addr_velocity_limit: 44,
+    // Not read off the P-series table; unknown.
+    addr_pwm_limit: 0,
+    addr_current_limit: 0,
     addr_torque_enable: 512,
     addr_led: 513,
     addr_hardware_error: 518,
@@ -307,6 +341,8 @@ pub const PH54: Profile = Profile {
     voltage_min: 10.0,
     voltage_max: 30.0,
     voltage_rated: 24.0,
+    stall_torque_nm: None,
+    stall_current_a: None,
 };
 
 /// PM54-060-S250-R / PM54-040-S250-R: the smaller P-series frame. Same

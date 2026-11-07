@@ -691,6 +691,30 @@ RDT 20 µs). 3 Mbaud 14축의 와이어 산술 1.3 ms 와 맞는다. 패킷 유�
 이유로 보레이트 상향의 이득도 작을 것으로 **추정**(미측정). Return Delay 0 은 위 2026-09-04 절의
 응답 손상 때문에 쓰지 않는다. 남은 500 Hz 경로는 사실상 U2D2 2개로 7+7 분할.
 
+**토크 한계 실제 적용 (2026-11-07).** 그때까지 `DynamixelBus` 는 `max_torque_nm` 을 버렸다. 이제 open 때
+축마다 정한다: 전류 센서 + 실속 수치가 있는 계열(XL330)은 **current-based position(모드 5, ±256 rev
+멀티턴)** + Goal Current(102) = Nm × 실속전류/실속토크; 센서 없는 계열(XL430)은 extended position(모드
+4) + **Goal PWM(100)** = Nm / 실속토크 × 885 ("Goal PWM is used as a final limiter", e-Manual);
+수치 없는 계열은 "NOT enforced" 를 open 때 출력. 실속 수치는 e-Manual 에서 읽음: XL330-M288 0.52 Nm·
+1.47 A @5 V, XL430-W250 1.4 Nm·1.3 A @11.1 V. 서보 자신의 PWM Limit(36)/Current Limit(38)을 open 때
+읽어 그 아래로 clamp(읽기 실패·0 이면 open 거부), 값은 토크 on 보다 먼저 쓴다. 관절 options
+`current_limit_ma` / `pwm_limit` 이 있으면 환산 대신 그 값. 전류 센서 계열은 envelope peak_current =
+실속전류(과전류 trip 이 실제 범위에서 동작). **근사**: PWM·전류와 토크는 선형이 아니고, PWM 한계는
+토크와 함께 최고 속도도 줄인다.
+
+실기(id 1–7 XL430, 400 Hz, ±0.2 rad 사인 10 s, 레지스터는 `dxl_diag dump` 로 읽어 확인):
+
+| max_torque_nm | Goal PWM (계산 = 읽음) | 추종 오차 최대 | e-stop |
+|---|---|---|---|
+| (적용 전) | 885 | — | — |
+| 1.0 | 632 | ≤ 0.087 rad | 0 |
+| 0.6 | 379 | ≤ 0.087 | 0 |
+| 0.3 | 190 | ≤ 0.089 | 0 |
+
+이 자세에서는 0.3 Nm 로도 처짐 없음. 런타임엔 **추종 오차(following error) trip 이 없어서**, 한계가
+중력보다 낮은 관절은 `ok` 로 보고하며 처질 수 있다 — 관절마다 최악 자세 중력보다 높게 둘 것.
+XL330 의 모드 5 전환(PID 가 기본값으로 재설정됨)은 아직 실기 미측정.
+
 **7축(U2D2 1개, id 1–7 XL430) 500 Hz (2026-11-07).** 트랜잭션(syncstress, goal 쓰기 + 10 B 읽기)
 p50 1.45 ms, p95 2.06, 500.0 Hz, 13 % 가 2 ms 초과; 토크 on/off 차이 없음; 연속 실행(hz=2000)이면
 707 Hz(p50 1.07). 런타임 관찰 20 s: miss 1, e-stop 0. **런타임 drive ±0.2 rad:** 기본 trip(50 연속)

@@ -323,6 +323,8 @@ fn check_driver_options(where_: &str, joint: &JointConfig) -> Result<(), ConfigE
                     )));
                 }
             }
+            drlabs_dynamixel::torque_override(&joint.options)
+                .map_err(|error| ConfigError(format!("{where_}: {error}")))?;
         }
         "robstride" => {
             // The driver refuses an undeclared model outright, because the

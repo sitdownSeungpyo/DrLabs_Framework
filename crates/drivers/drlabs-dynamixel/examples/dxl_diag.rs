@@ -21,6 +21,8 @@ use drlabs_transport::serial::SharedPort;
 const REGS: &[(&str, u16, u16)] = &[
     ("drive", 10, 1),
     ("opmode", 11, 1),
+    ("pwm_lim", 36, 2),
+    ("cur_lim", 38, 2),
     ("vel_lim", 44, 4),
     ("max_pos", 48, 4),
     ("min_pos", 52, 4),
@@ -28,6 +30,8 @@ const REGS: &[(&str, u16, u16)] = &[
     ("srl", 68, 1),
     ("hwerr", 70, 1),
     ("wdog", 98, 1),
+    ("g_pwm", 100, 2),
+    ("g_cur", 102, 2),
     ("p_acc", 108, 4),
     ("p_vel", 112, 4),
     ("goal", 116, 4),

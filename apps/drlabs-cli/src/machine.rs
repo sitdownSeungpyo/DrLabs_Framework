@@ -40,6 +40,7 @@ pub fn factory(bus: &BusConfig, joints: &[&JointConfig]) -> Result<Box<dyn drlab
                 .map_err(|error| format!("bus {:?}: open {}: {error}", bus.name, bus.port))?;
             let shared = drlabs_transport::serial::SharedPort::new(Box::new(port));
             let mut servos = Vec::with_capacity(joints.len());
+            let mut overrides = Vec::with_capacity(joints.len());
             for joint in joints {
                 let profile = match joint.options.get("profile") {
                     Some(name) => Some(drlabs_dynamixel::profile::profile_named(name).ok_or_else(
@@ -48,12 +49,17 @@ pub fn factory(bus: &BusConfig, joints: &[&JointConfig]) -> Result<Box<dyn drlab
                     None => None,
                 };
                 servos.push((joint.id as u8, profile));
+                overrides.push(
+                    drlabs_dynamixel::torque_override(&joint.options)
+                        .map_err(|error| format!("joint {:?}: {error}", joint.name))?,
+                );
             }
             let period = Duration::from_secs_f64(1.0 / bus.rate_hz.max(1) as f64);
             Ok(Box::new(
                 drlabs_dynamixel::DynamixelBus::new(shared, &servos)
                     .with_port_name(&bus.port, baud)
-                    .with_period(period),
+                    .with_period(period)
+                    .with_torque_overrides(&overrides),
             ))
         }
         "fdcanusb" => {

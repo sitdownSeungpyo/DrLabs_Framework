@@ -154,7 +154,7 @@ footer{padding:6px 16px;color:var(--mut)}
 <canvas id="chart" width="1200" height="220"></canvas>
 <footer>position (orange) and setpoint (blue) of every joint, last 30 s; polled from /state every 100 ms</footer>
 <script>
-const STATUS={0:"ok",1:"silent",2:"alert",3:"refused",4:"off",5:"tripped"};
+const STATUS={0:"ok",1:"silent",2:"alert",3:"refused",4:"off",5:"tripped",6:"held"};
 const hist=[]; const SPAN=30;
 function f(v,d){return (v===null||v===undefined||Number.isNaN(v))?"–":v.toFixed(d)}
 async function poll(){

@@ -47,6 +47,10 @@ pub enum AxisStatus {
     Off = 4,
     /// An emergency stop is latched. Set by the runtime, never by a driver.
     Tripped = 5,
+    /// Powered and holding its place under the robot's stop policy — during
+    /// a stop, or after a reset until the client's next command. Not limp:
+    /// do not handle it as if it were. Set by the runtime, never by a driver.
+    Held = 6,
 }
 
 impl AxisStatus {
@@ -58,6 +62,7 @@ impl AxisStatus {
             AxisStatus::Refused => "refused",
             AxisStatus::Off => "off",
             AxisStatus::Tripped => "tripped",
+            AxisStatus::Held => "held",
         }
     }
 
@@ -69,6 +74,7 @@ impl AxisStatus {
             3 => AxisStatus::Refused,
             4 => AxisStatus::Off,
             5 => AxisStatus::Tripped,
+            6 => AxisStatus::Held,
             _ => return None,
         })
     }
@@ -212,6 +218,7 @@ mod tests {
             AxisStatus::Refused,
             AxisStatus::Off,
             AxisStatus::Tripped,
+            AxisStatus::Held,
         ] {
             assert_eq!(AxisStatus::from_u8(status as u8), Some(status));
         }

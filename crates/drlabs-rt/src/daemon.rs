@@ -223,6 +223,7 @@ impl Daemon {
                         joint: *index,
                         mapping,
                         safety: mapping.safety_config(&joint.limits, SafetyConfig::default()),
+                        on_estop: config.estop_policy(joint),
                     }
                 })
                 .collect();

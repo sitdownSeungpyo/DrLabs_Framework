@@ -10,10 +10,12 @@
 //!
 //! An emergency stop is robot-wide. Any bus thread may latch it; every bus
 //! thread reads it each tick and stops its axes. It clears only on a client's
-//! explicit `FAULT_RESET`, and clearing it does not drive anything: every
-//! axis is back to `OFF` and has to be asked for again.
+//! explicit `FAULT_RESET`, and clearing it does not drive anything new: every
+//! axis is back to `OFF` and has to be asked for again — except one its
+//! [`EstopPolicy`] is holding, which keeps its place until the client's next
+//! command after the reset says what it should do.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use drlabs_core::bus::AxisReply;
@@ -40,9 +42,76 @@ impl TimeoutPolicy {
     }
 }
 
+/// What a driven axis does when the robot is stopped.
+///
+/// The categories are the ones a machine-safety standard would name: 0 is
+/// power removed at once, 1 is a controlled stop and then power removed, 2 is
+/// a controlled stop with power kept. A joint that carries a load against
+/// gravity falls under 0 — the arm on the bench fell 2.76 rad on a trip — so
+/// it is the description's choice, not the runtime's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EstopPolicy {
+    /// Torque off at once (category 0). The default, and the behaviour
+    /// before the policy existed.
+    #[default]
+    Release,
+    /// Decelerate within the joint's acceleration limit and hold that place,
+    /// powered (category 2), until a client says otherwise after a reset.
+    Hold,
+    /// Decelerate to rest, then torque off (category 1).
+    StopThenRelease,
+}
+
+impl EstopPolicy {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "release" => Some(EstopPolicy::Release),
+            "hold" => Some(EstopPolicy::Hold),
+            "stop_then_release" => Some(EstopPolicy::StopThenRelease),
+            _ => None,
+        }
+    }
+
+    pub const NAMES: &'static str = "\"release\", \"hold\" or \"stop_then_release\"";
+}
+
+/// Whether a stop for `code` may keep an axis powered.
+///
+/// A stop the operator asked for, a late loop, a joint moving too fast or
+/// leaving its travel, another axis gone quiet: holding is the safer of the
+/// two answers for a joint that would otherwise fall. A fault in the motor or
+/// its supply — current, heat, voltage, a controller fault, a stall — is one
+/// that holding makes worse, and a dead transport cannot carry a hold and
+/// must not re-energise anything when it comes back. Those release.
+pub fn trip_allows_hold(code: TripCode) -> bool {
+    matches!(
+        code,
+        TripCode::Requested
+            | TripCode::Deadline
+            | TripCode::VelocityRunaway
+            | TripCode::PositionEnvelope
+            | TripCode::CommLoss
+    )
+}
+
 /// The robot-wide emergency stop latch, shared by every bus thread.
+///
+/// A reset is a robot-wide event too. Every bus thread sees the client's
+/// reset flag, but only the first to run finds anything latched; so a clear
+/// also bumps a generation and records the sequence number of the command
+/// that carried it, and every thread acts on the generation changing rather
+/// than on having been the one to clear.
 #[derive(Debug, Clone, Default)]
-pub struct Estop(Arc<AtomicU8>);
+pub struct Estop(Arc<EstopInner>);
+
+#[derive(Debug, Default)]
+struct EstopInner {
+    code: AtomicU8,
+    /// Bumped on every clear.
+    generation: AtomicU32,
+    /// The command that cleared it last.
+    reset_seq: AtomicU32,
+}
 
 impl Estop {
     pub fn new() -> Self {
@@ -53,20 +122,51 @@ impl Estop {
     /// is the one kept: it is the one that happened.
     pub fn latch(&self, code: TripCode) -> bool {
         self.0
+            .code
             .compare_exchange(0, code as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
     pub fn code(&self) -> Option<TripCode> {
-        TripCode::from_u8(self.0.load(Ordering::Acquire))
+        TripCode::from_u8(self.0.code.load(Ordering::Acquire))
     }
 
     pub fn is_latched(&self) -> bool {
-        self.0.load(Ordering::Acquire) != 0
+        self.0.code.load(Ordering::Acquire) != 0
     }
 
+    /// Clears the latch unconditionally. For tests and shutdown; a client's
+    /// reset goes through [`clear_by`](Self::clear_by).
     pub fn clear(&self) {
-        self.0.store(0, Ordering::Release);
+        if self.0.code.swap(0, Ordering::AcqRel) != 0 {
+            self.0.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Clears the latch on behalf of the command numbered `seq`, once per
+    /// command however many bus threads see it: the first claims the
+    /// number, and a thread that arrives later for the same command must
+    /// not clear a stop that has latched since. Returns whether it cleared.
+    pub fn clear_by(&self, seq: u32) -> bool {
+        if self.0.reset_seq.swap(seq, Ordering::AcqRel) == seq {
+            return false;
+        }
+        if self.0.code.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        // The generation moves before the latch opens, so a thread that sees
+        // the latch open (it reads the latch first) also sees the reset that
+        // opened it. A non-zero code cannot change under us: `latch` only
+        // writes over zero.
+        self.0.generation.fetch_add(1, Ordering::AcqRel);
+        self.0.code.store(0, Ordering::Release);
+        true
+    }
+
+    /// The number of clears so far, and the command behind the last one.
+    pub fn generation(&self) -> (u32, u32) {
+        let generation = self.0.generation.load(Ordering::Acquire);
+        (generation, self.0.reset_seq.load(Ordering::Acquire))
     }
 }
 
@@ -207,6 +307,45 @@ mod tests {
         assert_eq!(estop.code(), Some(TripCode::OverCurrent));
         estop.clear();
         assert_eq!(estop.code(), None);
+    }
+
+    #[test]
+    fn the_estop_policy_is_spelled_as_in_the_config() {
+        assert_eq!(EstopPolicy::parse("release"), Some(EstopPolicy::Release));
+        assert_eq!(EstopPolicy::parse("hold"), Some(EstopPolicy::Hold));
+        assert_eq!(
+            EstopPolicy::parse("stop_then_release"),
+            Some(EstopPolicy::StopThenRelease)
+        );
+        assert_eq!(EstopPolicy::parse("brake"), None);
+        assert_eq!(EstopPolicy::default(), EstopPolicy::Release);
+    }
+
+    /// Holding is allowed for the stops it makes safer, never for a fault
+    /// it makes worse.
+    #[test]
+    fn only_the_stops_holding_helps_may_hold() {
+        for code in [
+            TripCode::Requested,
+            TripCode::Deadline,
+            TripCode::VelocityRunaway,
+            TripCode::PositionEnvelope,
+            TripCode::CommLoss,
+        ] {
+            assert!(trip_allows_hold(code), "{code:?}");
+        }
+        for code in [
+            TripCode::ControllerFault,
+            TripCode::OverVoltage,
+            TripCode::UnderVoltage,
+            TripCode::OverCurrent,
+            TripCode::BoardOverTemperature,
+            TripCode::MotorOverTemperature,
+            TripCode::Stall,
+            TripCode::Transport,
+        ] {
+            assert!(!trip_allows_hold(code), "{code:?}");
+        }
     }
 
     #[test]

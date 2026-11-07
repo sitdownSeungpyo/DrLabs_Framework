@@ -27,6 +27,6 @@ pub use config::{ApiConfig, BusConfig, Config, ConfigError, JointConfig, JointLi
 pub use daemon::{Daemon, Handle};
 pub use drlabs_core::lowlevel::{LowCmd, LowState, MotorCmd, MotorState, MAX_AXES};
 pub use exchange::{Broadcast, Reader, Stamped, Writer};
-pub use gate::{Estop, TimeoutPolicy};
+pub use gate::{Estop, EstopPolicy, TimeoutPolicy};
 pub use mapping::Mapping;
 pub use worker::{AxisSpec, BusState, BusWorker, WorkerConfig};

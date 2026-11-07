@@ -35,7 +35,7 @@ QUICK_STOP = 1 << 0
 FAULT_RESET = 1 << 1
 
 #: MotorState.status
-STATUS_NAMES = {0: "ok", 1: "silent", 2: "alert", 3: "refused", 4: "off", 5: "tripped"}
+STATUS_NAMES = {0: "ok", 1: "silent", 2: "alert", 3: "refused", 4: "off", 5: "tripped", 6: "held"}
 #: MotorState.blocked
 BLOCKED_NAMES = {
     0: "",

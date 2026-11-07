@@ -21,6 +21,10 @@
 //! * `seconds=0` (the default) runs until Enter is pressed on stdin, which
 //!   stops through the same release path as a timed run. Ctrl+C does not:
 //!   it kills the process with torque on and the bus watchdog armed.
+//! * `estop_at=S`, `reset_at=S`: the client raises a quick stop, and later a
+//!   fault reset, at those seconds into the run — what the joints do then is
+//!   the description's `on_estop` policy. After the reset the client keeps
+//!   streaming its motion, so a held joint is driven on from where it held.
 //! * `monitor=PORT`: serves a live page on 127.0.0.1:PORT — one row per
 //!   joint with position, setpoint, error, velocity, supply and temperature,
 //!   and a strip chart — from a JSON snapshot at `/state`.
@@ -39,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{dump_axes, factory, serve, AxisSnap, Snapshot};
-use drlabs_core::lowlevel::{mode, LowCmd, MotorCmd};
+use drlabs_core::lowlevel::{flags, mode, LowCmd, MotorCmd};
 use drlabs_core::trajectory::{synchronized, Leg, Trapezoidal};
 use drlabs_core::units::{Rev, RevPerSec, RevPerSec2};
 use drlabs_core::AxisStatus;
@@ -48,7 +52,7 @@ use drlabs_rt::{Config, Daemon};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.first() else {
-        eprintln!("usage: rt_bench <robot.json> [seconds=N] [drive] [amplitude=RAD] [shuttle=RAD] [dwell=S] [vel=RAD_S] [acc=RAD_S2] [monitor=PORT] [log=MS]");
+        eprintln!("usage: rt_bench <robot.json> [seconds=N] [drive] [amplitude=RAD] [shuttle=RAD] [dwell=S] [vel=RAD_S] [acc=RAD_S2] [estop_at=S] [reset_at=S] [monitor=PORT] [log=MS]");
         std::process::exit(2);
     };
     let mut seconds = 0u64;
@@ -60,7 +64,17 @@ fn main() {
     let mut acc_cap: Option<f64> = None;
     let mut monitor: Option<u16> = None;
     let mut log_ms = 0u64;
+    let mut estop_at: Option<f64> = None;
+    let mut reset_at: Option<f64> = None;
     for token in &args[1..] {
+        if let Some(value) = token.strip_prefix("estop_at=") {
+            estop_at = Some(value.parse().expect("estop_at=S"));
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("reset_at=") {
+            reset_at = Some(value.parse().expect("reset_at=S"));
+            continue;
+        }
         if let Some(value) = token.strip_prefix("seconds=") {
             seconds = value.parse().expect("seconds=N");
         } else if token == "drive" {
@@ -269,6 +283,18 @@ fn main() {
                         };
                     }
                 }
+                // A flag acts once per sequence number, so it rides on one
+                // record only.
+                let t_run = now.duration_since(started).as_secs_f64();
+                if estop_at.is_some_and(|at| t_run >= at) {
+                    estop_at = None;
+                    cmd.flags |= flags::QUICK_STOP;
+                    println!("quick stop sent at t={t_run:.3} s");
+                } else if estop_at.is_none() && reset_at.is_some_and(|at| t_run >= at) {
+                    reset_at = None;
+                    cmd.flags |= flags::FAULT_RESET;
+                    println!("fault reset sent at t={t_run:.3} s");
+                }
                 handle.send(cmd);
 
                 // Tracking error against the latest report.
@@ -323,12 +349,13 @@ fn main() {
             last_report = now;
             next_report += Duration::from_secs(1);
 
-            let (mut ok, mut off, mut silent, mut other) = (0, 0, 0, 0);
+            let (mut ok, mut off, mut silent, mut held, mut other) = (0, 0, 0, 0, 0);
             for s in state.active() {
                 match AxisStatus::from_u8(s.status) {
                     Some(AxisStatus::Ok) | Some(AxisStatus::Alert) => ok += 1,
                     Some(AxisStatus::Off) => off += 1,
                     Some(AxisStatus::Silent) => silent += 1,
+                    Some(AxisStatus::Held) => held += 1,
                     _ => other += 1,
                 }
             }
@@ -337,7 +364,7 @@ fn main() {
                 .cloned()
                 .fold(0f32, f32::max);
             println!(
-                "t={:>5.0}s  {:>6.1} Hz  tick {:>8}  miss {:>4}  late_max {:>6.2} ms  estop {:<2} axes ok {ok} off {off} silent {silent} other {other}  legs {leg_count}  err_max(min) {worst:.4} rad",
+                "t={:>5.0}s  {:>6.1} Hz  tick {:>8}  miss {:>4}  late_max {:>6.2} ms  estop {:<2} axes ok {ok} off {off} silent {silent} held {held} other {other}  legs {leg_count}  err_max(min) {worst:.4} rad",
                 now.duration_since(started).as_secs_f64(),
                 rate,
                 state.tick,

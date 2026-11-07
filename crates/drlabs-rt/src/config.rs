@@ -63,6 +63,13 @@ pub struct RtConfig {
     /// a machine with no real-time scheduling.
     #[serde(default)]
     pub deadline_miss_trip: u32,
+    /// What a driven joint does when the robot is stopped: `release` (torque
+    /// off at once, the default), `hold` (decelerate and keep the place,
+    /// powered) or `stop_then_release` (decelerate, then torque off). Only
+    /// stops that holding makes safer hold; a motor or supply fault always
+    /// releases. A joint's own `on_estop` overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_estop: Option<String>,
 }
 
 /// How the runtime talks to clients.
@@ -170,6 +177,24 @@ pub struct JointConfig {
     pub offset_rad: f64,
 
     pub limits: JointLimits,
+
+    /// This joint's stop policy, overriding `rt.on_estop`: a gravity-loaded
+    /// shoulder may hold while a wrist releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_estop: Option<String>,
+}
+
+impl Config {
+    /// The stop policy a joint runs under: its own, else the robot's, else
+    /// release. Validation has already refused a name that does not parse.
+    pub fn estop_policy(&self, joint: &JointConfig) -> crate::gate::EstopPolicy {
+        joint
+            .on_estop
+            .as_deref()
+            .or(self.rt.on_estop.as_deref())
+            .and_then(crate::gate::EstopPolicy::parse)
+            .unwrap_or_default()
+    }
 }
 
 /// What one joint is allowed to do, in joint space.
@@ -375,6 +400,25 @@ impl Config {
                 "rt.priority {} is outside 0..99",
                 self.rt.priority
             )));
+        }
+        if let Some(name) = &self.rt.on_estop {
+            if crate::gate::EstopPolicy::parse(name).is_none() {
+                return Err(ConfigError(format!(
+                    "rt.on_estop {name:?} must be {}",
+                    crate::gate::EstopPolicy::NAMES
+                )));
+            }
+        }
+        for joint in &self.joints {
+            if let Some(name) = &joint.on_estop {
+                if crate::gate::EstopPolicy::parse(name).is_none() {
+                    return Err(ConfigError(format!(
+                        "joint {:?}: on_estop {name:?} must be {}",
+                        joint.name,
+                        crate::gate::EstopPolicy::NAMES
+                    )));
+                }
+            }
         }
         if !matches!(self.api.on_cmd_timeout.as_str(), "hold" | "release") {
             return Err(ConfigError(format!(
@@ -1017,6 +1061,41 @@ mod tests {
         );
         let error = Config::parse(&text).unwrap_err();
         assert!(error.0.contains("on_cmd_timeout"), "{}", error.0);
+    }
+
+    /// The stop policy: release unless said, the robot's for every joint,
+    /// a joint's own over the robot's, and a misspelling refused.
+    #[test]
+    fn the_stop_policy_defaults_inherits_and_is_checked() {
+        use crate::gate::EstopPolicy;
+        let config = Config::parse(SHOULDER_PAIR).unwrap();
+        for joint in &config.joints {
+            assert_eq!(config.estop_policy(joint), EstopPolicy::Release);
+        }
+
+        let text = SHOULDER_PAIR
+            .replace(r#""rate_hz": 200,"#, r#""rate_hz": 200, "rt": {"on_estop": "hold"},"#)
+            .replace(
+                r#""offset_rad": 4.5974,"#,
+                r#""offset_rad": 4.5974, "on_estop": "stop_then_release","#,
+            );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.estop_policy(&config.joints[0]), EstopPolicy::Hold);
+        assert_eq!(
+            config.estop_policy(&config.joints[1]),
+            EstopPolicy::StopThenRelease
+        );
+
+        let text = SHOULDER_PAIR
+            .replace(r#""rate_hz": 200,"#, r#""rate_hz": 200, "rt": {"on_estop": "brake"},"#);
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.0.contains("on_estop"), "{}", error.0);
+        let text = SHOULDER_PAIR.replace(
+            r#""offset_rad": 4.5974,"#,
+            r#""offset_rad": 4.5974, "on_estop": "limp","#,
+        );
+        let error = Config::parse(&text).unwrap_err();
+        assert!(error.0.contains("l_sh_p"), "{}", error.0);
     }
 
     /// A simulated bus is a transport like any other, so a description can

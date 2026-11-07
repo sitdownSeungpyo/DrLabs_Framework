@@ -41,7 +41,8 @@ back. The torque ceiling, velocity limit, acceleration limit and watchdog
 come from the joint's declared limits every tick, whatever the mode.
 
 `MotorState` (28 bytes): `q, dq, tau, current, voltage, temp: f32; fault u16; status u8; blocked u8`.
-`status` is an `AxisStatus` (0 ok, 1 silent, 2 alert, 3 refused, 4 off, 5 tripped);
+`status` is an `AxisStatus` (0 ok, 1 silent, 2 alert, 3 refused, 4 off, 5 tripped,
+6 held — powered by the stop policy, not limp);
 `blocked` says why a DRIVE request is not honoured (`safety::Blocked`).
 
 `LowCmd` (1560 bytes): `seq u32, flags u32, t_ns u64, n u16, reserved[6], cmd[64]`.
@@ -76,10 +77,33 @@ The session's enable-operation / disable-operation / fault state machine (CiA 40
   re-referenced once.
 - A guard trip, `max_consecutive_timeouts` silent ticks on a driven axis,
   `deadline_miss_trip` consecutive late ticks, a transport failure, or the
-  client's QUICK_STOP flag latches a robot-wide fault: every axis gets Stop,
-  `LowState.estop = 1`, `estop_code` is the `TripCode`.
+  client's QUICK_STOP flag latches a robot-wide fault: `LowState.estop = 1`,
+  `estop_code` is the `TripCode`, and every axis does what its stop policy
+  says (below).
 - FAULT_RESET clears the latch. Every axis is then OFF and has to be asked
-  for again — clearing a stop drives nothing.
+  for again — clearing a stop drives nothing — except a held one, which
+  keeps its place until the client's next command (a later `seq` than the
+  reset's): DRIVE carries on from the held place, anything else releases it.
+  A reset is acted on once per `seq`; a client that restarts its counter
+  must not reuse the number of its last reset.
+
+### Stop policy (`rt.on_estop`, a joint's own `on_estop` overrides)
+
+| policy | a driven axis on a stop |
+|---|---|
+| `release` (default) | torque off at once (category 0) — a gravity-loaded joint falls |
+| `hold` | decelerates within its acceleration limit to the stopping point and holds it, powered (category 2); `status` 6 |
+| `stop_then_release` | decelerates to rest (at most 2 s), then torque off (category 1) |
+
+Only stops that holding makes safer hold: QUICK_STOP, deadline, velocity
+runaway, position envelope, comm loss. A motor or supply fault (current,
+temperature, voltage, controller fault, stall) and a transport failure
+release. The axis whose own guard or silence raised the stop is never held,
+whatever the code. A held axis that stops answering is released; after a
+reset a held axis whose client has gone quiet follows `on_cmd_timeout`.
+Measured 2026-11-07 on 7 XL430 (gravity-loaded arm, 400 Hz, `hold`): quick
+stop mid-sine, decelerated in 0.25 s, sagged ≤ 0.007 rad over 3 s held,
+resumed after reset with no jump, 0 deadline misses.
 - A `LowCmd` older than `api.cmd_timeout_ms` is stale: `on_cmd_timeout:
   hold` keeps the last `q` with `dq`/`tau` zeroed (a stale `VELOCITY` or
   `TORQUE` becomes a `HOLD`), `release` turns every axis off. The servo's

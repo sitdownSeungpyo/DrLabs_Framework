@@ -34,7 +34,7 @@ use drlabs_safety::{Config as SafetyConfig, Guard, TripCode};
 use drlabs_timing::{sleep_until, Resolution};
 
 use crate::exchange::{Reader, Stamped, Writer};
-use crate::gate::{AxisGate, Estop, TimeoutPolicy};
+use crate::gate::{trip_allows_hold, AxisGate, Estop, EstopPolicy, TimeoutPolicy};
 use crate::mapping::Mapping;
 
 /// What one axis on the bus is.
@@ -45,7 +45,24 @@ pub struct AxisSpec {
     pub mapping: Mapping,
     /// The motor-space envelope, already through the mapping.
     pub safety: SafetyConfig,
+    /// What the axis does when the robot is stopped while it is driven.
+    pub on_estop: EstopPolicy,
 }
+
+/// An axis an [`EstopPolicy`] is keeping powered through a stop.
+#[derive(Debug, Clone, Copy)]
+struct EstopHold {
+    /// Where it comes to rest, motor space: the setpoint's stopping point
+    /// when the stop began, so it decelerates straight to it.
+    target: Rev,
+    /// `stop_then_release`: let go once at rest.
+    release_when_still: bool,
+    since: Instant,
+}
+
+/// How long `stop_then_release` waits for the setpoint to come to rest
+/// before releasing anyway.
+const STOP_THEN_RELEASE_LIMIT: Duration = Duration::from_secs(2);
 
 /// How the thread runs.
 #[derive(Debug, Clone)]
@@ -128,6 +145,51 @@ struct Axis {
     can_hold: bool,
     /// The acceleration limit's state: where the setpoint actually sent is.
     shaper: Shaper,
+    /// Set while the stop policy keeps this axis powered.
+    estop_hold: Option<EstopHold>,
+    /// This axis's own guard or silence raised a stop since the last reset.
+    /// It is the one misbehaving, so it is never the one kept powered.
+    self_tripped: bool,
+}
+
+impl Axis {
+    /// Whether the axis is powered under the runtime's command: driven by a
+    /// client, or held by the stop policy. The guard and the comm-loss count
+    /// watch both.
+    fn energised(&self) -> bool {
+        self.gate.driving || self.estop_hold.is_some()
+    }
+
+    /// Where the setpoint would come to rest decelerating at the limit from
+    /// where it is now, inside the envelope; else where the axis is.
+    fn stopping_point(&self) -> Option<Rev> {
+        let safety = &self.spec.safety;
+        let accel = safety.accel_limit.value();
+        // A position setpoint brakes from where it is at its own velocity.
+        // A velocity command has no setpoint; the hold's shaper will start
+        // from the measured position and velocity, so predict from those.
+        let (from, v) = match self.shaper.shaping {
+            Shaping::Off => return self.known.position.filter(|p| p.value().is_finite()),
+            Shaping::Position => (self.shaper.position, self.shaper.velocity),
+            Shaping::Velocity => (
+                self.known.position?.value(),
+                self.known.velocity.map(|v| v.value()).unwrap_or(0.0),
+            ),
+        };
+        let travel = if accel > 0.0 { v * v.abs() / (2.0 * accel) } else { 0.0 };
+        let point = from + travel;
+        point
+            .is_finite()
+            .then(|| safety.clamp_position(Rev(point)).0)
+    }
+
+    /// Lets go of a held axis: the stop burst, then off.
+    fn release_hold(&mut self) {
+        if self.estop_hold.take().is_some() {
+            self.stop_ticks = STOP_BURST;
+            self.shaper.reset();
+        }
+    }
 }
 
 /// What the shaper is shaping: nothing, a position setpoint, or a velocity.
@@ -315,6 +377,11 @@ pub struct BusWorker {
     tick: u64,
     last_cmd_seq: u32,
     reset_requested: bool,
+    /// The sequence number of the command that cleared the last stop. A
+    /// held axis keeps holding until a later one arrives.
+    reset_seq: u32,
+    /// The estop's clear count this thread has acted on.
+    seen_generation: u32,
     late_run: u32,
     epoch: Instant,
 }
@@ -348,6 +415,8 @@ impl BusWorker {
                 zero_pending: None,
                 can_hold: bus.capabilities(index).modes.contains(&ControlMode::Hold),
                 shaper: Shaper::OFF,
+                estop_hold: None,
+                self_tripped: false,
             })
             .collect();
         Self {
@@ -364,6 +433,8 @@ impl BusWorker {
             tick: 0,
             last_cmd_seq: 0,
             reset_requested: false,
+            reset_seq: 0,
+            seen_generation: 0,
             late_run: 0,
             epoch: Instant::now(),
         }
@@ -494,16 +565,26 @@ impl BusWorker {
         }
         if self.reset_requested {
             self.reset_requested = false;
-            if self.estop.is_latched() {
-                self.estop.clear();
-                for axis in &mut self.axes {
-                    axis.gate.release();
-                    axis.guard.reset();
-                    axis.silent_run = 0;
-                }
+            self.estop.clear_by(cmd.seq);
+        }
+        // Whichever thread cleared it, every thread resets its own axes and
+        // learns which command did it. The latch is read before the
+        // generation: `clear_by` moves the generation first, so seeing the
+        // latch open guarantees seeing the reset behind it.
+        let stopped = self.estop.is_latched();
+        let (generation, reset_seq) = self.estop.generation();
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            self.reset_seq = reset_seq;
+            for axis in &mut self.axes {
+                axis.gate.release();
+                axis.guard.reset();
+                axis.silent_run = 0;
+                axis.self_tripped = false;
             }
         }
-        let stopped = self.estop.is_latched();
+        let trip = if stopped { self.estop.code() } else { None };
+        let dt = self.config.period.as_secs_f64();
 
         let profile =
             if self.config.full_every > 0 && self.tick % self.config.full_every as u64 == 0 {
@@ -555,20 +636,100 @@ impl BusWorker {
                 axis.hold_at = None;
             }
 
-            let want = mode::drives(motor.mode);
+            // The stop policy. An axis being driven when the stop came, under
+            // a policy that keeps power and a stop that allows it, is brought
+            // to rest and held instead of released.
+            if stopped {
+                axis.zero_pending = None;
+                if axis.estop_hold.is_none() {
+                    if axis.gate.driving
+                        && axis.spec.on_estop != EstopPolicy::Release
+                        && trip.is_some_and(trip_allows_hold)
+                        && axis.silent_run == 0
+                        && !axis.self_tripped
+                    {
+                        if let Some(target) = axis.stopping_point() {
+                            axis.estop_hold = Some(EstopHold {
+                                target,
+                                release_when_still: axis.spec.on_estop
+                                    == EstopPolicy::StopThenRelease,
+                                since: now,
+                            });
+                        }
+                    }
+                } else if !trip.is_some_and(trip_allows_hold) {
+                    axis.release_hold();
+                }
+            } else if axis.estop_hold.is_some()
+                && stale
+                && self.config.on_timeout == TimeoutPolicy::Release
+            {
+                // Reset, and nobody is talking: the timeout policy decides,
+                // as it would for an axis the client was driving.
+                axis.release_hold();
+            } else if axis.estop_hold.is_some() && cmd.seq != self.reset_seq {
+                // The client's first command after the reset decides: drive
+                // carries on from the held place, anything else lets go.
+                if mode::drives(motor.mode) {
+                    axis.estop_hold = None;
+                } else {
+                    axis.release_hold();
+                }
+            }
+            if axis.estop_hold.is_some() {
+                // A held axis that stops answering is let go: when it comes
+                // back it is not re-energised by a hold nobody can see.
+                let limit = axis.spec.safety.max_consecutive_timeouts;
+                if limit > 0 && axis.silent_run >= limit {
+                    axis.release_hold();
+                }
+            }
+            let holding = axis.estop_hold.is_some();
+
+            // A held axis waits for the client's next word, so the record
+            // that carried the reset does not arm it.
+            let want = mode::drives(motor.mode) && !holding;
             let was_driving = axis.gate.driving;
             let drive = axis
                 .gate
                 .decide(want, &axis.known, &mut axis.guard, stopped);
             if was_driving && !drive {
-                axis.stop_ticks = STOP_BURST;
+                axis.stop_ticks = if holding { 0 } else { STOP_BURST };
             }
 
-            if !drive || stopped {
+            if (!drive || stopped) && !holding {
                 // Driving again later starts from wherever the axis is then.
                 axis.shaper.reset();
             }
-            let command = if stopped {
+            let command = if let Some(hold) = axis.estop_hold {
+                let held = MotorCmd {
+                    mode: mode::DRIVE,
+                    q: axis.spec.mapping.joint_position(hold.target).value() as f32,
+                    ..MotorCmd::OFF
+                };
+                let mut command =
+                    drive_command(&axis.spec, &held, self.config.period, resend, None);
+                axis.shaper
+                    .apply(&mut command, mode::DRIVE, &axis.spec.safety, dt, &axis.known);
+                if hold.release_when_still {
+                    let at_rest = match axis.shaper.shaping {
+                        Shaping::Position => {
+                            axis.shaper.velocity.abs() <= 1e-6
+                                && (axis.shaper.position - hold.target.value()).abs() <= 1e-5
+                        }
+                        // Nothing shapes the stop, so the target is already
+                        // the command: as still as this axis will be made.
+                        _ => true,
+                    };
+                    if at_rest
+                        || now.saturating_duration_since(hold.since) >= STOP_THEN_RELEASE_LIMIT
+                    {
+                        // This tick still holds; the burst starts on the next.
+                        axis.release_hold();
+                    }
+                }
+                command
+            } else if stopped {
                 // A stop cancels what was pending; the client asks again.
                 axis.zero_pending = None;
                 Command::new(Mode::Stop)
@@ -576,13 +737,8 @@ impl BusWorker {
                 let hold_at = if axis.can_hold { None } else { axis.hold_at };
                 let mut command =
                     drive_command(&axis.spec, &motor, self.config.period, resend, hold_at);
-                axis.shaper.apply(
-                    &mut command,
-                    motor.mode,
-                    &axis.spec.safety,
-                    self.config.period.as_secs_f64(),
-                    &axis.known,
-                );
+                axis.shaper
+                    .apply(&mut command, motor.mode, &axis.spec.safety, dt, &axis.known);
                 command
             } else if axis.stop_ticks > 0 {
                 axis.stop_ticks -= 1;
@@ -599,6 +755,11 @@ impl BusWorker {
         if self.bus.cycle(&self.cmds, &mut self.replies).is_err() {
             self.estop.latch(TripCode::Transport);
             self.replies.fill(AxisReply::SILENT);
+            // A link that failed cannot carry a hold, and must not resume
+            // one on its own when it comes back.
+            for axis in &mut self.axes {
+                axis.release_hold();
+            }
         }
 
         for (axis, reply) in self.axes.iter_mut().zip(self.replies.iter()) {
@@ -608,15 +769,23 @@ impl BusWorker {
             } else {
                 axis.silent_run = axis.silent_run.saturating_add(1);
                 let limit = axis.spec.safety.max_consecutive_timeouts;
-                if axis.gate.driving && limit > 0 && axis.silent_run >= limit {
+                if axis.energised() && limit > 0 && axis.silent_run >= limit {
                     self.estop.latch(TripCode::CommLoss);
+                    axis.self_tripped = true;
+                    axis.release_hold();
                 }
             }
             if let Some(code) =
                 axis.guard
-                    .evaluate(&axis.known, axis.velocity_target, axis.gate.driving, now)
+                    .evaluate(&axis.known, axis.velocity_target, axis.energised(), now)
             {
                 self.estop.latch(code);
+                // The axis whose own guard tripped is the one misbehaving —
+                // running away, out of its travel, overheating — whatever
+                // the code: holding it would keep feeding the fault. Others
+                // may hold.
+                axis.self_tripped = true;
+                axis.release_hold();
             }
             self.state.state[axis.spec.joint] = motor_state(axis, self.estop.is_latched());
         }
@@ -742,7 +911,12 @@ fn f32_or_nan(value: Option<f64>) -> f32 {
 fn motor_state(axis: &Axis, stopped: bool) -> MotorState {
     let mapping = &axis.spec.mapping;
     let known = &axis.known;
-    let status = if stopped {
+    // A held axis says so before anything else, stop or no stop: it is
+    // powered, and "tripped" reads as limp to whoever is standing next to
+    // it. The robot-wide stop is in the record's own `estop` field.
+    let status = if axis.estop_hold.is_some() {
+        AxisStatus::Held
+    } else if stopped {
         AxisStatus::Tripped
     } else if !known.status.answered() {
         AxisStatus::Silent
@@ -794,6 +968,7 @@ mod tests {
             joint,
             mapping,
             safety: mapping.safety_config(&limits, SafetyConfig::default()),
+            on_estop: EstopPolicy::Release,
         }
     }
 
@@ -1227,6 +1402,359 @@ mod tests {
         assert!((last - 0.5).abs() < 1e-9);
     }
 
+    /// Drives one axis toward 1.2 rad from rest and stops it mid-move with
+    /// `code`; returns the worker, its command writer, the estop, the log,
+    /// the clock and the index of the first logged tick after the stop.
+    fn stopped_mid_move(
+        on_estop: EstopPolicy,
+        code: TripCode,
+    ) -> (BusWorker, Writer<Stamped<LowCmd>>, Estop, Log, Instant, usize) {
+        let (mut worker, mut cmd_tx, _, estop, log) =
+            recording_with(1, false, Rev(0.0), TimeoutPolicy::Hold, on_estop);
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+            at: start,
+        });
+        // Long enough to be moving fast, not long enough to arrive.
+        for i in 0..60u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert!(worker.axes[0].shaper.velocity.abs() > 0.05, "moving when stopped");
+        estop.latch(code);
+        let first = log.lock().unwrap().len();
+        (worker, cmd_tx, estop, log, start + Duration::from_millis(120), first)
+    }
+
+    fn positions(log: &Log, from: usize) -> Vec<Option<f64>> {
+        log.lock().unwrap()[from..]
+            .iter()
+            .map(|cmds| match cmds[0].mode {
+                Mode::Position => cmds[0].position.get().map(|p| p.value()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `release`, the default, is what it always was: torque off on the
+    /// first tick of the stop.
+    #[test]
+    fn release_lets_go_at_once() {
+        let (mut worker, _, _, log, t, first) =
+            stopped_mid_move(EstopPolicy::Release, TripCode::Requested);
+        worker.tick(t);
+        assert_eq!(log.lock().unwrap()[first][0].mode, Mode::Stop);
+    }
+
+    /// `hold` decelerates within the acceleration limit to the stopping
+    /// point and stays there, powered, without passing it.
+    #[test]
+    fn hold_brakes_within_the_limit_and_keeps_the_place() {
+        let (mut worker, _, _, log, t, first) =
+            stopped_mid_move(EstopPolicy::Hold, TripCode::Requested);
+        let target = worker.axes[0].stopping_point().unwrap().value();
+        for i in 0..400u64 {
+            worker.tick(t + Duration::from_millis(2 * i));
+        }
+        let held: Vec<f64> = positions(&log, first)
+            .into_iter()
+            .map(|p| p.expect("every tick of a hold is a position command"))
+            .collect();
+        let a = spec(0).safety.accel_limit.value();
+        let dt = 0.002;
+        for w in held.windows(3) {
+            let accel = (w[2] - 2.0 * w[1] + w[0]) / (dt * dt);
+            assert!(accel.abs() <= a * 1.0001, "{accel} over {a}");
+        }
+        assert!(held.iter().all(|&p| p <= target + 1e-5), "passed the stopping point");
+        assert!((held.last().unwrap() - target).abs() < 1e-5);
+        assert!(worker.axes[0].energised());
+    }
+
+    /// A fault that holding makes worse releases even under `hold`.
+    #[test]
+    fn hold_releases_on_a_motor_fault() {
+        let (mut worker, _, _, log, t, first) =
+            stopped_mid_move(EstopPolicy::Hold, TripCode::OverCurrent);
+        worker.tick(t);
+        assert_eq!(log.lock().unwrap()[first][0].mode, Mode::Stop);
+        assert!(!worker.axes[0].energised());
+    }
+
+    /// `stop_then_release` comes to rest, then lets go with the stop burst.
+    #[test]
+    fn stop_then_release_rests_then_lets_go() {
+        let (mut worker, _, _, log, t, first) =
+            stopped_mid_move(EstopPolicy::StopThenRelease, TripCode::Requested);
+        for i in 0..400u64 {
+            worker.tick(t + Duration::from_millis(2 * i));
+        }
+        let modes: Vec<Mode> = log.lock().unwrap()[first..].iter().map(|c| c[0].mode).collect();
+        let braking = modes.iter().take_while(|m| **m == Mode::Position).count();
+        assert!(braking > 10, "it braked for {braking} ticks");
+        assert!(modes[braking..].iter().all(|m| *m == Mode::Stop), "{:?}", &modes[braking..]);
+        assert!(!worker.axes[0].energised());
+    }
+
+    /// After a reset a held axis keeps its place until the client's next
+    /// command: drive carries on without letting go, off releases.
+    #[test]
+    fn a_reset_keeps_the_hold_until_the_client_speaks() {
+        for (next_mode, expect_release) in [(mode::DRIVE, false), (mode::OFF, true)] {
+            let (mut worker, mut cmd_tx, estop, log, t, _) =
+                stopped_mid_move(EstopPolicy::Hold, TripCode::Requested);
+            for i in 0..300u64 {
+                worker.tick(t + Duration::from_millis(2 * i));
+            }
+            let held_at = worker.axes[0].estop_hold.unwrap().target.value();
+
+            // The reset, carrying the client's old drive record.
+            let mut reset = one(mode::DRIVE, 1.2, 0.0, 0.0, 2);
+            reset.flags = flags::FAULT_RESET;
+            let t = t + Duration::from_millis(600);
+            cmd_tx.publish(Stamped { value: reset, at: t });
+            let from = log.lock().unwrap().len();
+            for i in 0..50u64 {
+                worker.tick(t + Duration::from_millis(2 * i));
+            }
+            assert_eq!(estop.code(), None);
+            for p in positions(&log, from) {
+                let p = p.expect("still a position command after the reset");
+                assert!((p - held_at).abs() < 1e-5, "held, not driven to the old target: {p}");
+            }
+
+            // The client's next command.
+            let t = t + Duration::from_millis(100);
+            cmd_tx.publish(Stamped {
+                value: one(next_mode, 1.2, 0.0, 0.0, 3),
+                at: t,
+            });
+            let from = log.lock().unwrap().len();
+            for i in 0..5u64 {
+                worker.tick(t + Duration::from_millis(2 * i));
+            }
+            let modes: Vec<Mode> =
+                log.lock().unwrap()[from..].iter().map(|c| c[0].mode).collect();
+            if expect_release {
+                assert_eq!(modes[0], Mode::Stop, "{modes:?}");
+                assert!(!worker.axes[0].energised());
+            } else {
+                assert!(modes.iter().all(|m| *m == Mode::Position), "{modes:?}");
+                assert!(worker.axes[0].gate.driving);
+            }
+        }
+    }
+
+    /// Two bus threads share one stop. A reset that one of them clears is a
+    /// reset for both: neither drives a held axis on the record that
+    /// carried it.
+    #[test]
+    fn a_reset_is_the_same_reset_on_every_bus() {
+        let estop = Estop::new();
+        let mut sender = crate::exchange::Broadcast::new();
+        let mut workers = Vec::new();
+        let mut logs = Vec::new();
+        for joint in 0..2 {
+            let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut bus = Recording {
+                inner: SimBus::new(1).fixed_step(0.002),
+                log: Arc::clone(&log),
+                holds: false,
+            };
+            bus.open().unwrap();
+            let (state_tx, _) = triple(BusState::EMPTY);
+            workers.push(BusWorker::new(
+                WorkerConfig {
+                    name: format!("b{joint}"),
+                    period: Duration::from_millis(2),
+                    cmd_timeout: Duration::from_millis(100),
+                    on_timeout: TimeoutPolicy::Hold,
+                    deadline_miss_trip: 0,
+                    full_every: 10,
+                    resend_every: 50,
+                    priority: 0,
+                    cpu: None,
+                },
+                Box::new(bus),
+                &[AxisSpec {
+                    on_estop: EstopPolicy::Hold,
+                    ..spec(joint)
+                }],
+                sender.subscribe(Stamped::now(LowCmd::EMPTY)),
+                state_tx,
+                estop.clone(),
+                Arc::new(AtomicBool::new(true)),
+            ));
+            logs.push(log);
+        }
+        let drive = |seq: u32, flags_: u32| {
+            let mut cmd = LowCmd::EMPTY;
+            cmd.seq = seq;
+            cmd.n = 2;
+            cmd.flags = flags_;
+            for motor in cmd.cmd.iter_mut().take(2) {
+                motor.mode = mode::DRIVE;
+                motor.q = 1.2;
+            }
+            cmd
+        };
+        let start = Instant::now();
+        let mut t = start;
+        let step = |workers: &mut Vec<BusWorker>, t: &mut Instant, n: u64| {
+            for _ in 0..n {
+                *t += Duration::from_millis(2);
+                for w in workers.iter_mut() {
+                    w.tick(*t);
+                }
+            }
+        };
+        sender.publish(Stamped { value: drive(1, 0), at: t });
+        step(&mut workers, &mut t, 60);
+        sender.publish(Stamped { value: drive(2, flags::QUICK_STOP), at: t });
+        step(&mut workers, &mut t, 300);
+        let held: Vec<f64> = workers
+            .iter()
+            .map(|w| w.axes[0].estop_hold.expect("both held").target.value())
+            .collect();
+
+        // The reset rides on the old drive record; worker 0 runs first and
+        // clears it, worker 1 must still see it as this reset.
+        sender.publish(Stamped {
+            value: drive(3, flags::FAULT_RESET),
+            at: t,
+        });
+        let from: Vec<usize> = logs.iter().map(|l| l.lock().unwrap().len()).collect();
+        step(&mut workers, &mut t, 50);
+        assert_eq!(estop.code(), None);
+        for (k, log) in logs.iter().enumerate() {
+            for p in positions(log, from[k]) {
+                let p = p.expect("a position command");
+                assert!((p - held[k]).abs() < 1e-5, "bus {k} moved off its hold to {p}");
+            }
+            assert_eq!(workers[k].reset_seq, 3, "bus {k} knows which command reset it");
+        }
+    }
+
+    /// The axis whose own guard raised the stop is not held, whatever the
+    /// code; the others are.
+    #[test]
+    fn the_axis_that_tripped_is_not_the_one_held() {
+        let (mut worker, mut cmd_tx, _, estop, log) =
+            recording_with(2, false, Rev(0.0), TimeoutPolicy::Hold, EstopPolicy::Hold);
+        let start = Instant::now();
+        let mut cmd = LowCmd::EMPTY;
+        cmd.seq = 1;
+        cmd.n = 2;
+        for motor in cmd.cmd.iter_mut().take(2) {
+            motor.mode = mode::DRIVE;
+            motor.q = 1.2;
+        }
+        cmd_tx.publish(Stamped { value: cmd, at: start });
+        for i in 0..60u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        // Axis 0 is the culprit, as its guard would have said.
+        worker.axes[0].self_tripped = true;
+        estop.latch(TripCode::VelocityRunaway);
+        let from = log.lock().unwrap().len();
+        worker.tick(start + Duration::from_millis(120));
+        let sent = log.lock().unwrap()[from].clone();
+        assert_eq!(sent[0].mode, Mode::Stop, "the culprit is released");
+        assert_eq!(sent[1].mode, Mode::Position, "the other holds");
+    }
+
+    /// After a reset, a client that has gone quiet is handled by the
+    /// timeout policy: `release` lets a held axis go.
+    #[test]
+    fn a_dead_client_after_a_reset_gets_the_timeout_policy() {
+        let (mut worker, _, _, log, t, _) = {
+            let (mut worker, mut cmd_tx, _, estop, log) = recording_with(
+                1,
+                false,
+                Rev(0.0),
+                TimeoutPolicy::Release,
+                EstopPolicy::Hold,
+            );
+            let start = Instant::now();
+            cmd_tx.publish(Stamped {
+                value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+                at: start,
+            });
+            for i in 0..40u64 {
+                worker.tick(start + Duration::from_millis(2 * i));
+            }
+            estop.latch(TripCode::Requested);
+            worker.tick(start + Duration::from_millis(80));
+            assert!(worker.axes[0].estop_hold.is_some());
+            let mut reset = one(mode::DRIVE, 1.2, 0.0, 0.0, 2);
+            reset.flags = flags::FAULT_RESET;
+            let t = start + Duration::from_millis(82);
+            cmd_tx.publish(Stamped { value: reset, at: t });
+            worker.tick(t);
+            (worker, cmd_tx, estop, log, t, 0usize)
+        };
+        assert!(worker.axes[0].estop_hold.is_some(), "held through the reset");
+        // Nothing more from the client: stale after 100 ms.
+        let from = log.lock().unwrap().len();
+        for i in 1..80u64 {
+            worker.tick(t + Duration::from_millis(2 * i));
+        }
+        assert!(worker.axes[0].estop_hold.is_none(), "released once stale");
+        assert!(log.lock().unwrap()[from..].iter().any(|c| c[0].mode == Mode::Stop));
+    }
+
+    /// A bus that fails while axes are held lets them go: a link that comes
+    /// back must not pick the hold up again on its own.
+    #[test]
+    fn a_failed_bus_releases_its_holds() {
+        let (mut worker, _, estop, _, t, _) =
+            stopped_mid_move(EstopPolicy::Hold, TripCode::Requested);
+        worker.tick(t);
+        assert!(worker.axes[0].estop_hold.is_some());
+        // Swap in a bus that fails every cycle.
+        struct Dead;
+        impl Bus for Dead {
+            fn kind(&self) -> &'static str {
+                "dead"
+            }
+            fn axes(&self) -> usize {
+                1
+            }
+            fn open(&mut self) -> drlabs_core::Result<Vec<Option<drlabs_core::Identity>>> {
+                Ok(vec![None])
+            }
+            fn close(&mut self) -> drlabs_core::Result<()> {
+                Ok(())
+            }
+            fn cycle(&mut self, _: &[AxisCmd], _: &mut [AxisReply]) -> drlabs_core::Result<()> {
+                Err(drlabs_core::Error::Config("gone".into()))
+            }
+            fn capabilities(&self, _: usize) -> drlabs_core::Capabilities {
+                drlabs_core::Capabilities::default()
+            }
+        }
+        worker.bus = Box::new(Dead);
+        worker.tick(t + Duration::from_millis(2));
+        assert!(worker.axes[0].estop_hold.is_none());
+        assert_eq!(estop.code(), Some(TripCode::Requested), "the first reason is kept");
+    }
+
+    /// The record says a held axis is held — not tripped, not off — during
+    /// the stop and after the reset.
+    #[test]
+    fn a_held_axis_reports_held() {
+        let (mut worker, mut cmd_tx, estop, _, t, _) =
+            stopped_mid_move(EstopPolicy::Hold, TripCode::Requested);
+        worker.tick(t);
+        assert_eq!(motor_state(&worker.axes[0], true).status, AxisStatus::Held as u8);
+        let mut reset = one(mode::DRIVE, 1.2, 0.0, 0.0, 2);
+        reset.flags = flags::FAULT_RESET;
+        cmd_tx.publish(Stamped { value: reset, at: t });
+        worker.tick(t + Duration::from_millis(2));
+        assert_eq!(estop.code(), None);
+        assert_eq!(motor_state(&worker.axes[0], false).status, AxisStatus::Held as u8);
+    }
+
     /// A bus that remembers what it was told, so a test can see the modes
     /// the worker chose rather than only where the axes ended up.
     struct Recording {
@@ -1272,10 +1800,25 @@ mod tests {
         at: Rev,
         on_timeout: TimeoutPolicy,
     ) -> (BusWorker, Writer<Stamped<LowCmd>>, Reader<BusState>, Estop, Log) {
+        recording_with(axes, holds, at, on_timeout, EstopPolicy::Release)
+    }
+
+    fn recording_with(
+        axes: usize,
+        holds: bool,
+        at: Rev,
+        on_timeout: TimeoutPolicy,
+        on_estop: EstopPolicy,
+    ) -> (BusWorker, Writer<Stamped<LowCmd>>, Reader<BusState>, Estop, Log) {
         let (cmd_tx, cmd_rx) = triple(Stamped::now(LowCmd::EMPTY));
         let (state_tx, state_rx) = triple(BusState::EMPTY);
         let estop = Estop::new();
-        let specs: Vec<AxisSpec> = (0..axes).map(spec).collect();
+        let specs: Vec<AxisSpec> = (0..axes)
+            .map(|joint| AxisSpec {
+                on_estop,
+                ..spec(joint)
+            })
+            .collect();
         let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut inner = SimBus::new(axes).fixed_step(0.002);
         for axis in 0..axes {

@@ -220,6 +220,35 @@ pub struct JointLimits {
     pub bus_voltage_min: Option<f64>,
     #[serde(default)]
     pub bus_voltage_max: Option<f64>,
+
+    /// How far, in radians, a driven joint may be from the setpoint sent to
+    /// it for longer than [`FOLLOWING_ERROR_TIME_S`] before the robot is
+    /// stopped. A joint whose torque ceiling is below its load sags while
+    /// its servo still answers healthy; this is what notices. Leave it out
+    /// for [`DEFAULT_FOLLOWING_ERROR_RAD`]; 0 turns the check off for this
+    /// joint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_following_error_rad: Option<f64>,
+}
+
+/// The following-error ceiling a joint gets when it declares none. Several
+/// times the 0.09 rad the bench tracks a 1 rad/s trajectory with at 400 Hz,
+/// a sag nobody would mistake for lag.
+pub const DEFAULT_FOLLOWING_ERROR_RAD: f64 = 0.5;
+/// How long the error must persist: long enough that a hard start or a
+/// stall against a stop for a moment does not trip, short enough that a
+/// sagging arm does not go far.
+pub const FOLLOWING_ERROR_TIME_S: f64 = 0.25;
+
+impl JointLimits {
+    /// The following-error ceiling in force, radians; `None` when off.
+    pub fn following_error_rad(&self) -> Option<f64> {
+        match self.max_following_error_rad {
+            None => Some(DEFAULT_FOLLOWING_ERROR_RAD),
+            Some(value) if value > 0.0 => Some(value),
+            Some(_) => None,
+        }
+    }
 }
 
 /// Why a description was refused.
@@ -541,6 +570,13 @@ impl Config {
             }
             if limits.max_velocity_rad_s <= 0.0 {
                 return Err(ConfigError(format!("{where_} has no max_velocity_rad_s")));
+            }
+            if let Some(value) = limits.max_following_error_rad {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(ConfigError(format!(
+                        "{where_}: max_following_error_rad {value} must be 0 (off) or positive"
+                    )));
+                }
             }
 
             match (limits.bus_voltage_min, limits.bus_voltage_max) {

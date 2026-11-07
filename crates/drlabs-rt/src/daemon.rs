@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use drlabs_core::bus::Bus;
 use drlabs_core::lowlevel::{LowCmd, LowState, MAX_AXES};
+use drlabs_core::units::Rad;
 use drlabs_safety::Config as SafetyConfig;
 
 use crate::config::{BusConfig, Config, JointConfig};
@@ -224,6 +225,10 @@ impl Daemon {
                         mapping,
                         safety: mapping.safety_config(&joint.limits, SafetyConfig::default()),
                         on_estop: config.estop_policy(joint),
+                        following_error: joint
+                            .limits
+                            .following_error_rad()
+                            .map(|rad| mapping.motor_span(Rad(rad)).value().abs()),
                     }
                 })
                 .collect();

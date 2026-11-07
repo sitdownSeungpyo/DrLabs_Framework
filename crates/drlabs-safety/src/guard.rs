@@ -43,6 +43,11 @@ pub enum TripCode {
     Requested = 12,
     /// The transport itself failed.
     Transport = 13,
+    /// A driven axis stayed further from its setpoint than its declared
+    /// following error for longer than allowed: it is not doing what it is
+    /// told — overpowered by its load, limited, jammed — while still
+    /// answering as healthy. Raised by the runtime.
+    FollowingError = 14,
 }
 
 impl TripCode {
@@ -62,6 +67,7 @@ impl TripCode {
             TripCode::Deadline => "deadline",
             TripCode::Requested => "estop_requested",
             TripCode::Transport => "transport",
+            TripCode::FollowingError => "following_error",
         }
     }
 
@@ -80,6 +86,7 @@ impl TripCode {
             11 => TripCode::Deadline,
             12 => TripCode::Requested,
             13 => TripCode::Transport,
+            14 => TripCode::FollowingError,
             _ => return None,
         })
     }
@@ -588,7 +595,7 @@ mod tests {
 
     #[test]
     fn trip_codes_round_trip_through_a_byte() {
-        for value in 1..=13u8 {
+        for value in 1..=14u8 {
             let code = TripCode::from_u8(value).expect("every value in range is a code");
             assert_eq!(code as u8, value);
             assert!(!code.code().is_empty());

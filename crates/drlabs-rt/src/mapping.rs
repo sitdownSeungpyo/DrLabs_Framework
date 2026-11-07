@@ -222,6 +222,7 @@ mod tests {
         let limits = JointLimits {
             bus_voltage_min: None,
             bus_voltage_max: None,
+            max_following_error_rad: None,
             min_rad: -1.0,
             max_rad: 2.0,
             max_torque_nm: 1.0,
@@ -248,6 +249,7 @@ mod tests {
         let limits = JointLimits {
             bus_voltage_min: None,
             bus_voltage_max: None,
+            max_following_error_rad: None,
             min_rad: -0.5,
             max_rad: 0.5,
             max_torque_nm: 19.0,
@@ -270,6 +272,7 @@ mod tests {
         let limits = JointLimits {
             bus_voltage_min: None,
             bus_voltage_max: None,
+            max_following_error_rad: None,
             min_rad: -1.0,
             max_rad: 1.0,
             max_torque_nm: 1.0,

@@ -63,6 +63,7 @@ TRIP_NAMES = {
     11: "deadline",
     12: "quick_stop_requested",
     13: "transport",
+    14: "following_error",
 }
 
 #: What the runtime and a ROS 2 node both call the topics (without the

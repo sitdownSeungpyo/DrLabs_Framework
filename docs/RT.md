@@ -87,6 +87,23 @@ The session's enable-operation / disable-operation / fault state machine (CiA 40
   A reset is acted on once per `seq`; a client that restarts its counter
   must not reuse the number of its last reset.
 
+### Following error (`limits.max_following_error_rad`)
+
+A driven joint (client DRIVE/HOLD, position command) that stays further from
+the setpoint sent to it than this for 0.25 s stops the robot with code 14
+`following_error` — a joint overpowered by its load or held under a torque
+ceiling below it still answers `ok`, and this is what notices. Left out:
+**0.5 rad, on**. `0` turns it off for that joint: **a gripper, or any joint
+that is meant to push against something or sits against a hard stop inside
+its `min_rad`/`max_rad`, must set 0**, or it will trip. A tick the axis did
+not answer is not judged (comm loss is). The joint that tripped follows its
+stop policy like any other, and a hold keeps it where it actually is, not
+where its setpoint had run to. Holds kept by the stop policy are not checked.
+Measured 2026-11-07, 7 XL430, 400 Hz, ±0.2 rad 0.5 Hz sine under a 0.3 Nm
+ceiling, `hold`: default 0.5 rad — no trip in 10 s (tracking ≤ 0.09 rad);
+0.05 rad — still no trip (the error passes it only near peak speed, never for
+0.25 s on end); 0.02 rad — code 14 at 0.43 s, all 7 held, no drop.
+
 ### Stop policy (`rt.on_estop`, a joint's own `on_estop` overrides)
 
 | policy | a driven axis on a stop |

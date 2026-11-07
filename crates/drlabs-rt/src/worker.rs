@@ -47,7 +47,13 @@ pub struct AxisSpec {
     pub safety: SafetyConfig,
     /// What the axis does when the robot is stopped while it is driven.
     pub on_estop: EstopPolicy,
+    /// The following-error ceiling, motor revolutions; `None` is off.
+    pub following_error: Option<f64>,
 }
+
+/// How long a following error must persist before it stops the robot.
+const FOLLOWING_ERROR_TIME: Duration =
+    Duration::from_millis((crate::config::FOLLOWING_ERROR_TIME_S * 1000.0) as u64);
 
 /// An axis an [`EstopPolicy`] is keeping powered through a stop.
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +156,14 @@ struct Axis {
     /// This axis's own guard or silence raised a stop since the last reset.
     /// It is the one misbehaving, so it is never the one kept powered.
     self_tripped: bool,
+    /// Since when the axis has been further from its setpoint than its
+    /// following-error ceiling, without a break.
+    following_since: Option<Instant>,
+    /// This axis raised a following-error stop. It is not misbehaving the
+    /// way a runaway is — it is being overpowered — so it follows its stop
+    /// policy like the others, but a hold keeps it where it actually is
+    /// rather than where its setpoint had got to.
+    hold_where_it_is: bool,
 }
 
 impl Axis {
@@ -417,6 +431,8 @@ impl BusWorker {
                 shaper: Shaper::OFF,
                 estop_hold: None,
                 self_tripped: false,
+                following_since: None,
+                hold_where_it_is: false,
             })
             .collect();
         Self {
@@ -581,6 +597,8 @@ impl BusWorker {
                 axis.guard.reset();
                 axis.silent_run = 0;
                 axis.self_tripped = false;
+                axis.following_since = None;
+                axis.hold_where_it_is = false;
             }
         }
         let trip = if stopped { self.estop.code() } else { None };
@@ -648,7 +666,18 @@ impl BusWorker {
                         && axis.silent_run == 0
                         && !axis.self_tripped
                     {
-                        if let Some(target) = axis.stopping_point() {
+                        let target = if axis.hold_where_it_is {
+                            // Its setpoint ran ahead of it; hold the place
+                            // it reached, starting the shaper from there.
+                            axis.shaper.reset();
+                            axis.known
+                                .position
+                                .filter(|p| p.value().is_finite())
+                                .map(|p| axis.spec.safety.clamp_position(p).0)
+                        } else {
+                            axis.stopping_point()
+                        };
+                        if let Some(target) = target {
                             axis.estop_hold = Some(EstopHold {
                                 target,
                                 release_when_still: axis.spec.on_estop
@@ -762,7 +791,12 @@ impl BusWorker {
             }
         }
 
-        for (axis, reply) in self.axes.iter_mut().zip(self.replies.iter()) {
+        for ((axis, reply), sent) in self
+            .axes
+            .iter_mut()
+            .zip(self.replies.iter())
+            .zip(self.cmds.iter())
+        {
             axis.known.merge(reply);
             if reply.status.answered() {
                 axis.silent_run = 0;
@@ -786,6 +820,39 @@ impl BusWorker {
                 // may hold.
                 axis.self_tripped = true;
                 axis.release_hold();
+            }
+
+            // Following error: a client-driven position setpoint the axis
+            // has stayed away from. Only while the client drives it — a hold
+            // the stop policy is keeping is not let go for sagging, which
+            // would only let it fall further.
+            // A tick it did not answer is comm loss's to judge, not this:
+            // the merged position is then an old one.
+            let error = match (axis.spec.following_error, sent.command.mode) {
+                (Some(limit), Mode::Position)
+                    if axis.gate.driving && !stopped && reply.status.answered() =>
+                {
+                    sent.command
+                        .position
+                        .get()
+                        .zip(axis.known.position)
+                        .map(|(setpoint, at)| (setpoint.value() - at.value()).abs())
+                        .filter(|e| e.is_finite())
+                        .map(|e| e > limit)
+                }
+                _ => None,
+            };
+            match error {
+                Some(true) => {
+                    let since = *axis.following_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= FOLLOWING_ERROR_TIME {
+                        self.estop.latch(TripCode::FollowingError);
+                        // Overpowered, not misbehaving: its stop policy
+                        // decides, and a hold keeps the place it reached.
+                        axis.hold_where_it_is = true;
+                    }
+                }
+                _ => axis.following_since = None,
             }
             self.state.state[axis.spec.joint] = motor_state(axis, self.estop.is_latched());
         }
@@ -963,12 +1030,14 @@ mod tests {
             max_accel_rad_s2: 30.0,
             bus_voltage_min: None,
             bus_voltage_max: None,
+            max_following_error_rad: None,
         };
         AxisSpec {
             joint,
             mapping,
             safety: mapping.safety_config(&limits, SafetyConfig::default()),
             on_estop: EstopPolicy::Release,
+            following_error: None,
         }
     }
 
@@ -1753,6 +1822,238 @@ mod tests {
         worker.tick(t + Duration::from_millis(2));
         assert_eq!(estop.code(), None);
         assert_eq!(motor_state(&worker.axes[0], false).status, AxisStatus::Held as u8);
+    }
+
+    /// A bus whose axis answers but never moves: a joint overpowered by its
+    /// load, or held under a torque ceiling below it.
+    struct Stuck;
+    impl Bus for Stuck {
+        fn kind(&self) -> &'static str {
+            "stuck"
+        }
+        fn axes(&self) -> usize {
+            1
+        }
+        fn open(&mut self) -> drlabs_core::Result<Vec<Option<drlabs_core::Identity>>> {
+            Ok(vec![None])
+        }
+        fn close(&mut self) -> drlabs_core::Result<()> {
+            Ok(())
+        }
+        fn cycle(&mut self, _: &[AxisCmd], out: &mut [AxisReply]) -> drlabs_core::Result<()> {
+            out[0] = AxisReply {
+                status: AxisStatus::Ok,
+                mode: Some(1),
+                position: Some(Rev(0.0)),
+                velocity: Some(RevPerSec(0.0)),
+                voltage: Some(drlabs_core::units::Volts(24.0)),
+                board_temperature: Some(drlabs_core::units::Celsius(30.0)),
+                ..AxisReply::SILENT
+            };
+            Ok(())
+        }
+        fn capabilities(&self, _: usize) -> drlabs_core::Capabilities {
+            drlabs_core::Capabilities::default()
+        }
+    }
+
+    fn stuck_worker(following_error: Option<f64>) -> (BusWorker, Writer<Stamped<LowCmd>>, Estop) {
+        let (cmd_tx, cmd_rx) = triple(Stamped::now(LowCmd::EMPTY));
+        let (state_tx, _) = triple(BusState::EMPTY);
+        let estop = Estop::new();
+        let worker = BusWorker::new(
+            WorkerConfig {
+                name: "stuck".into(),
+                period: Duration::from_millis(2),
+                cmd_timeout: Duration::from_secs(10),
+                on_timeout: TimeoutPolicy::Hold,
+                deadline_miss_trip: 0,
+                full_every: 10,
+                resend_every: 50,
+                priority: 0,
+                cpu: None,
+            },
+            Box::new(Stuck),
+            &[AxisSpec {
+                following_error,
+                ..spec(0)
+            }],
+            cmd_rx,
+            state_tx,
+            estop.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+        (worker, cmd_tx, estop)
+    }
+
+    /// An axis that answers healthy but does not follow its setpoint stops
+    /// the robot once the error has lasted long enough — and not before.
+    #[test]
+    fn a_joint_that_does_not_follow_trips() {
+        let (mut worker, mut cmd_tx, estop) = stuck_worker(Some(0.05));
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+            at: start,
+        });
+        let mut tripped_at = None;
+        for i in 0..1000u64 {
+            let t = start + Duration::from_millis(2 * i);
+            worker.tick(t);
+            if estop.code().is_some() {
+                tripped_at = Some(t);
+                break;
+            }
+        }
+        let tripped_at = tripped_at.expect("it trips");
+        assert_eq!(estop.code(), Some(TripCode::FollowingError));
+        // The setpoint ramps away from 0; the error passes 0.05 rev after a
+        // while, and must then persist for the full time.
+        assert!(
+            tripped_at.duration_since(start) >= FOLLOWING_ERROR_TIME,
+            "tripped after {:?}",
+            tripped_at.duration_since(start)
+        );
+        assert!(worker.axes[0].hold_where_it_is);
+        assert!(!worker.axes[0].self_tripped, "overpowered, not misbehaving");
+    }
+
+    /// Under `hold`, the joint that could not follow is held where it got
+    /// to — not released to fall, and not driven on toward where its
+    /// setpoint had run.
+    #[test]
+    fn a_joint_that_could_not_follow_is_held_where_it_is() {
+        let (mut worker, mut cmd_tx, estop) = stuck_worker(Some(0.05));
+        worker.axes[0].spec.on_estop = EstopPolicy::Hold;
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+            at: start,
+        });
+        let mut t = start;
+        for i in 0..1000u64 {
+            t = start + Duration::from_millis(2 * i);
+            worker.tick(t);
+            if estop.code().is_some() {
+                break;
+            }
+        }
+        assert_eq!(estop.code(), Some(TripCode::FollowingError));
+        for i in 1..300u64 {
+            worker.tick(t + Duration::from_millis(2 * i));
+        }
+        let hold = worker.axes[0].estop_hold.expect("held, not released");
+        assert!(hold.target.value().abs() < 1e-9, "held where it is (0), at {:?}", hold.target);
+        assert!(worker.axes[0].shaper.position.abs() < 1e-3, "setpoint back at the axis");
+    }
+
+    /// Off means off, and a short excursion does not trip.
+    #[test]
+    fn following_error_off_or_brief_does_not_trip() {
+        let (mut worker, mut cmd_tx, estop) = stuck_worker(None);
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+            at: start,
+        });
+        for i in 0..1000u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        assert_eq!(estop.code(), None);
+
+        // A joint that freezes for a little under the limit and then
+        // catches up is not a trip; one that stays frozen is.
+        for (frozen_ms, expect_trip) in [(200u64, false), (600, true)] {
+            let frozen = Arc::new(AtomicBool::new(false));
+            let (cmd_tx, cmd_rx) = triple(Stamped::now(LowCmd::EMPTY));
+            let mut cmd_tx = cmd_tx;
+            let (state_tx, _) = triple(BusState::EMPTY);
+            let estop = Estop::new();
+            let mut worker = BusWorker::new(
+                WorkerConfig {
+                    name: "freezes".into(),
+                    period: Duration::from_millis(2),
+                    cmd_timeout: Duration::from_secs(10),
+                    on_timeout: TimeoutPolicy::Hold,
+                    deadline_miss_trip: 0,
+                    full_every: 10,
+                    resend_every: 50,
+                    priority: 0,
+                    cpu: None,
+                },
+                Box::new(Freezes {
+                    at: 0.0,
+                    frozen: Arc::clone(&frozen),
+                }),
+                &[AxisSpec {
+                    following_error: Some(0.02),
+                    ..spec(0)
+                }],
+                cmd_rx,
+                state_tx,
+                estop.clone(),
+                Arc::new(AtomicBool::new(true)),
+            );
+            cmd_tx.publish(Stamped {
+                value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+                at: start,
+            });
+            let mut t = start;
+            for i in 0..600u64 {
+                // Moving from the start; frozen from 100 ms for `frozen_ms`.
+                let ms = 2 * i;
+                frozen.store(ms >= 100 && ms < 100 + frozen_ms, Ordering::Relaxed);
+                t = start + Duration::from_millis(ms);
+                worker.tick(t);
+            }
+            let _ = t;
+            assert_eq!(
+                estop.code().is_some(),
+                expect_trip,
+                "frozen {frozen_ms} ms: {:?}",
+                estop.code()
+            );
+        }
+    }
+
+    /// Follows its command exactly, except while `frozen`.
+    struct Freezes {
+        at: f64,
+        frozen: Arc<AtomicBool>,
+    }
+    impl Bus for Freezes {
+        fn kind(&self) -> &'static str {
+            "freezes"
+        }
+        fn axes(&self) -> usize {
+            1
+        }
+        fn open(&mut self) -> drlabs_core::Result<Vec<Option<drlabs_core::Identity>>> {
+            Ok(vec![None])
+        }
+        fn close(&mut self) -> drlabs_core::Result<()> {
+            Ok(())
+        }
+        fn cycle(&mut self, cmds: &[AxisCmd], out: &mut [AxisReply]) -> drlabs_core::Result<()> {
+            if !self.frozen.load(Ordering::Relaxed) {
+                if let Some(p) = cmds[0].command.position.get() {
+                    self.at = p.value();
+                }
+            }
+            out[0] = AxisReply {
+                status: AxisStatus::Ok,
+                mode: Some(1),
+                position: Some(Rev(self.at)),
+                velocity: Some(RevPerSec(0.0)),
+                voltage: Some(drlabs_core::units::Volts(24.0)),
+                board_temperature: Some(drlabs_core::units::Celsius(30.0)),
+                ..AxisReply::SILENT
+            };
+            Ok(())
+        }
+        fn capabilities(&self, _: usize) -> drlabs_core::Capabilities {
+            drlabs_core::Capabilities::default()
+        }
     }
 
     /// A bus that remembers what it was told, so a test can see the modes

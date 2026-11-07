@@ -91,6 +91,7 @@ pub fn trip_allows_hold(code: TripCode) -> bool {
             | TripCode::VelocityRunaway
             | TripCode::PositionEnvelope
             | TripCode::CommLoss
+            | TripCode::FollowingError
     )
 }
 
@@ -331,6 +332,7 @@ mod tests {
             TripCode::VelocityRunaway,
             TripCode::PositionEnvelope,
             TripCode::CommLoss,
+            TripCode::FollowingError,
         ] {
             assert!(trip_allows_hold(code), "{code:?}");
         }

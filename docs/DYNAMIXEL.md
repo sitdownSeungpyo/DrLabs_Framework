@@ -716,7 +716,20 @@ e-stop 됐다. 순서대로:
    > Profile Velocity 까지 즉시 가속한다 — 중력 부하 XL430 팔에선 충격. 지금은 **클라이언트가
    > 반드시 궤적을 스트리밍**해야 한다(`rt_bench`, `wave`, `drlabs run` 은 사다리꼴로 보냄).
    > 한계값 자체는 로봇·장착 부위마다 config 에서 정할 값이고, 적용은 런타임이 setpoint 에서
-   > 하도록 별도 작업으로 고친다(서보 펌웨어와 무관하게 동일 동작). 그때까지 미해결.
+   > 하도록 별도 작업으로 고친다(서보 펌웨어와 무관하게 동일 동작).
+   >
+   > **해결 (2026-11-07):** `drlabs-rt` `worker.rs` 의 `Shaper` 가 매 틱 setpoint 에 관절별
+   > `max_accel_rad_s2`·`max_velocity_rad_s` 를 적용한다. 위치 목표는 2차 리미터(이산 제동 곡선으로
+   > 목표에서 정지), 속도 명령은 slew. 한계 안의 사다리꼴은 그대로 통과, 계단·점프·enable 직후 먼
+   > 목표는 램프가 된다. NaN/inf 목표는 현재 setpoint 유지(없으면 Stop). config 0 = 안전 기본값
+   > 5 rev/s² 적용(제한 없음이 아님). 목표가 갑자기 멈추면 v²/2a 만큼 지나쳤다 돌아온다(1 rad/s,
+   > 4 rad/s² 에서 0.125 rad). 실기(14축 400 Hz): `rt_bench drive amplitude=0.2` 10 s e-stop 0,
+   > 추종 ≤ 0.092 rad; `wave` 40 s e-stop 0, ≤ 0.101 rad, 회전 1.82 s 그대로.
+   >
+   > 같은 날 첫 14축 drive 에서 id 8(XL430, 중력 부하 팔, 당시 3.18 rad)이 2.76 rad 낙하하며
+   > VelocityRunaway(2.5 rad/s × 0.5 s) trip. 셰이퍼 setpoint 는 ≤ 1 rad/s·중심 ±0.2 rad(+최대
+   > 0.125) 안이므로 명령이 만든 움직임이 아니고, 팔이 0.617 rad 로 내려앉은 뒤엔 구·신 바이너리
+   > 모두 10 s 무사 — 원인은 그 자세에서 중력 토크가 서보를 이긴 것으로 **추정**(그 자세 A/B 는 미실행).
 3. **bus watchdog 가 close 뒤에도 무장.** `close` 는 토크만 껐고 reg 98(=4, 80 ms) 이
    남아, 다음 도구가 토크를 켜고 100 ms 쉬면 latch → goal 거부(XL430 0x04, XL330 0x07).
    `dxl_diag test` 가 두 번 이걸로 헛돌았다. `close` 가 98 도 0 으로 쓴다.

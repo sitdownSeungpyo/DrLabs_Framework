@@ -21,6 +21,8 @@
 
 # Claude
 .claude
+# oh-my-claudecode runtime state.
+.omc/
 # Unrelated content that shares the framework root directory.
 andrej-karpathy-skills/
 miles-dev-skills/

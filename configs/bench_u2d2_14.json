@@ -1,0 +1,38 @@
+{
+ "robot": "bench_u2d2_14",
+ "rate_hz": 400,
+ "rt": { "deadline_miss_trip": 50 },
+ "buses": [
+  { "name": "dxl0", "transport": "serial", "port": "COM5", "baud": 3000000, "rate_hz": 400 }
+ ],
+ "joints": [
+  { "name": "j01", "bus": "dxl0", "driver": "dynamixel", "id": 1, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j02", "bus": "dxl0", "driver": "dynamixel", "id": 2, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j03", "bus": "dxl0", "driver": "dynamixel", "id": 3, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j04", "bus": "dxl0", "driver": "dynamixel", "id": 4, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j05", "bus": "dxl0", "driver": "dynamixel", "id": 5, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j06", "bus": "dxl0", "driver": "dynamixel", "id": 6, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j07", "bus": "dxl0", "driver": "dynamixel", "id": 7, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j08", "bus": "dxl0", "driver": "dynamixel", "id": 8, "options": { "profile": "xl430" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.3, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j09", "bus": "dxl0", "driver": "dynamixel", "id": 9, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j10", "bus": "dxl0", "driver": "dynamixel", "id": 10, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j11", "bus": "dxl0", "driver": "dynamixel", "id": 11, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j12", "bus": "dxl0", "driver": "dynamixel", "id": 12, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j13", "bus": "dxl0", "driver": "dynamixel", "id": 13, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } },
+  { "name": "j14", "bus": "dxl0", "driver": "dynamixel", "id": 14, "options": { "profile": "xl330" }, "gear_ratio": 1.0, "direction": 1, "offset_rad": 0.0,
+    "limits": { "min_rad": -6.0, "max_rad": 6.0, "max_torque_nm": 0.1, "max_velocity_rad_s": 1.0, "max_accel_rad_s2": 4.0 } }
+ ]
+}

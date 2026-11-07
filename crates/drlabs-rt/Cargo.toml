@@ -17,3 +17,9 @@ drlabs-robstride = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+# For examples/rt_bench.rs: the runtime on a real serial chain without the
+# DDS endpoint, so the tick can be measured on a machine that cannot build
+# CycloneDDS.
+[dev-dependencies]
+drlabs-transport = { workspace = true }

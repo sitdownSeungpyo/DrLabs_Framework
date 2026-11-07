@@ -628,3 +628,167 @@ fdcanusb(CDC-ACM)는 레이턴시 타이머가 없어 이 문제가 없다. 다�
 스택이 DTR을 요구하는 경우가 있어, `probe -driver moteus`가 Mac에서 침묵하면
 open 직후 `TIOCMBIS(TIOCM_DTR|TIOCM_RTS)`를 추가하는 것이 첫 시도다.
 
+## U2D2 14축 500 Hz 검증 — 400 Hz 까지 (2026-11-06)
+
+벤치: U2D2(FTDI FT232H, Windows COM5) 3 Mbaud, XL430-W250 ×8(id 1–8, fw 50),
+XL330-M288 ×6(id 9–14, fw 53), Return Delay 10(20 µs), Extended Position.
+Windows 11, 실시간 스케줄링 없음, release 빌드. 모두 **확인함**.
+
+**먼저 FTDI 레이턴시 타이머.** 레지스트리
+`HKLM\SYSTEM\CurrentControlSet\Enum\FTDIBUS\VID_0403+PID_6014+<serial>\0000\Device Parameters\LatencyTimer`
+가 기본 16(ms)이었다. 1로 바꾸고 `pnputil /restart-device`(관리자 권한)로
+드라이버를 다시 읽혔다. FT232H는 고속 USB라 패킷 임계가 512 B 이므로 Dynamixel
+응답(≤ 수백 B)은 언제나 타이머 만료로만 호스트에 올라온다 — 16 ms 면 어떤 보레이트에서도
+60 Hz 근처에 묶이고, 1 이 하한이다. 아래 수치는 전부 1 ms 에서 잰 것.
+
+**Fast Sync Read 지원** (`dxl_diag COM5 3000000 fastprobe 1,…,14`): 14축 전부 `yes`.
+단독 0.94–1.37 ms, 14축 함께 10 B 블록 1.44–2.35 ms.
+
+**트랜잭션 비용** (`syncstress … hz=500 write fast`, goal=present 동기쓰기 + Fast Sync
+Read 10 B, 토크 off, 500 µs 슬립 폴링 드라이버):
+
+| 축 | p50 | p95 | p99 | max | 달성 | 유실 |
+|---|---|---|---|---|---|---|
+| 1 | 0.75 ms | 1.50 | 2.14 | 3.27 | 500.0 Hz | 0 / 5 000 |
+| 7 | 1.45 ms | 2.07 | 2.48 | 3.24 | 500.0 Hz | 0 / 35 000 |
+| 14 | 2.01 ms | 2.56 | 2.96 | 4.00 | 485.4 Hz | 0 / 135 912 |
+| 14, 읽기만 | 2.00 ms | 2.40 | 2.90 | 3.14 | 492.2 Hz | 0 / 103 362 |
+| 14, 400 Hz | 2.10 ms | 2.68 | 3.08 | 3.97 | 400.0 Hz | 0 / 84 000 |
+
+≈ 0.65 ms 고정(USB 왕복 + 레이턴시 타이머) + 축당 ≈ 0.1 ms(와이어 20 B ≈ 67 µs +
+RDT 20 µs). 3 Mbaud 14축의 와이어 산술 1.3 ms 와 맞는다. 패킷 유실·CRC 오류는 0.
+
+**런타임** (`cargo run --release -p drlabs-rt --example rt_bench -- configs/bench_u2d2_14.json seconds=N`,
+관찰만 — 전축 OFF, 틱마다 14축 읽기; 스핀 폴링 `DynamixelBus`):
+
+| rate | ticks | deadline miss | late_max | 결과 |
+|---|---|---|---|---|
+| 500 Hz, 30 s | 14 492 | 5 872 (40 %) | 6.01 ms | 평균 484 Hz, 1 s 안에 deadline trip e-stop(11) |
+| 400 Hz, 20 s | 7 957 | 0 | 2.16 ms | 정상 |
+| 250 Hz, 20 s | 4 972 | 0 | 1.28 ms | 정상 |
+
+**결론: 이 구성(U2D2 1개, 3 Mbaud, 14축, 10 B 블록)으로 500 Hz 는 안 된다.** 틱 비용이
+주기와 같아 여유가 0 이고, 2 ms 를 넘는 틱이 40 % 다. 400 Hz 는 관찰 모드에서 깨끗하다
+(`drive` 는 미측정 — 정상 상태의 goal 동기쓰기는 위 syncstress 에 이미 포함돼 있어 와이어
+비용은 같다). 500 Hz 로 가려면 세 가지 중 하나 이상:
+- U2D2 2개로 7+7 분할 — 버스당 1.45 ms, 2 ms 주기에 27 % 여유(측정값으로 예측, 미실행).
+- 보레이트 4–4.5 Mbaud(EEPROM 8 변경, 서보 전부) — 와이어 1.3 → 0.9 ms 정도. 미측정.
+- 읽기 블록 축소(position 4 B 만: 응답 204 → 120 B, ≈ 0.3 ms). 미측정.
+고정 0.65 ms 는 USB 와 FTDI 타이머(하한 1 ms)의 몫이라 소프트웨어로 더 줄이기 어렵다.
+
+같은 날 고친 것: `Daemon::start` 가 `rate_hz` 를 선언하지 않은 버스에 0 을 넘겨
+serial 팩토리가 `with_period(1 s)` 를 받고 있었다 — `fault_every = 1`, 즉 hwerr·watchdog
+sync read 2회가 **매 틱** 나갔다. 이제 `rate_for_bus` 값을 채워서 넘긴다. 위 측정은 버스에
+`rate_hz` 를 명시한 설정이라 영향 없음.
+
+### 400 Hz drive — 런타임에서 실제로 움직이기까지 고친 세 가지 (2026-11-06)
+
+`rt_bench … drive` (전축 DRIVE, 시작 위치 중심 ±0.2 rad 0.5 Hz 사인) 는 세 번 연속 1 s 안에
+e-stop 됐다. 순서대로:
+
+1. **under_voltage(3)**. `drlabs-rt` 는 `bus.envelope()` 를 한 번도 쓰지 않았다 — 단축
+   세션은 connect 에서 `normalise` + `fit_voltage_to` 로 서보 정격을 반영하는데 런타임은
+   `SafetyConfig::default()` 의 11–42 V 밴드 그대로였다. XL430(10 V)·XL330(5.2 V) 둘 다
+   첫 DRIVE 틱에 하한 미달. `BusWorker::run` 이 open 직후 축마다 같은 두 호출을 한다.
+2. **velocity_runaway(8)**. 트립 순간 XL430 전부 −5.3 rad/s — 그러나 이건 트립 **뒤**
+   토크가 풀리며 팔이 떨어지는 속도였고(id 1~8 은 중력 부하 관절), 원인은 따로 있었다:
+   **XL330(id 9~14) 이 올바른 goal 에서 일정 속도로 멀어진다.** 단독 재현(id 9, 400 Hz):
+   1.1 s 동안 정지 → 이후 −0.29 rad/s(속도 레지스터 −12 카운트) 로 goal 과 무관하게
+   무한 이동. goal 을 고정하면 안 일어나고, 1초 fault 읽기·50틱 resend 를 꺼도 똑같다.
+   `dxl_diag sine`(드라이버만, 2.5 ms 마다 goal 동기쓰기 + fast sync read) 로 분리:
+
+   | XL330 id 9, fw 53 | max \|err\| | 비고 |
+   |---|---|---|
+   | p_vel 42, **p_acc 11** (런타임이 쓰던 값) | 572 | 1 s 무시 후 −12 카운트 속도로 발산 |
+   | p_vel 0, p_acc 0 | 10 | 추종 |
+   | p_vel 42, **p_acc 0** | 9 | 추종 |
+   | XL430 id 1, fw 50, p_vel 42, p_acc 11 | 22 | 추종 |
+
+   즉 XL330 fw 53 은 **Profile Acceleration ≠ 0 + 틱마다 goal 갱신** 조합에서 궤적 생성기가
+   깨진다. 런타임은 궤적을 호스트가 스트리밍하므로 서보 가속 프로파일은 필요 없다 —
+   `DynamixelBus` 는 이제 Profile Acceleration 을 **항상 0** 으로 쓰고(`accel_limit` 무시),
+   Profile Velocity 는 속도 상한으로 유지한다. 단축 `Chain`/`Link` 경로는 그대로다.
+
+   > **주의 — 가속 한계 미적용 (2026-11-07 하드웨어 안전 리뷰에서 확인).** 이 버스에서는
+   > config 의 `max_accel_rad_s2` 가 **어디에서도 적용되지 않는다**. `worker.rs` 는 `accel_limit`
+   > 을 매 틱 보내지만 `DynamixelBus` 가 0(무제한)으로 바꾸고, guard·`drive_command` 는 위치·속도·
+   > 토크만 제한한다. 클라이언트가 위치를 계단으로 보내면(DDS 클라이언트, 자세 점프) 서보는
+   > Profile Velocity 까지 즉시 가속한다 — 중력 부하 XL430 팔에선 충격. 지금은 **클라이언트가
+   > 반드시 궤적을 스트리밍**해야 한다(`rt_bench`, `wave`, `drlabs run` 은 사다리꼴로 보냄).
+   > 한계값 자체는 로봇·장착 부위마다 config 에서 정할 값이고, 적용은 런타임이 setpoint 에서
+   > 하도록 별도 작업으로 고친다(서보 펌웨어와 무관하게 동일 동작). 그때까지 미해결.
+3. **bus watchdog 가 close 뒤에도 무장.** `close` 는 토크만 껐고 reg 98(=4, 80 ms) 이
+   남아, 다음 도구가 토크를 켜고 100 ms 쉬면 latch → goal 거부(XL430 0x04, XL330 0x07).
+   `dxl_diag test` 가 두 번 이걸로 헛돌았다. `close` 가 98 도 0 으로 쓴다.
+
+고친 뒤 14축 400 Hz drive 30 s (`bench_u2d2_14.json` rate 400, ±0.2 rad 0.5 Hz):
+
+```
+11958 ticks, 34 deadline misses (0.28 %), late_max 3.87 ms, e-stop 없음, 14축 전부 ok
+XL430 dq ±0.6 rad/s 사인 추종, XL330 추종(이전엔 발산), 전압 XL430 9.8–10.0 V · XL330 5.1–5.2 V
+```
+
+`rt_bench` 옵션: `seconds=N drive amplitude=RAD log=MS` — `log` 는 MS 마다 전축 q/dq 한 줄,
+e-stop 첫 관측 시점에 전축 덤프. `dxl_diag sine <id> [hz=] [pvel=] [pacc=] [amp=] [freq=] [seconds=]`.
+
+### 400 Hz 궤적 왕복 20분 soak — ±180°, 14축 (2026-11-07)
+
+`rt_bench … shuttle=3.14159 dwell=0.25 monitor=8090`: 시작 자세 기준 −π ↔ +π 를
+`drlabs_core::trajectory::synchronized`(가장 느린 축에 맞춘 다관절 시간 동기 사다리꼴,
+`drlabs run -shuttle` 과 같은 플래너)로 계획해 **클라이언트가 버스 레이트(400 Hz)로
+q + dq 피드포워드를 스트리밍**. 관절 한계 그대로: 1 rad/s, 4 rad/s². 한 구간 360°,
+≈ 6.8 s. 모니터는 `127.0.0.1:8090` 의 자체 HTTP 페이지(`/state` JSON 100 ms 폴링).
+
+```
+479 889 ticks / 1200 s = 400.0 Hz, deadline miss 1 830 (0.38 %), late_max 7.92 ms
+177 구간, e-stop 0, silent 0, 400 Hz 에서 395 Hz 아래로 떨어진 초 = 3 (최저 386 Hz)
+추종 오차 최대 XL430 0.073–0.084 rad, XL330 0.097–0.100 rad (이동 중 지연; 정지 시 수렴)
+온도 XL430 32 → 37–40 °C, XL330 22 → 24–25 °C; 전압 XL430 9.8–10.1 V, XL330 5.1–5.2 V
+분당 miss 51–241 (호스트 지터, Windows 비실시간; 연속 50 트립에는 근접하지 않음)
+```
+
+**판정: 400 Hz 제어 주기는 20분 동안 안정.** 궤적은 발산·진동 없이 일정한 지연만
+보여 개선 필요 없음. 지연 0.07–0.10 rad 의 원인은 (a) 서보 Profile Velocity 상한(42 =
+1 rad/s)이 궤적 순항 속도와 같아 따라잡을 여유가 없고 (b) P 제어만의 정상 상태 오차.
+줄이려면 궤적 속도를 상한 아래로(`vel=0.7`) 두거나 Profile Velocity 를 0 으로 쓰는 선택이
+있는데, 후자는 서보 쪽 속도 상한을 포기하는 것이라 기본값으로 두지 않았다(미측정).
+
+60 s 시범(±0.25 rad): 59 구간, miss 134 (0.56 %), late_max 6.09 ms, 오차 최대 0.07–0.10 rad.
+클라이언트가 400 Hz 로 송신하면 100 Hz 사인 때(0.28 %)보다 miss 가 조금 는다 — 같은
+PC 의 스레드 하나가 더 깨어나는 비용으로 추정, 미분리.
+
+### 400 Hz 파도 패턴 — 14축 순차 90°, 무한 반복 (2026-11-07)
+
+일렬로 놓인 14축으로 작품용 패턴. 별도 예제 `crates/drlabs-rt/examples/wave.rs`
+(`wave <robot.json> [angle=RAD] [dwell=S] [vel=] [acc=] [seconds=N] [monitor=PORT]`; 모니터
+페이지·버스 factory 는 `rt_bench` 와 `examples/common/mod.rs` 로 공유): j01 이 자기 사다리꼴로
+`angle`(기본 −π/2) 만큼 돌고, **그 궤적의 계획 시간이 끝나는 순간** j02 가 같은 이동을 시작…
+j14 까지. `dwell` 뒤 역순(j14→j01)으로 출발 자세 복귀, 다시 반복. 움직이지 않는 축은
+DRIVE 로 자기 자리를 유지(데몬은 매 틱 14축 명령을 다 받음). 다음 축의 시작 시각은
+"알아챈 틱"이 아니라 앞 축의 계획 시간에 체인해 지연이 축마다 누적되지 않는다.
+`synchronized` 가 아니라 축마다 `Trapezoidal::new` — 관절 한계 1 rad/s·4 rad/s² 에서 90° 한
+구간 = 2·0.25 + (π/2 − 0.25)/1 ≈ 1.82 s, 한 방향 ≈ 25.5 s, 왕복 ≈ 51 s + dwell 2회.
+
+`seconds=0`(기본)이면 **Enter 를 누를 때까지** 돈다. Enter 는 timed run 과 같은 release
+경로(빈 LowCmd → 50 ms → stop)를 탄다. **Ctrl+C 는 그 경로를 건너뛴다**: 토크 켜진 채
+프로세스가 죽고 버스 워치독이 래치된다(`dxl_diag release` 로 풀어야 함). stdin 이 리다이렉트된
+백그라운드 실행에서는 Enter 가 닿지 않으니 그때는 `seconds=N` 으로 돌린다.
+
+```
+configs/bench_u2d2_14.json  (rate_hz 500 → 400 으로 고정; 500 은 위에서 불가 판정)
+cargo run --release --example wave -- configs\bench_u2d2_14.json monitor=8090
+
+120 s 검증(분리 전 rt_bench 안의 같은 로직): 47 955 ticks = 400.0 Hz, miss 132 (0.28 %), late_max 4.62 ms, 64 구간, e-stop 0, silent 0
+추종 오차 최대 XL430 0.067–0.074 rad, XL330 0.085–0.097 rad (shuttle 때와 같은 지연 성격)
+온도 XL430 32–34 °C, XL330 23–24 °C
+30 s 시범(−0.3 rad): 52 구간, miss 28 (0.23 %), 한 구간 0.55 s — 순차 출발·복귀 확인
+```
+
+방향: `angle` 음수 = 위치 감소. 이것이 CW 인지는 Dynamixel 관례(위치 증가 = CCW)가
+`direction: 1` 로 그대로 통과한다는 **추정**이고 실기 육안 확인은 사용자 몫. 반대면
+`angle=1.5708`.
+
+주의: 중간에 멈추면 각 축은 그 순간의 목표(centre 또는 centre+RAD)에 남고, 다음 실행은
+**그 자리를 새 centre 로** 잡는다. 두 번째 검증 때 j01–j03 의 centre 가 첫 시범 때보다
+0.3 rad 낮았던 것이 그 예. 출발 자세를 유지하려면 복귀 구간이 끝난 직후(dwell 중)에 Enter.
+

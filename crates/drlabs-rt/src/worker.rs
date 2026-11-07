@@ -126,6 +126,179 @@ struct Axis {
     zero_pending: Option<Rev>,
     /// Whether the bus holds zero velocity natively.
     can_hold: bool,
+    /// The acceleration limit's state: where the setpoint actually sent is.
+    shaper: Shaper,
+}
+
+/// What the shaper is shaping: nothing, a position setpoint, or a velocity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shaping {
+    Off,
+    Position,
+    Velocity,
+}
+
+/// The envelope's acceleration limit, applied to the setpoint here rather
+/// than left to the controller.
+///
+/// A client's position target goes through a second-order limiter: the
+/// setpoint moves toward it at no more than the velocity limit, its velocity
+/// changes by no more than `accel · period` a tick, and it brakes in time to
+/// stop on the target. A target that already moves within the limits — a
+/// streamed trapezoid — passes through unchanged; a step, a jump or a first
+/// command far from where the axis is becomes a ramp. A velocity command is
+/// slewed the same way. Units are motor space, like the envelope.
+///
+/// Why here: the Dynamixel bus writes Profile Acceleration 0 because an
+/// XL330 on firmware 53 runs away with any other value while the goal is
+/// streamed (docs/DYNAMIXEL.md), so the servo enforces nothing. Doing it on
+/// the setpoint makes every bus behave the same whatever its firmware.
+///
+/// The limit is a magnitude for braking too: a target that stops dead
+/// while the setpoint is moving is overshot by `v² / 2a` before the setpoint
+/// comes back, inside the position envelope.
+#[derive(Debug, Clone, Copy)]
+struct Shaper {
+    shaping: Shaping,
+    /// The setpoint sent last tick, rev.
+    position: f64,
+    /// Its velocity, rev/s.
+    velocity: f64,
+    /// The client's target last tick, rev — its change is the target's own
+    /// velocity.
+    last_target: f64,
+}
+
+impl Shaper {
+    const OFF: Self = Self {
+        shaping: Shaping::Off,
+        position: 0.0,
+        velocity: 0.0,
+        last_target: 0.0,
+    };
+
+    fn reset(&mut self) {
+        self.shaping = Shaping::Off;
+    }
+
+    /// Rewrites `command`'s position or velocity setpoint to obey
+    /// `safety.accel_limit`. `client_mode` is the client's mode: a HOLD that
+    /// became a position command holds where it latched and is not shaped.
+    /// `known` starts the setpoint where the axis is, so the first command
+    /// after enabling is ramped from there.
+    fn apply(
+        &mut self,
+        command: &mut Command,
+        client_mode: u8,
+        safety: &SafetyConfig,
+        dt: f64,
+        known: &AxisReply,
+    ) {
+        let accel = safety.accel_limit.value();
+        if !(accel > 0.0 && accel.is_finite() && dt > 0.0) {
+            self.reset();
+            return;
+        }
+        let vmax = match safety.max_velocity.value() {
+            v if v > 0.0 && v.is_finite() => v,
+            _ => f64::INFINITY,
+        };
+        let dv = accel * dt;
+        let measured_velocity = known
+            .velocity
+            .map(|v| v.value())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+            .clamp(-vmax, vmax);
+
+        match command.mode {
+            Mode::Position if client_mode != mode::HOLD => {
+                let Some(target) = command.position.get() else {
+                    self.reset();
+                    return;
+                };
+                let mut target = target.value();
+                if !target.is_finite() {
+                    // Nothing upstream rejects a NaN or an infinity in the
+                    // client's record, and `f64::clamp` panics on a NaN
+                    // bound: on this thread that is a bus left energised
+                    // with nobody watching. A target that is not a number
+                    // holds the setpoint where it is.
+                    target = if self.shaping == Shaping::Position {
+                        self.position
+                    } else {
+                        match known.position.map(|p| p.value()) {
+                            Some(p) if p.is_finite() => p,
+                            _ => {
+                                // Nowhere known to hold: do not drive it.
+                                self.reset();
+                                *command = Command::new(Mode::Stop);
+                                return;
+                            }
+                        }
+                    };
+                }
+                if self.shaping != Shaping::Position {
+                    let from = known
+                        .position
+                        .map(|p| p.value())
+                        .filter(|p| p.is_finite())
+                        .unwrap_or(target);
+                    *self = Self {
+                        shaping: Shaping::Position,
+                        position: from,
+                        velocity: measured_velocity,
+                        last_target: target,
+                    };
+                }
+                // The target's own velocity, so a moving target is followed
+                // rather than chased: with the setpoint on it, `ahead` is 0.
+                let target_velocity = ((target - self.last_target) / dt).clamp(-vmax, vmax);
+                self.last_target = target;
+                let ahead = target - (self.position + target_velocity * dt);
+                // The fastest the setpoint may move and still stop on the
+                // target, braking by `dv` a tick: from k·dv the distance to
+                // rest is dv·dt·k(k+1)/2. The continuous √(2a·e) overshoots
+                // by a fraction of a tick's travel.
+                let braking =
+                    dv * ((0.25 + 2.0 * ahead.abs() / (dv * dt)).sqrt() - 0.5);
+                let wanted = (target_velocity + (ahead / dt).clamp(-braking, braking))
+                    .clamp(-vmax, vmax);
+                self.velocity = wanted.clamp(self.velocity - dv, self.velocity + dv);
+                self.position += self.velocity * dt;
+                let (clamped, at_edge) = safety.clamp_position(Rev(self.position));
+                if at_edge {
+                    self.position = clamped.value();
+                    self.velocity = 0.0;
+                }
+                command.position = Field::Set(Rev(self.position));
+                command.velocity = Field::Set(RevPerSec(self.velocity));
+                command.velocity_target = RevPerSec(self.velocity);
+            }
+            Mode::Velocity => {
+                // A velocity that is not a number is a request to stop.
+                let wanted = command
+                    .velocity
+                    .get()
+                    .map(|v| v.value())
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0);
+                if self.shaping != Shaping::Velocity {
+                    *self = Self {
+                        shaping: Shaping::Velocity,
+                        velocity: measured_velocity,
+                        ..Self::OFF
+                    };
+                }
+                self.velocity = wanted
+                    .clamp(-vmax, vmax)
+                    .clamp(self.velocity - dv, self.velocity + dv);
+                command.velocity = Field::Set(RevPerSec(self.velocity));
+                command.velocity_target = RevPerSec(self.velocity);
+            }
+            _ => self.reset(),
+        }
+    }
 }
 
 pub struct BusWorker {
@@ -174,6 +347,7 @@ impl BusWorker {
                 hold_at: None,
                 zero_pending: None,
                 can_hold: bus.capabilities(index).modes.contains(&ControlMode::Hold),
+                shaper: Shaper::OFF,
             })
             .collect();
         Self {
@@ -390,13 +564,26 @@ impl BusWorker {
                 axis.stop_ticks = STOP_BURST;
             }
 
+            if !drive || stopped {
+                // Driving again later starts from wherever the axis is then.
+                axis.shaper.reset();
+            }
             let command = if stopped {
                 // A stop cancels what was pending; the client asks again.
                 axis.zero_pending = None;
                 Command::new(Mode::Stop)
             } else if drive {
                 let hold_at = if axis.can_hold { None } else { axis.hold_at };
-                drive_command(&axis.spec, &motor, self.config.period, resend, hold_at)
+                let mut command =
+                    drive_command(&axis.spec, &motor, self.config.period, resend, hold_at);
+                axis.shaper.apply(
+                    &mut command,
+                    motor.mode,
+                    &axis.spec.safety,
+                    self.config.period.as_secs_f64(),
+                    &axis.known,
+                );
+                command
             } else if axis.stop_ticks > 0 {
                 axis.stop_ticks -= 1;
                 Command::new(Mode::Stop)
@@ -584,7 +771,7 @@ fn motor_state(axis: &Axis, stopped: bool) -> MotorState {
 mod tests {
     use super::*;
     use crate::exchange::triple;
-    use drlabs_core::units::{RadPerSec2, Rev};
+    use drlabs_core::units::{RadPerSec2, Rev, RevPerSec2};
     use drlabs_safety::Blocked;
     use drlabs_sim::SimBus;
 
@@ -827,6 +1014,217 @@ mod tests {
         assert_eq!(command.max_torque, TorqueLimit::Nm(s.safety.max_torque));
         assert!(max < Rev(0.3), "±1.5 rad is ±0.24 rev");
         let _ = RadPerSec2(0.0);
+    }
+
+    /// Runs a shaper over `targets`, one per tick, and returns the setpoints.
+    fn shape(safety: &SafetyConfig, dt: f64, targets: &[f64]) -> Vec<(f64, f64)> {
+        let mut shaper = Shaper::OFF;
+        let known = AxisReply {
+            position: Some(Rev(targets[0])),
+            velocity: Some(RevPerSec(0.0)),
+            ..AxisReply::SILENT
+        };
+        targets
+            .iter()
+            .map(|&t| {
+                let mut command = Command {
+                    mode: Mode::Position,
+                    position: Field::Set(Rev(t)),
+                    velocity: Field::Set(RevPerSec(0.0)),
+                    ..Command::default()
+                };
+                shaper.apply(&mut command, mode::DRIVE, safety, dt, &known);
+                (
+                    command.position.get().unwrap().value(),
+                    command.velocity.get().unwrap().value(),
+                )
+            })
+            .collect()
+    }
+
+    /// A step in the target becomes a ramp: the setpoint's velocity never
+    /// changes by more than the limit allows in a tick, never exceeds the
+    /// velocity limit, and the setpoint settles on the target without
+    /// passing it.
+    #[test]
+    fn a_step_is_ramped_within_the_acceleration_limit() {
+        let safety = spec(0).safety;
+        let (a, vmax, dt) = (safety.accel_limit.value(), safety.max_velocity.value(), 0.002);
+        let target = 0.2; // rev, inside the ±0.2387 rev envelope
+        let mut targets = vec![0.0];
+        targets.extend(std::iter::repeat(target).take(1000));
+        let out = shape(&safety, dt, &targets);
+
+        let mut last_v = 0.0;
+        for (i, &(p, v)) in out.iter().enumerate() {
+            assert!((v - last_v).abs() <= a * dt + 1e-9, "tick {i}: dv {}", v - last_v);
+            assert!(v.abs() <= vmax + 1e-9, "tick {i}: v {v}");
+            // A velocity off the dv grid lands within a few µrev of the
+            // target; one Dynamixel count is 244 µrev.
+            assert!(p <= target + 1e-5, "tick {i}: overshoot to {p}");
+            last_v = v;
+        }
+        let (p, v) = *out.last().unwrap();
+        assert!((p - target).abs() < 1e-6 && v.abs() < 1e-6, "settled at {p} moving {v}");
+        // And it did not jump: the first move is one tick of the limit.
+        assert!(out[1].0 - out[0].0 <= a * dt * dt + 1e-9);
+    }
+
+    /// A target that is already a trapezoid within the limits is passed
+    /// through: the shaper adds no lag to a client that plans its moves.
+    #[test]
+    fn a_feasible_trapezoid_passes_through() {
+        use drlabs_core::trajectory::Trapezoidal;
+        let safety = spec(0).safety;
+        let dt = 0.002;
+        let profile = Trapezoidal::new(
+            Rev(-0.2),
+            Rev(0.2),
+            RevPerSec(safety.max_velocity.value() * 0.9),
+            RevPerSec2(safety.accel_limit.value() * 0.9),
+        )
+        .unwrap();
+        let ticks = (profile.total_time() / dt) as usize + 50;
+        let targets: Vec<f64> = (0..ticks)
+            .map(|i| profile.sample(i as f64 * dt).position.value())
+            .collect();
+        let out = shape(&safety, dt, &targets);
+        for (i, (&t, &(p, _))) in targets.iter().zip(&out).enumerate() {
+            assert!((p - t).abs() < 1e-6, "tick {i}: setpoint {p} target {t}");
+        }
+    }
+
+    /// No limit, no shaping: the client's target goes out as sent.
+    #[test]
+    fn a_zero_acceleration_limit_shapes_nothing() {
+        let mut safety = spec(0).safety;
+        safety.accel_limit = RevPerSec2(0.0);
+        let out = shape(&safety, 0.002, &[0.0, 0.2, 0.2]);
+        assert_eq!(out[1].0, 0.2);
+    }
+
+    /// Through the worker: a client that jumps the target sends the bus a
+    /// ramp, and the first command after enabling starts where the axis is.
+    #[test]
+    fn the_worker_ramps_a_jump_it_is_sent() {
+        let (mut worker, mut cmd_tx, _, _, log) =
+            recording(1, true, Rev(0.0), TimeoutPolicy::Hold);
+        let safety = spec(0).safety;
+        let start = Instant::now();
+        cmd_tx.publish(Stamped {
+            value: one(mode::DRIVE, 1.2, 0.0, 0.0, 1),
+            at: start,
+        });
+        for i in 0..600u64 {
+            worker.tick(start + Duration::from_millis(2 * i));
+        }
+        let positions: Vec<f64> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|cmds| cmds[0].position.get().map(|p| p.value()))
+            .collect();
+        assert!(positions.len() > 100, "{} position commands", positions.len());
+        assert!(positions[0].abs() < 1e-3, "first setpoint {} is not a jump", positions[0]);
+        let a = safety.accel_limit.value();
+        let dt = 0.002;
+        for w in positions.windows(3) {
+            let accel = (w[2] - 2.0 * w[1] + w[0]) / (dt * dt);
+            assert!(accel.abs() <= a * 1.0001, "{accel} rev/s² over {a}");
+        }
+        let target = Mapping {
+            gear_ratio: 1.0,
+            direction: 1.0,
+            offset_rad: 0.0,
+        }
+        .motor_position(Rad(1.2))
+        .value();
+        assert!((positions.last().unwrap() - target).abs() < 1e-6);
+    }
+
+    /// A NaN or an infinity from a client must not panic the bus thread: a
+    /// position that is not a number holds the setpoint, a velocity that is
+    /// not a number brakes to zero. `f64::clamp` panics on a NaN bound.
+    #[test]
+    fn a_non_finite_command_holds_instead_of_panicking() {
+        let mut safety = spec(0).safety;
+        let dt = 0.002;
+        let known = AxisReply {
+            position: Some(Rev(0.1)),
+            velocity: Some(RevPerSec(0.0)),
+            ..AxisReply::SILENT
+        };
+        for limited in [true, false] {
+            safety.position_limit_enabled = limited;
+            let mut shaper = Shaper::OFF;
+            for t in [0.15, f64::NAN, f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let mut command = Command {
+                    mode: Mode::Position,
+                    position: Field::Set(Rev(t)),
+                    velocity: Field::Set(RevPerSec(0.0)),
+                    ..Command::default()
+                };
+                shaper.apply(&mut command, mode::DRIVE, &safety, dt, &known);
+                let p = command.position.get().unwrap().value();
+                assert!(p.is_finite() && (p - 0.1).abs() < 0.01, "setpoint {p} after {t}");
+            }
+            // First command not a number, nothing shaped yet: holds where
+            // the axis is.
+            let mut shaper = Shaper::OFF;
+            let mut command = Command {
+                mode: Mode::Position,
+                position: Field::Set(Rev(f64::NAN)),
+                ..Command::default()
+            };
+            shaper.apply(&mut command, mode::DRIVE, &safety, dt, &known);
+            assert_eq!(command.position.get(), Some(Rev(0.1)));
+        }
+
+        let mut shaper = Shaper::OFF;
+        for v in [0.3, f64::NAN, f64::NAN, f64::INFINITY, f64::NAN] {
+            let mut command = Command {
+                mode: Mode::Velocity,
+                velocity: Field::Set(RevPerSec(v)),
+                ..Command::default()
+            };
+            shaper.apply(&mut command, mode::VELOCITY, &safety, dt, &known);
+            assert!(command.velocity.get().unwrap().value().is_finite());
+        }
+
+        // And with no position to hold at all, the axis is stopped.
+        let mut shaper = Shaper::OFF;
+        let mut command = Command {
+            mode: Mode::Position,
+            position: Field::Set(Rev(f64::NAN)),
+            ..Command::default()
+        };
+        shaper.apply(&mut command, mode::DRIVE, &safety, dt, &AxisReply::SILENT);
+        assert_eq!(command.mode, Mode::Stop);
+    }
+
+    /// A velocity command is slewed, not stepped.
+    #[test]
+    fn a_velocity_step_is_slewed() {
+        let safety = spec(0).safety;
+        let dt = 0.002;
+        let mut shaper = Shaper::OFF;
+        let known = AxisReply {
+            velocity: Some(RevPerSec(0.0)),
+            ..AxisReply::SILENT
+        };
+        let mut last = 0.0;
+        for _ in 0..500 {
+            let mut command = Command {
+                mode: Mode::Velocity,
+                velocity: Field::Set(RevPerSec(0.5)),
+                ..Command::default()
+            };
+            shaper.apply(&mut command, mode::VELOCITY, &safety, dt, &known);
+            let v = command.velocity.get().unwrap().value();
+            assert!((v - last).abs() <= safety.accel_limit.value() * dt + 1e-9);
+            last = v;
+        }
+        assert!((last - 0.5).abs() < 1e-9);
     }
 
     /// A bus that remembers what it was told, so a test can see the modes

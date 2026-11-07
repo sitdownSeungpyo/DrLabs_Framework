@@ -168,7 +168,9 @@ fn wait_driving(handle: &mut Handle, budget: Duration) {
     let deadline = Instant::now() + budget;
     loop {
         let state = handle.state();
-        if state.state[0].status == AxisStatus::Ok as u8 {
+        // Before the first tick the record is empty, and an empty status
+        // reads as `Ok` (0); only a ticked record says anything.
+        if state.tick > 0 && state.state[0].status == AxisStatus::Ok as u8 {
             return;
         }
         assert!(
@@ -247,7 +249,9 @@ fn the_bus_holds_the_rate_it_was_given() {
 }
 
 /// A command still takes effect promptly: the next tick picks it up, and the
-/// state record says so within a period or two.
+/// state record says so within a period or two. A jump in the target is
+/// ramped within the joint's acceleration limit (60 rad/s² here, so 0.3 rad
+/// takes about 0.15 s), and then the bus is given the target exactly.
 #[test]
 fn a_command_is_acted_on_within_a_period() {
     let (mut handle, bus) = started(50, "hold"); // 20 ms period
@@ -256,7 +260,11 @@ fn a_command_is_acted_on_within_a_period() {
 
     handle.send(drive(0.3, 2));
     std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(handle.state().cmd_seq, 2, "the next tick took the command");
+    let early = bus.last_command(0).unwrap().position.get().unwrap();
+    assert!(early > Rev(0.0), "the setpoint started toward the target: {early:?}");
 
+    std::thread::sleep(Duration::from_millis(400));
     let sent = bus.last_command(0).expect("a command reached the bus");
     let target = sent.position.get().expect("a position was commanded");
     assert!(
@@ -327,7 +335,9 @@ fn a_quick_stop_latches_until_it_is_reset() {
     handle.stop();
 }
 
-/// The safety envelope clamps a command before it reaches the bus.
+/// The safety envelope clamps a command before it reaches the bus: the
+/// setpoint ramps (within 60 rad/s², about half a second for π rad) to the
+/// envelope's edge and no further.
 #[test]
 fn a_target_outside_the_envelope_is_clamped_before_it_is_sent() {
     let (mut handle, bus) = started(100, "hold");
@@ -335,7 +345,13 @@ fn a_target_outside_the_envelope_is_clamped_before_it_is_sent() {
     wait_driving(&mut handle, Duration::from_secs(2));
 
     handle.send(drive(50.0, 2));
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < deadline {
+        let last = bus.last_command(0).expect("the bus has cycled");
+        let sent = last.position.get().expect("a position was commanded");
+        assert!(sent <= Rev(0.5) + Rev(1e-6), "past the envelope: {sent:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let sent = bus.last_command(0).unwrap().position.get().unwrap();
     assert!(
         (sent - Rev(0.5)).abs() < Rev(1e-6),

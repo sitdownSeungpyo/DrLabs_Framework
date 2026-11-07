@@ -566,6 +566,14 @@ impl Bus for DynamixelBus {
             let _ = self
                 .driver
                 .write_u8(axis.id, axis.profile.addr_torque_enable, 0);
+            // An armed watchdog outlives torque off, and the next tool to
+            // enable torque and pause for a moment finds every goal refused
+            // (0x04 on XL430, 0x07 on XL330). Leave it disarmed.
+            if axis.profile.addr_bus_watchdog != 0 {
+                let _ = self
+                    .driver
+                    .write_u8(axis.id, axis.profile.addr_bus_watchdog, 0);
+            }
             axis.torque = false;
         }
         self.open = false;
@@ -607,14 +615,21 @@ impl Bus for DynamixelBus {
                             axis.velocity = Some(counts);
                         }
                     }
-                    if let Some(limit) = command.accel_limit.get() {
-                        let counts = (limit.value() * 3600.0
-                            / axis.profile.accel_rev_per_min2_per_count)
-                            .round()
-                            .max(0.0) as u32;
-                        if command.full || axis.last_accel != Some(counts) {
-                            axis.accel = Some(counts);
-                        }
+                    // Profile Acceleration is written as zero, whatever the
+                    // command's limit, and the limit is not applied here.
+                    // Measured 2026-11-06 (dxl_diag sine, goal every 2.5 ms,
+                    // profile velocity 42): an XL330-M288 fw 53 with profile
+                    // acceleration 11 ignores the goal for a second and
+                    // then runs at a constant 12 counts of velocity away
+                    // from it, without bound; with acceleration 0 it tracks
+                    // within 10 counts. An XL430 fw 50 tolerates either. The
+                    // runtime streams the trajectory itself, so the servo's
+                    // own acceleration profile adds nothing; profile velocity
+                    // stays, as the speed cap.
+                    if command.accel_limit.get().is_some()
+                        && (command.full || axis.last_accel != Some(0))
+                    {
+                        axis.accel = Some(0);
                     }
                     if axis.profile.addr_bus_watchdog != 0 {
                         if let Some(timeout) = command.watchdog.get() {

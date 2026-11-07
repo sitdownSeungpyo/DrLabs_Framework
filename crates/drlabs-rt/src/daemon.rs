@@ -187,13 +187,18 @@ impl Daemon {
         let mut workers = Vec::new();
 
         for bus_name in config.bus_names() {
-            let bus_config = config.bus(&bus_name).cloned().unwrap_or_else(|| BusConfig {
+            let mut bus_config = config.bus(&bus_name).cloned().unwrap_or_else(|| BusConfig {
                 name: bus_name.clone(),
                 transport: implicit_transport(config),
                 port: String::new(),
                 baud: 0,
                 rate_hz: 0,
             });
+            // The factory sees the rate the bus will actually run at, not the
+            // zero that means "the robot's". A serial factory derives the
+            // bus's period from it, and a period of a second put the
+            // once-a-second register reads on every tick.
+            bus_config.rate_hz = config.rate_for_bus(&bus_name);
             let members: Vec<(usize, &JointConfig)> = config
                 .joints
                 .iter()

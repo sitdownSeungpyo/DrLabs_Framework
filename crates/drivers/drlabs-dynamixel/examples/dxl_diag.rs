@@ -57,7 +57,7 @@ fn read_i32(d: &Driver, id: u8, addr: u16) -> Result<i32, String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        eprintln!("usage: dxl_diag <port> <baud> dump <ids> | test <id> [delta] [all_ids] | fastprobe <ids> [len] | syncstress <ids> <chunk> <seconds> [arm] [len] [hz=N] [fast] [write] | release | wdtest | raw | rdt");
+        eprintln!("usage: dxl_diag <port> <baud> dump <ids> | test <id> [delta] [all_ids] | fastprobe <ids> [len] | syncstress <ids> <chunk> <seconds> [arm] [len] [hz=N] [fast] [write] | sine <id> [hz=N] [pvel=N] [pacc=N] [amp=N] [freq=HZ] [seconds=N] | release | wdtest | raw | rdt");
         std::process::exit(2);
     }
     let baud: u32 = args[2].parse().expect("baud");
@@ -449,6 +449,83 @@ fn main() {
             if all.len() < 400 {
                 println!("  raw: {:02X?}", all);
             }
+        }
+        // sine <id> [hz=N] [pvel=N] [pacc=N] [amp=COUNTS] [freq=HZ] [seconds=N]:
+        // stream a sine goal to one servo the way the runtime does — a goal
+        // sync write and a fast sync read every cycle — with the profile
+        // registers set as asked, and print how far the servo is from its
+        // goal every 250 ms. The question it answers: does this firmware
+        // follow a goal that moves a count or two per cycle, with a
+        // velocity/acceleration profile in force?
+        "sine" => {
+            let id: u8 = args[4].parse().expect("id");
+            let mut hz = 400.0f64;
+            let mut pvel: u32 = 42;
+            let mut pacc: u32 = 11;
+            let mut amp = 33.0f64;
+            let mut freq = 0.5f64;
+            let mut seconds = 4u64;
+            for token in args.iter().skip(5) {
+                let (key, value) = token.split_once('=').expect("key=value");
+                match key {
+                    "hz" => hz = value.parse().expect("hz"),
+                    "pvel" => pvel = value.parse().expect("pvel"),
+                    "pacc" => pacc = value.parse().expect("pacc"),
+                    "amp" => amp = value.parse().expect("amp"),
+                    "freq" => freq = value.parse().expect("freq"),
+                    "seconds" => seconds = value.parse().expect("seconds"),
+                    other => panic!("unknown key {other}"),
+                }
+            }
+            driver.write_u8(id, 98, 0).expect("clear watchdog");
+            driver.write_u8(id, 64, 0).expect("torque off");
+            driver.write_u32(id, 108, pacc).expect("profile acceleration");
+            driver.write_u32(id, 112, pvel).expect("profile velocity");
+            let start = read_i32(&driver, id, 132).expect("present");
+            driver.write_u32(id, 116, start as u32).expect("goal=present");
+            driver.write_u8(id, 64, 1).expect("torque on");
+            println!(
+                "id {id}: start {start}, sine amp {amp} counts at {freq} Hz, goal every {:.2} ms, pvel {pvel} pacc {pacc}",
+                1e3 / hz
+            );
+            println!("{:>6} {:>7} {:>7} {:>6} {:>7}", "t", "goal", "present", "err", "vel");
+            let period = Duration::from_secs_f64(1.0 / hz);
+            let started = std::time::Instant::now();
+            let mut next = started;
+            let mut next_print = started;
+            let mut max_err = 0i32;
+            let mut goals: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+            while started.elapsed() < Duration::from_secs(seconds) {
+                let t = started.elapsed().as_secs_f64();
+                let goal = start + (amp * (std::f64::consts::TAU * freq * t).sin()).round() as i32;
+                goals.insert(id, (goal as u32).to_le_bytes().to_vec());
+                if let Err(e) = driver.sync_write(116, 4, &goals) {
+                    println!("sync write error {e}");
+                }
+                let (present, vel) = match driver.fast_sync_read(126, 10, &[id]) {
+                    Ok((a, _)) => match a.get(&id) {
+                        Some(d) if d.len() >= 10 => (
+                            i32::from_le_bytes([d[6], d[7], d[8], d[9]]),
+                            i32::from_le_bytes([d[2], d[3], d[4], d[5]]),
+                        ),
+                        _ => (i32::MIN, 0),
+                    },
+                    Err(_) => (i32::MIN, 0),
+                };
+                if present != i32::MIN {
+                    max_err = max_err.max((goal - present).abs());
+                }
+                if std::time::Instant::now() >= next_print {
+                    next_print += Duration::from_millis(250);
+                    println!("{t:>6.2} {goal:>7} {present:>7} {:>6} {vel:>7}", goal - present);
+                }
+                next += period;
+                if let Some(d) = next.checked_duration_since(std::time::Instant::now()) {
+                    std::thread::sleep(d);
+                }
+            }
+            let _ = driver.write_u8(id, 64, 0);
+            println!("max |err| {max_err} counts; torque off");
         }
         // rdt <ids> <counts>: set Return Delay Time (reg 9, EEPROM) on every id.
         "rdt" => {

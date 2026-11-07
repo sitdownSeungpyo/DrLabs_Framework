@@ -233,6 +233,22 @@ impl BusWorker {
                 return;
             }
         }
+        // The driver's own ratings, now that open has identified each servo:
+        // they tighten the declared envelope, and widen a voltage band nobody
+        // declared so it contains the motor's rated supply. Without this a 5 V
+        // or 12 V servo was judged against the default 11–42 V band and
+        // tripped under-voltage on its first drive. Same as the session does
+        // on connect; allocation here is at open, not on the tick.
+        for (index, axis) in self.axes.iter_mut().enumerate() {
+            if let Some(envelope) = self.bus.envelope(index) {
+                let mut notes = axis.spec.safety.normalise(Some(&envelope));
+                notes.extend(axis.spec.safety.fit_voltage_to(&envelope));
+                axis.guard = Guard::new(axis.spec.safety);
+                for note in notes {
+                    eprintln!("[{}] axis {}: {note}", self.config.name, axis.spec.joint);
+                }
+            }
+        }
         let period = self.config.period;
         let granted = drlabs_timing::rt::promote(self.config.priority, self.config.cpu, period);
         eprintln!(
